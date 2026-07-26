@@ -32,13 +32,7 @@ _AGENT_CONFIG = {
 
 
 def _recover_interrupted_job(agent, request) -> None:
-    """Requeue work left behind when an ephemeral GitHub runner terminated.
-
-    A cloud runner makes another claim only after the prior workflow attempt has
-    ended (the workflows use a concurrency group). Therefore a still-running
-    ``current_job`` at the beginning of a new claim is orphaned and safe to
-    recover automatically.
-    """
+    """Requeue work left behind when an ephemeral GitHub runner terminated."""
 
     if not request.path.endswith("/agent-api/claim/") or not agent.current_job_id:
         return
@@ -120,7 +114,12 @@ def github_cloud_agent(request):
         return None
     if claims.get("ref") != "refs/heads/main":
         return None
-    if claims.get("event_name") not in {"schedule", "workflow_dispatch", "workflow_run"}:
+    if claims.get("event_name") not in {
+        "schedule",
+        "workflow_dispatch",
+        "workflow_run",
+        "push",
+    }:
         return None
 
     workflow_ref = claims.get("workflow_ref", "")

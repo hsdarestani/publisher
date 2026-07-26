@@ -23,6 +23,7 @@ INSTALLED_APPS = [
     "apps.publisher",
     "apps.integrations",
     "apps.reports",
+    "apps.signing",
 ]
 
 MIDDLEWARE = [

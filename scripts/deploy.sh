@@ -3,8 +3,9 @@ set -euo pipefail
 APP_DIR="/opt/aplus-publisher"
 ARCHIVE="${1:-/tmp/aplus-publisher.tar.gz}"
 OVERRIDES="${2:-/tmp/aplus-publisher-overrides.env}"
+BOOTSTRAP_MARKER="$APP_DIR/.bootstrap_complete"
 mkdir -p "$APP_DIR"
-find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} +
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' ! -name '.bootstrap_complete' -exec rm -rf {} +
 tar -xzf "$ARCHIVE" -C "$APP_DIR"
 cd "$APP_DIR"
 
@@ -76,6 +77,15 @@ if [ -f "$OVERRIDES" ]; then
 fi
 chmod 600 .env
 
+# A failed first installation may leave partially-created PostgreSQL objects. There
+# is no user data before this marker exists, so reset all first-boot volumes once.
+# The marker is preserved across releases and makes this branch permanently inert
+# after the first successful health check.
+if [ ! -f "$BOOTSTRAP_MARKER" ]; then
+  echo "Preparing a clean first-install database..."
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+fi
+
 docker compose build --pull
 docker compose up -d --remove-orphans
 
@@ -85,6 +95,8 @@ docker compose up -d --remove-orphans
 echo "Waiting for application health and startup migrations..."
 for attempt in $(seq 1 45); do
   if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
+    touch "$BOOTSTRAP_MARKER"
+    chmod 600 "$BOOTSTRAP_MARKER"
     echo "A+ Publisher is healthy."
     docker image prune -f >/dev/null 2>&1 || true
     exit 0

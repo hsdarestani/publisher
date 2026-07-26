@@ -104,16 +104,39 @@ jobs:
           [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
       - name: Deploy over SSH
+        id: production
+        continue-on-error: true
+        timeout-minutes: 30
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
-          test -n "$HOST" && test -n "$PASS"
-          PORT="${SSH_PORT:-22}"
-          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+          set -o pipefail
+          {
+            test -n "$HOST" && test -n "$PASS"
+            PORT="${SSH_PORT:-22}"
+            sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
+            sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+          } 2>&1 | tee /tmp/deploy-ci.log
+      - name: Report production result
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const ok = '${{ steps.production.outcome }}' === 'success';
+            const log = fs.existsSync('/tmp/deploy-ci.log') ? fs.readFileSync('/tmp/deploy-ci.log', 'utf8').slice(-12000) : 'No deployment log was produced.';
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: 5082685558,
+              body: ok ? '✅ Production deployment completed successfully on `publisher.smarbiz.sbs`.' : '### Production deployment failure\n\n```text\n' + log + '\n```'
+            });
+      - name: Enforce production result
+        if: steps.production.outcome == 'failure'
+        run: exit 1
 
   materialize-source:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

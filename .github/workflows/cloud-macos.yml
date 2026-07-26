@@ -1,0 +1,43 @@
+name: A+ Cloud Mac
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aplus-cloud-macos
+  cancel-in-progress: false
+
+jobs:
+  cloud-macos-agent:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout A+ Publisher agent
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+
+      - name: Show Apple build environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --find iTMSTransporter
+
+      - name: Claim and execute macOS jobs
+        env:
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '3'
+        run: python agents/cloud_macos.py

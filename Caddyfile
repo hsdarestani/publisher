@@ -1,0 +1,19 @@
+{$DOMAIN:publisher.smarbiz.sbs} {
+  encode zstd gzip
+  handle_path /media/* {
+    root * /srv/media
+    file_server
+  }
+  handle {
+    reverse_proxy web:8000
+  }
+  request_body {
+    max_size 2GB
+  }
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
+}

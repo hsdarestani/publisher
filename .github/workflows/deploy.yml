@@ -1,0 +1,106 @@
+name: Validate and deploy A+ Publisher
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publisher-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand source bundle
+        run: |
+          if compgen -G 'source-bundle.b64.part*' > /dev/null; then
+            cat source-bundle.b64.part* | base64 --decode > source-bundle.tar.gz
+          fi
+          if [ -f source-bundle.tar.gz ]; then
+            tar -xzf source-bundle.tar.gz
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Django checks and tests
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-only-key
+        run: |
+          python manage.py check
+          python manage.py migrate --noinput
+          python manage.py test
+      - name: Compile agent
+        run: python -m py_compile agents/runner.py
+      - name: Validate compose
+        run: docker compose config
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand source bundle
+        run: |
+          if compgen -G 'source-bundle.b64.part*' > /dev/null; then
+            cat source-bundle.b64.part* | base64 --decode > source-bundle.tar.gz
+          fi
+          if [ -f source-bundle.tar.gz ]; then
+            tar -xzf source-bundle.tar.gz
+          fi
+      - name: Package release
+        run: tar --exclude=.git --exclude=.env -czf /tmp/aplus-publisher.tar.gz .
+      - name: Prepare optional deployment settings
+        env:
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          : > /tmp/aplus-publisher-overrides.env
+          [ -n "$ADMIN_EMAIL" ] && printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
+      - name: Deploy over SSH
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+
+  materialize-source:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replace bundle with readable source
+        run: |
+          if compgen -G 'source-bundle.b64.part*' > /dev/null; then
+            cat source-bundle.b64.part* | base64 --decode > source-bundle.tar.gz
+          fi
+          if [ ! -f source-bundle.tar.gz ]; then
+            exit 0
+          fi
+          tar -xzf source-bundle.tar.gz
+          rm -f source-bundle.tar.gz source-bundle.b64.part*
+          git config user.name "A+ Publisher Bot"
+          git config user.email "publisher-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "Materialize A+ Publisher source"
+          git push origin HEAD:main

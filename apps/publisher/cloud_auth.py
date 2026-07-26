@@ -18,12 +18,7 @@ _CLOUD_AGENT_NAME = "A+ Cloud Mac · GitHub Actions"
 
 
 def github_cloud_agent(request):
-    """Authenticate the official A+ GitHub-hosted macOS workflow via OIDC.
-
-    No persistent agent secret is required. The token is short-lived, signed by
-    GitHub and restricted to the configured repository, main branch, audience,
-    and the cloud macOS workflow's supported trigger events.
-    """
+    """Authenticate the official A+ GitHub-hosted macOS workflow via OIDC."""
 
     token = request.headers.get("X-GitHub-OIDC", "").strip()
     if not token:
@@ -50,7 +45,11 @@ def github_cloud_agent(request):
         return None
     if claims.get("ref") != "refs/heads/main":
         return None
-    if claims.get("event_name") not in {"schedule", "workflow_dispatch", "push"}:
+    if claims.get("event_name") not in {
+        "schedule",
+        "workflow_dispatch",
+        "workflow_run",
+    }:
         return None
 
     workflow_ref = claims.get("workflow_ref", "")
@@ -61,16 +60,12 @@ def github_cloud_agent(request):
         f"github-oidc:{allowed_repository}:cloud-macos".encode()
     ).hexdigest()
 
-    # Older deployments or a manually-created agent may already own either the
-    # stable name or token hash. Resolve both identities before creating anything,
-    # then normalize the record in one transaction. Repeated ephemeral runners are
-    # therefore safe and never hit the unique name/token constraints.
     with transaction.atomic():
         agent = BuildAgent.objects.select_for_update().filter(token_hash=token_hash).first()
         if agent is None:
             agent = BuildAgent.objects.select_for_update().filter(name=_CLOUD_AGENT_NAME).first()
         if agent is None:
-            agent = BuildAgent.objects.create(
+            return BuildAgent.objects.create(
                 name=_CLOUD_AGENT_NAME,
                 platform="macos",
                 enabled=True,
@@ -78,7 +73,6 @@ def github_cloud_agent(request):
                 labels=["github-hosted", "ephemeral", "xcode", "cloud"],
                 capabilities={"oidc": True, "ephemeral": True},
             )
-            return agent
 
         agent.name = _CLOUD_AGENT_NAME
         agent.platform = "macos"

@@ -10,6 +10,7 @@ on:
       - '.github/workflows/cloud-macos.yml'
       - 'agents/cloud_macos.py'
       - 'agents/runner.py'
+      - 'apps/core/middleware.py'
       - 'apps/publisher/cloud_auth.py'
       - 'apps/publisher/views.py'
 
@@ -53,8 +54,26 @@ jobs:
           PUBLISHER_URL: https://publisher.smarbiz.sbs
           PUBLISHER_MAX_JOBS: '3'
         run: |
-          set -o pipefail
+          set +e
           python agents/cloud_macos.py 2>&1 | tee /tmp/cloud-mac.log
+          AGENT_EXIT=${PIPESTATUS[0]}
+          if [ "$AGENT_EXIT" -ne 0 ]; then
+            echo "--- Publisher diagnostic response ---" | tee -a /tmp/cloud-mac.log
+            python - <<'PY' 2>&1 | tee -a /tmp/cloud-mac.log
+          import sys
+          sys.path.insert(0, "agents")
+          import requests
+          from cloud_macos import GitHubOIDCAuth, GitHubOIDCProvider
+
+          server = "https://publisher.smarbiz.sbs"
+          session = requests.Session()
+          session.auth = GitHubOIDCAuth(GitHubOIDCProvider(server))
+          response = session.post(f"{server}/apps/agent-api/claim/", timeout=45)
+          print(f"HTTP {response.status_code}")
+          print(response.text[:4000])
+          PY
+            exit "$AGENT_EXIT"
+          fi
 
       - name: Report cloud Mac status
         if: always()

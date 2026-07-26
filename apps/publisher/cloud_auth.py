@@ -14,14 +14,30 @@ from .models import BuildAgent
 logger = logging.getLogger(__name__)
 _GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 _GITHUB_JWKS = PyJWKClient(f"{_GITHUB_OIDC_ISSUER}/.well-known/jwks")
-_CLOUD_AGENT_NAME = "A+ Cloud Mac · GitHub Actions"
+
+_AGENT_CONFIG = {
+    "macos": {
+        "name": "A+ Cloud Mac · GitHub Actions",
+        "workflow": ".github/workflows/cloud-macos.yml@",
+        "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
+        "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},
+    },
+    "linux": {
+        "name": "A+ Cloud Linux · GitHub Actions",
+        "workflow": ".github/workflows/cloud-linux.yml@",
+        "labels": ["github-hosted", "ephemeral", "flutter", "android", "cloud"],
+        "capabilities": {"oidc": True, "ephemeral": True, "android": True},
+    },
+}
 
 
 def github_cloud_agent(request):
-    """Authenticate the official A+ GitHub-hosted macOS workflow via OIDC."""
+    """Authenticate official A+ GitHub-hosted build workflows via OIDC."""
 
     token = request.headers.get("X-GitHub-OIDC", "").strip()
-    if not token:
+    platform = request.headers.get("X-Agent-Platform", "macos").strip().lower()
+    config = _AGENT_CONFIG.get(platform)
+    if not token or not config:
         return None
 
     audience = os.getenv("GITHUB_OIDC_AUDIENCE", "https://publisher.smarbiz.sbs").rstrip("/")
@@ -45,41 +61,37 @@ def github_cloud_agent(request):
         return None
     if claims.get("ref") != "refs/heads/main":
         return None
-    if claims.get("event_name") not in {
-        "schedule",
-        "workflow_dispatch",
-        "workflow_run",
-    }:
+    if claims.get("event_name") not in {"schedule", "workflow_dispatch", "workflow_run"}:
         return None
 
     workflow_ref = claims.get("workflow_ref", "")
-    if workflow_ref and ".github/workflows/cloud-macos.yml@" not in workflow_ref:
+    if workflow_ref and config["workflow"] not in workflow_ref:
         return None
 
     token_hash = hashlib.sha256(
-        f"github-oidc:{allowed_repository}:cloud-macos".encode()
+        f"github-oidc:{allowed_repository}:cloud-{platform}".encode()
     ).hexdigest()
 
     with transaction.atomic():
         agent = BuildAgent.objects.select_for_update().filter(token_hash=token_hash).first()
         if agent is None:
-            agent = BuildAgent.objects.select_for_update().filter(name=_CLOUD_AGENT_NAME).first()
+            agent = BuildAgent.objects.select_for_update().filter(name=config["name"]).first()
         if agent is None:
             return BuildAgent.objects.create(
-                name=_CLOUD_AGENT_NAME,
-                platform="macos",
+                name=config["name"],
+                platform=platform,
                 enabled=True,
                 token_hash=token_hash,
-                labels=["github-hosted", "ephemeral", "xcode", "cloud"],
-                capabilities={"oidc": True, "ephemeral": True},
+                labels=config["labels"],
+                capabilities=config["capabilities"],
             )
 
-        agent.name = _CLOUD_AGENT_NAME
-        agent.platform = "macos"
+        agent.name = config["name"]
+        agent.platform = platform
         agent.enabled = True
         agent.token_hash = token_hash
-        agent.labels = ["github-hosted", "ephemeral", "xcode", "cloud"]
-        agent.capabilities = {"oidc": True, "ephemeral": True}
+        agent.labels = config["labels"]
+        agent.capabilities = config["capabilities"]
         agent.save(
             update_fields=[
                 "name",

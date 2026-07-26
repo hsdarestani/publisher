@@ -12,14 +12,17 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from apps.core.audit import log_event
+from .cloud_auth import github_cloud_agent
 from .forms import MobileAppForm, LocalizationForm, AssetForm, ReleaseForm, BuildAgentForm
 from .models import MobileApp, AppLocalization, AppAsset, Release, Build, BuildAgent, Job, Submission
 from .readiness import evaluate_release
 from .tasks import enqueue_job, run_job
 
+
 @login_required
 def app_list(request):
     return render(request, "publisher/app_list.html", {"apps": MobileApp.objects.prefetch_related("releases", "metrics").all()})
+
 
 @login_required
 def app_create(request):
@@ -29,6 +32,7 @@ def app_create(request):
         messages.success(request, "Application created.")
         return redirect(app)
     return render(request, "shared/form.html", {"form": form, "title": "New application", "back_url": "/apps/"})
+
 
 @login_required
 def app_edit(request, pk):
@@ -40,6 +44,7 @@ def app_edit(request, pk):
         return redirect(app)
     return render(request, "shared/form.html", {"form": form, "title": f"Edit {app.name}", "back_url": app.get_absolute_url()})
 
+
 @login_required
 def app_detail(request, pk):
     app = get_object_or_404(MobileApp.objects.prefetch_related("localizations", "assets", "releases__builds", "submissions"), pk=pk)
@@ -48,6 +53,7 @@ def app_detail(request, pk):
     for row in app.metrics.values("metric").annotate(total=Sum("value")):
         metrics[row["metric"]] = float(row["total"] or 0)
     return render(request, "publisher/app_detail.html", {"app": app, "metrics": metrics, "jobs": app.jobs.all()[:8], "issues": app.technical_issues.exclude(status="resolved")[:6]})
+
 
 @login_required
 def localization_create(request, app_pk):
@@ -59,12 +65,14 @@ def localization_create(request, app_pk):
         return redirect(app)
     return render(request, "shared/form.html", {"form": form, "title": f"Add localization · {app.name}", "back_url": app.get_absolute_url()})
 
+
 @login_required
 def localization_edit(request, pk):
     obj = get_object_or_404(AppLocalization, pk=pk)
     form = LocalizationForm(request.POST or None, instance=obj)
     if request.method == "POST" and form.is_valid(): form.save(); messages.success(request, "Localization updated."); return redirect(obj.app)
     return render(request, "shared/form.html", {"form": form, "title": f"Edit {obj.locale}", "back_url": obj.app.get_absolute_url()})
+
 
 @login_required
 def asset_create(request, app_pk):
@@ -74,12 +82,14 @@ def asset_create(request, app_pk):
         obj = form.save(commit=False); obj.app = app; obj.save(); messages.success(request, "Asset uploaded."); return redirect(app)
     return render(request, "shared/form.html", {"form": form, "title": f"Upload asset · {app.name}", "back_url": app.get_absolute_url()})
 
+
 @login_required
 @require_POST
 def asset_delete(request, pk):
     obj = get_object_or_404(AppAsset, pk=pk); app = obj.app
     obj.file.delete(save=False); obj.delete(); messages.success(request, "Asset removed.")
     return redirect(app)
+
 
 @login_required
 def release_create(request, app_pk):
@@ -95,11 +105,13 @@ def release_create(request, app_pk):
         return redirect(release)
     return render(request, "shared/form.html", {"form": form, "title": f"New release · {app.name}", "back_url": app.get_absolute_url()})
 
+
 @login_required
 def release_detail(request, pk):
     release = get_object_or_404(Release.objects.select_related("app").prefetch_related("builds", "jobs", "submissions"), pk=pk)
     readiness = evaluate_release(release)
     return render(request, "publisher/release_detail.html", {"release": release, "readiness": readiness})
+
 
 @login_required
 @require_POST
@@ -115,13 +127,16 @@ def release_action(request, pk, action):
         build.status = "queued"; build.logs = ""; build.save(update_fields=["status", "logs", "updated_at"])
         enqueue_job(action, app=app, release=release, build=build, agent=True, platform="linux" if platform == "android" else "macos")
         release.status = "building"; release.save(update_fields=["status", "updated_at"])
-        messages.success(request, f"{platform.title()} build queued for an available agent.")
+        if platform == "ios":
+            messages.success(request, "iOS build queued for the automatic A+ Cloud Mac. It will be picked up by GitHub-hosted macOS without a personal Mac.")
+        else:
+            messages.success(request, "Android build queued for an available Linux agent.")
     elif action == "upload_apple":
         build = release.builds.filter(platform="ios", status="succeeded").first()
         if not build: messages.error(request, "A successful iOS build is required.")
         else:
             enqueue_job("upload_apple", app=app, release=release, build=build, agent=True, platform="macos")
-            messages.success(request, "App Store upload queued for a macOS agent.")
+            messages.success(request, "App Store upload queued for the automatic A+ Cloud Mac.")
     elif action in {"upload_google", "submit_google", "submit_apple"}:
         build = release.builds.filter(platform="android" if "google" in action else "ios", status="succeeded").first()
         enqueue_job(action, app=app, release=release, build=build)
@@ -130,6 +145,7 @@ def release_action(request, pk, action):
         return HttpResponseBadRequest("Unknown action")
     log_event(request, f"release.{action}", f"Queued {action} for {release}", release)
     return redirect(release)
+
 
 @login_required
 @require_POST
@@ -141,13 +157,16 @@ def app_action(request, pk, action):
     messages.success(request, f"{action.replace('_', ' ').title()} queued.")
     return redirect(app)
 
+
 @login_required
 def jobs(request):
     return render(request, "publisher/jobs.html", {"jobs": Job.objects.select_related("app", "release", "build")[:300]})
 
+
 @login_required
 def job_detail(request, pk):
     return render(request, "publisher/job_detail.html", {"job": get_object_or_404(Job.objects.select_related("app", "release", "build"), pk=pk)})
+
 
 @login_required
 @require_POST
@@ -158,9 +177,11 @@ def job_retry(request, pk):
     messages.success(request, "Job queued again.")
     return redirect("job_detail", pk=job.pk)
 
+
 @login_required
 def agent_list(request):
     return render(request, "publisher/agents.html", {"agents": BuildAgent.objects.all()})
+
 
 @login_required
 def agent_create(request):
@@ -172,6 +193,7 @@ def agent_create(request):
         return redirect("agent_created", pk=agent.pk)
     return render(request, "shared/form.html", {"form": form, "title": "Register build agent", "back_url": "/apps/agents/"})
 
+
 @login_required
 def agent_created(request, pk):
     agent = get_object_or_404(BuildAgent, pk=pk)
@@ -181,8 +203,12 @@ def agent_created(request, pk):
 
 def _agent_from_request(request):
     token = request.headers.get("X-Agent-Token", "")
-    if not token: return None
-    return BuildAgent.objects.filter(token_hash=hashlib.sha256(token.encode()).hexdigest(), enabled=True).first()
+    if token:
+        agent = BuildAgent.objects.filter(token_hash=hashlib.sha256(token.encode()).hexdigest(), enabled=True).first()
+        if agent:
+            return agent
+    return github_cloud_agent(request)
+
 
 @csrf_exempt
 @require_POST
@@ -213,13 +239,17 @@ def build_agent_payload(job):
         "package_name": app.package_name, "bundle_id": app.bundle_id, "build_config": app.build_config,
         "callback_base": "/apps/agent-api",
     }
-    if job.type == "upload_apple" and app.apple_account and app.apple_account.configured:
+    if job.type in {"build_ios", "upload_apple"} and app.apple_account and app.apple_account.configured:
         payload["apple"] = {
-            "issuer_id": app.apple_account.apple_issuer_id, "key_id": app.apple_account.apple_key_id,
+            "issuer_id": app.apple_account.apple_issuer_id,
+            "key_id": app.apple_account.apple_key_id,
+            "team_id": app.apple_account.apple_team_id,
             "private_key": app.apple_account.get_credentials().get("private_key", ""),
         }
-        if job.build and job.build.artifact: payload["artifact_url"] = job.build.artifact.url
+        if job.type == "upload_apple" and job.build and job.build.artifact:
+            payload["artifact_url"] = job.build.artifact.url
     return payload
+
 
 @csrf_exempt
 @require_POST
@@ -232,17 +262,19 @@ def agent_log(request, job_pk):
         job.build.logs = job.logs; job.build.status = "running"; job.build.save(update_fields=["logs", "status", "updated_at"])
     return JsonResponse({"ok": True})
 
+
 @csrf_exempt
 @require_POST
 def agent_complete(request, job_pk):
-    agent = _agent_from_request(request); job = get_object_or_404(Job.objects.select_related("build", "release"), pk=job_pk)
+    agent = _agent_from_request(request)
+    job = get_object_or_404(Job.objects.select_related("build", "release", "app", "app__apple_account"), pk=job_pk)
     if not agent or agent.current_job_id != job.pk: return JsonResponse({"error": "unauthorized"}, status=401)
     status = request.POST.get("status", "failed")
     artifact = request.FILES.get("artifact")
     metadata = json.loads(request.POST.get("metadata", "{}") or "{}")
     error = request.POST.get("error", "")
-    if job.build:
-        build = job.build
+    build = job.build
+    if build:
         if artifact:
             build.artifact.save(artifact.name, artifact, save=False)
             build.artifact_size = artifact.size
@@ -256,6 +288,18 @@ def agent_complete(request, job_pk):
         build.save()
     job.status = "succeeded" if status == "succeeded" else "failed"; job.progress = 100 if status == "succeeded" else job.progress; job.finished_at = timezone.now(); job.error = error; job.result = metadata; job.save()
     agent.current_job = None; agent.last_seen_at = timezone.now(); agent.save(update_fields=["current_job", "last_seen_at", "updated_at"])
+
+    if status == "succeeded" and job.type == "build_ios" and build and job.app.apple_account and job.app.apple_account.configured:
+        exists = Job.objects.filter(build=build, type="upload_apple", status__in=["queued", "running", "succeeded"]).exists()
+        if not exists:
+            next_job = enqueue_job("upload_apple", app=job.app, release=job.release, build=build, agent=True, platform="macos")
+            next_job.append_log("Automatically queued after the cloud iOS build.")
+
+    if status == "succeeded" and job.type == "upload_apple" and job.release and job.release.auto_submit:
+        exists = Job.objects.filter(release=job.release, type="submit_apple", status__in=["queued", "running", "succeeded"]).exists()
+        if not exists:
+            enqueue_job("submit_apple", app=job.app, release=job.release, build=build)
+
     if job.release:
         builds = job.release.builds.all()
         if builds.exists() and all(b.status == "succeeded" for b in builds): job.release.status = "uploaded" if job.type == "upload_apple" else "ready"

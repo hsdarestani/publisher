@@ -3,7 +3,11 @@
 
 The same implementation supports two modes:
 - Ephemeral GitHub-hosted execution using short-lived OIDC authentication.
-- A persistent Docker agent using a server-generated static agent token.
+- A persistent agent using a server-generated static agent token.
+
+Ephemeral agents can stay alive for a bounded watch window, polling Publisher so
+new Build/Retry actions are claimed within seconds instead of waiting for the
+next scheduled GitHub Actions run.
 """
 from __future__ import annotations
 
@@ -23,12 +27,14 @@ class CloudLinuxAgent(CloudMacAgent):
     def __init__(self, server: str, max_jobs: int = 3):
         static_token = os.getenv("PUBLISHER_AGENT_TOKEN", "").strip()
         self.continuous = bool(static_token) or os.getenv("PUBLISHER_CONTINUOUS", "") == "1"
+        self.interval = int(os.getenv("PUBLISHER_POLL_INTERVAL", "10"))
+        self.watch_seconds = max(0, int(os.getenv("PUBLISHER_WATCH_SECONDS", "0")))
         if static_token:
             Agent.__init__(
                 self,
                 server,
                 token=static_token,
-                interval=int(os.getenv("PUBLISHER_POLL_INTERVAL", "5")),
+                interval=self.interval,
                 work_root=os.getenv("PUBLISHER_WORK_ROOT"),
             )
             self.max_jobs = max_jobs
@@ -38,7 +44,10 @@ class CloudLinuxAgent(CloudMacAgent):
 
     def run(self):
         mode = "persistent" if self.continuous else "ephemeral"
+        deadline = time.monotonic() + self.watch_seconds if self.watch_seconds else None
         print(f"A+ Cloud Linux ({mode}) connected to {self.server}", flush=True)
+        if deadline:
+            print(f"Watching the Android queue for {self.watch_seconds} seconds.", flush=True)
         processed = 0
         had_failures = False
         while self.continuous or processed < self.max_jobs:
@@ -47,7 +56,8 @@ class CloudLinuxAgent(CloudMacAgent):
                 response.raise_for_status()
                 job = response.json().get("job")
                 if not job:
-                    if self.continuous:
+                    should_wait = self.continuous or (deadline is not None and time.monotonic() < deadline)
+                    if should_wait:
                         time.sleep(self.interval)
                         continue
                     print("No Android job is queued.", flush=True)

@@ -65,6 +65,29 @@ services:
       RUN_MIGRATIONS: "0"
     depends_on: [web, redis]
 
+  android-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.android-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PUBLISHER_URL: http://web:8000
+      PUBLISHER_AGENT_TOKEN: ${ANDROID_AGENT_TOKEN}
+      PUBLISHER_CONTINUOUS: "1"
+      PUBLISHER_POLL_INTERVAL: "5"
+      PUBLISHER_MAX_JOBS: "1000000"
+      PUBLISHER_WORK_ROOT: /work
+      PUB_CACHE: /cache/pub
+      GRADLE_USER_HOME: /cache/gradle
+    volumes:
+      - android_agent_work:/work
+      - android_agent_pub_cache:/cache/pub
+      - android_agent_gradle_cache:/cache/gradle
+    depends_on:
+      web:
+        condition: service_healthy
+
   caddy:
     image: caddy:2-alpine
     environment:
@@ -84,5 +107,8 @@ volumes:
   postgres_data:
   redis_data:
   media_data:
+  android_agent_work:
+  android_agent_pub_cache:
+  android_agent_gradle_cache:
   caddy_data:
   caddy_config:

@@ -49,6 +49,7 @@ jobs:
         id: cloud
         continue-on-error: true
         env:
+          PYTHONUNBUFFERED: '1'
           PUBLISHER_URL: https://publisher.smarbiz.sbs
           PUBLISHER_MAX_JOBS: '3'
         run: |

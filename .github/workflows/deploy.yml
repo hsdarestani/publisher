@@ -44,6 +44,7 @@ jobs:
           {
             python manage.py check
             python manage.py migrate --noinput
+            python manage.py collectstatic --noinput
             python manage.py test
           } 2>&1 | tee /tmp/django-ci.log
       - name: Report Django failure on PR

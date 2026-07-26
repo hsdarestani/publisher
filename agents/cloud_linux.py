@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Ephemeral GitHub-hosted Linux/Android agent for A+ Publisher."""
+"""Linux/Android agent for A+ Publisher.
+
+The same implementation supports two modes:
+- Ephemeral GitHub-hosted execution using short-lived OIDC authentication.
+- A persistent Docker agent using a server-generated static agent token.
+"""
 from __future__ import annotations
 
 import base64
@@ -8,56 +13,82 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import time
 
 from cloud_macos import CloudMacAgent
+from runner import Agent
 
 
 class CloudLinuxAgent(CloudMacAgent):
     def __init__(self, server: str, max_jobs: int = 3):
-        super().__init__(server, max_jobs=max_jobs)
+        static_token = os.getenv("PUBLISHER_AGENT_TOKEN", "").strip()
+        self.continuous = bool(static_token) or os.getenv("PUBLISHER_CONTINUOUS", "") == "1"
+        if static_token:
+            Agent.__init__(
+                self,
+                server,
+                token=static_token,
+                interval=int(os.getenv("PUBLISHER_POLL_INTERVAL", "5")),
+                work_root=os.getenv("PUBLISHER_WORK_ROOT"),
+            )
+            self.max_jobs = max_jobs
+        else:
+            super().__init__(server, max_jobs=max_jobs)
         self.session.headers["X-Agent-Platform"] = "linux"
 
     def run(self):
-        print(f"A+ Cloud Linux connected to {self.server}", flush=True)
+        mode = "persistent" if self.continuous else "ephemeral"
+        print(f"A+ Cloud Linux ({mode}) connected to {self.server}", flush=True)
         processed = 0
         had_failures = False
-        while processed < self.max_jobs:
-            response = self.session.post(f"{self.server}/apps/agent-api/claim/", timeout=45)
-            response.raise_for_status()
-            job = response.json().get("job")
-            if not job:
-                print("No Android job is queued.", flush=True)
-                break
+        while self.continuous or processed < self.max_jobs:
+            try:
+                response = self.session.post(f"{self.server}/apps/agent-api/claim/", timeout=45)
+                response.raise_for_status()
+                job = response.json().get("job")
+                if not job:
+                    if self.continuous:
+                        time.sleep(self.interval)
+                        continue
+                    print("No Android job is queued.", flush=True)
+                    break
 
-            if job["type"] == "build_android":
-                try:
-                    signing_response = self.session.get(
-                        f"{self.server}/signing/jobs/{job['id']}/credentials/",
-                        timeout=90,
-                    )
-                    if not signing_response.ok:
-                        detail = signing_response.text.strip()[:2000]
-                        raise RuntimeError(
-                            f"Publisher signing endpoint returned HTTP {signing_response.status_code}: {detail}"
+                if job["type"] == "build_android":
+                    try:
+                        signing_response = self.session.get(
+                            f"{self.server}/signing/jobs/{job['id']}/credentials/",
+                            timeout=90,
                         )
-                    signing_payload = signing_response.json()
-                    job["payload"]["android_signing"] = signing_payload["android_signing"]
-                    job["payload"]["android_certificate_sha256"] = signing_payload.get(
-                        "certificate_sha256", ""
-                    )
-                except Exception as exc:
-                    error = f"Android signing setup failed: {exc}"
-                    self.log(job["id"], f"FAILED: {error}", 95)
-                    self.complete(job["id"], "failed", None, {}, error)
+                        if not signing_response.ok:
+                            detail = signing_response.text.strip()[:2000]
+                            raise RuntimeError(
+                                f"Publisher signing endpoint returned HTTP {signing_response.status_code}: {detail}"
+                            )
+                        signing_payload = signing_response.json()
+                        job["payload"]["android_signing"] = signing_payload["android_signing"]
+                        job["payload"]["android_certificate_sha256"] = signing_payload.get(
+                            "certificate_sha256", ""
+                        )
+                    except Exception as exc:
+                        error = f"Android signing setup failed: {exc}"
+                        self.log(job["id"], f"FAILED: {error}", 95)
+                        self.complete(job["id"], "failed", None, {}, error)
+                        had_failures = True
+                        processed += 1
+                        continue
+
+                if self.execute(job) is False:
                     had_failures = True
-                    processed += 1
-                    continue
+                processed += 1
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if not self.continuous:
+                    raise
+                print(f"persistent agent poll error: {exc}", flush=True)
+                time.sleep(min(self.interval * 2, 60))
 
-            if self.execute(job) is False:
-                had_failures = True
-            processed += 1
-
-        if had_failures:
+        if had_failures and not self.continuous:
             raise RuntimeError("One or more Android jobs failed. See the Publisher execution log.")
 
     def build(self, job_id, job_type, payload, workspace):
@@ -136,14 +167,12 @@ class CloudLinuxAgent(CloudMacAgent):
             if not files:
                 raise RuntimeError(f"Build completed but no AAB matched: {pattern}")
             artifact = max(files, key=lambda path: path.stat().st_mtime)
-            # Android upload certificates are self-signed by design. ``-strict``
-            # treats that normal condition as a failure, so verify integrity only.
             self._run(job_id, ["jarsigner", "-verify", "-verbose", "-certs", str(artifact)], repo_dir, 86)
             self.log(job_id, f"Signed AAB ready: {artifact.relative_to(repo_dir)}", 92)
             return artifact, {
                 "sha256": self.sha256(artifact),
                 "commit": self.git_output(repo_dir, "rev-parse", "HEAD"),
-                "agent": "A+ Cloud Linux · GitHub Actions",
+                "agent": "A+ Persistent Linux" if self.continuous else "A+ Cloud Linux · GitHub Actions",
                 "android_certificate_sha256": payload.get("android_certificate_sha256", ""),
                 "java": subprocess.check_output(["java", "-version"], stderr=subprocess.STDOUT, text=True).splitlines()[0],
                 "flutter": subprocess.check_output(["flutter", "--version"], text=True).splitlines()[0],

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Applications · A+ Publisher{% endblock %}
+{% block page_title %}Applications{% endblock %}
+{% block top_actions %}<a class="btn btn-primary" href="{% url 'app_create' %}">＋ New application</a>{% endblock %}
+{% block content %}
+<div class="page-intro"><div><h2>Your app portfolio</h2><p>Store configuration, releases, builds, analytics and technical health in one place.</p></div><div class="search"><input type="search" placeholder="Search applications" data-filter-input="app-card"></div></div>
+<div class="app-grid">
+{% for app in apps %}<article class="card app-card" data-filter-value="{{ app.name }} {{ app.client_name }} {{ app.package_name }} {{ app.bundle_id }}">
+  <a href="{{ app.get_absolute_url }}" class="app-card-link"><div class="app-card-top"><span class="app-icon large">{{ app.name|slice:':1' }}</span><span class="status status-{{ app.status }}">{{ app.get_status_display }}</span></div><h3>{{ app.name }}</h3><p>{{ app.client_name|default:'A+ Solution' }}</p>
+  <div class="meta-list"><span><i>Framework</i><strong>{{ app.get_framework_display }}</strong></span><span><i>Latest commit</i><strong>{{ app.latest_commit_sha|slice:':8'|default:'Not synced' }}</strong></span><span><i>Releases</i><strong>{{ app.releases.count }}</strong></span></div>
+  <div class="platform-pills">{% if app.supports_android %}<i>Android</i>{% endif %}{% if app.supports_ios %}<i>iOS</i>{% endif %}{% for item in app.tech_stack|slice:':2' %}<i>{{ item }}</i>{% endfor %}</div></a>
+</article>{% empty %}<div class="card empty full"><strong>No apps yet</strong><p>Start by adding an application and its store identifiers.</p><a class="btn btn-primary" href="{% url 'app_create' %}">Create application</a></div>{% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Overview · A+ Publisher{% endblock %}
+{% block page_title %}Release overview{% endblock %}
+{% block top_actions %}<a class="btn btn-primary" href="{% url 'app_create' %}">＋ New application</a>{% endblock %}
+{% block content %}
+<section class="hero-card">
+  <div><span class="eyebrow">Publishing control center</span><h2>Everything between commit and review.</h2><p>Build, validate, publish and monitor Android and iOS apps from one A+ workspace.</p></div>
+  <div class="hero-flow"><span>Source</span><i>→</i><span>Build</span><i>→</i><span>Store</span><i>→</i><strong>Review</strong></div>
+</section>
+<div class="stats-grid">
+  <article class="stat-card"><span>Applications</span><strong>{{ apps_count }}</strong><small>Managed products</small></article>
+  <article class="stat-card"><span>Downloads · 30 days</span><strong>{{ downloads_30d }}</strong><small>Apple + Google</small></article>
+  <article class="stat-card"><span>Active releases</span><strong>{{ active_releases }}</strong><small>Build to review</small></article>
+  <article class="stat-card {% if open_issues %}attention{% endif %}"><span>Open issues</span><strong>{{ open_issues }}</strong><small>{{ failed_jobs }} failed jobs</small></article>
+</div>
+<div class="two-column wide-left">
+  <section class="card">
+    <div class="card-head"><div><span class="eyebrow">Portfolio</span><h3>Applications</h3></div><a href="{% url 'app_list' %}">View all →</a></div>
+    <div class="app-table">
+      {% for app in apps %}<a class="app-row" href="{{ app.get_absolute_url }}"><span class="app-icon">{{ app.name|slice:':1' }}</span><span class="app-main"><strong>{{ app.name }}</strong><small>{{ app.client_name|default:app.get_framework_display }}</small></span><span class="platform-pills">{% if app.supports_android %}<i>Android</i>{% endif %}{% if app.supports_ios %}<i>iOS</i>{% endif %}</span><span class="status status-{{ app.status }}">{{ app.get_status_display }}</span><span>›</span></a>{% empty %}<div class="empty"><strong>No applications yet</strong><p>Create your first app and connect its repository.</p></div>{% endfor %}
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-head"><div><span class="eyebrow">Latest activity</span><h3>Jobs</h3></div><a href="{% url 'jobs' %}">All jobs →</a></div>
+    <div class="timeline">
+      {% for job in jobs %}<a href="{% url 'job_detail' job.pk %}" class="timeline-item"><span class="job-dot status-{{ job.status }}"></span><span><strong>{{ job.get_type_display }}</strong><small>{{ job.app.name|default:'System' }} · {{ job.created_at|timesince }} ago</small></span><i class="status status-{{ job.status }}">{{ job.get_status_display }}</i></a>{% empty %}<div class="empty small">No jobs have run yet.</div>{% endfor %}
+    </div>
+  </section>
+</div>
+<div class="two-column">
+  <section class="card"><div class="card-head"><div><span class="eyebrow">Store pipeline</span><h3>Recent submissions</h3></div></div>
+  {% for submission in submissions %}<div class="compact-row"><span class="store-badge store-{{ submission.platform }}">{% if submission.platform == 'android' %}G{% else %}A{% endif %}</span><span><strong>{{ submission.app.name }}</strong><small>{{ submission.release.version_name }} · {{ submission.get_platform_display }}</small></span><span class="status status-{{ submission.state }}">{{ submission.state|title }}</span></div>{% empty %}<div class="empty small">No store submissions yet.</div>{% endfor %}</section>
+  <section class="card"><div class="card-head"><div><span class="eyebrow">Audit trail</span><h3>Recent changes</h3></div></div>
+  {% for event in audit_events %}<div class="compact-row"><span class="avatar mini">{{ event.actor.username|default:'S'|slice:':1'|upper }}</span><span><strong>{{ event.summary }}</strong><small>{{ event.created_at|date:'M j, H:i' }} · {{ event.actor.username|default:'System' }}</small></span></div>{% empty %}<div class="empty small">No audit events yet.</div>{% endfor %}</section>
+</div>
+{% endblock %}

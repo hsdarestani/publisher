@@ -1,0 +1,25 @@
+from django.urls import path
+from . import views
+urlpatterns = [
+    path("", views.app_list, name="app_list"),
+    path("new/", views.app_create, name="app_create"),
+    path("<int:pk>/", views.app_detail, name="app_detail"),
+    path("<int:pk>/edit/", views.app_edit, name="app_edit"),
+    path("<int:pk>/action/<str:action>/", views.app_action, name="app_action"),
+    path("<int:app_pk>/localizations/new/", views.localization_create, name="localization_create"),
+    path("localizations/<int:pk>/edit/", views.localization_edit, name="localization_edit"),
+    path("<int:app_pk>/assets/new/", views.asset_create, name="asset_create"),
+    path("assets/<int:pk>/delete/", views.asset_delete, name="asset_delete"),
+    path("<int:app_pk>/releases/new/", views.release_create, name="release_create"),
+    path("releases/<int:pk>/", views.release_detail, name="release_detail"),
+    path("releases/<int:pk>/action/<str:action>/", views.release_action, name="release_action"),
+    path("jobs/", views.jobs, name="jobs"),
+    path("jobs/<int:pk>/", views.job_detail, name="job_detail"),
+    path("jobs/<int:pk>/retry/", views.job_retry, name="job_retry"),
+    path("agents/", views.agent_list, name="agents"),
+    path("agents/new/", views.agent_create, name="agent_create"),
+    path("agents/<int:pk>/created/", views.agent_created, name="agent_created"),
+    path("agent-api/claim/", views.agent_claim, name="agent_claim"),
+    path("agent-api/jobs/<int:job_pk>/log/", views.agent_log, name="agent_log"),
+    path("agent-api/jobs/<int:job_pk>/complete/", views.agent_complete, name="agent_complete"),
+]

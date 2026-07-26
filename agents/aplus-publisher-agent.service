@@ -1,0 +1,15 @@
+[Unit]
+Description=A+ Publisher Build Agent
+After=network-online.target
+
+[Service]
+Type=simple
+User=publisher-agent
+WorkingDirectory=/opt/aplus-publisher-agent
+EnvironmentFile=/etc/aplus-publisher-agent.env
+ExecStart=/opt/aplus-publisher-agent/.venv/bin/python /opt/aplus-publisher-agent/runner.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

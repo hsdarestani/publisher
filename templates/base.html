@@ -1,0 +1,47 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fb">
+  <title>{% block title %}A+ Publisher{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+  <script defer src="{% static 'js/app.js' %}"></script>
+</head>
+<body>
+{% if user.is_authenticated %}
+<div class="shell">
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="{% url 'dashboard' %}"><span class="brand-mark">A+</span><span><strong>Publisher</strong><small>App operations</small></span></a>
+    <nav>
+      <a href="{% url 'dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}"><span>⌂</span>Overview</a>
+      <a href="{% url 'app_list' %}" class="{% if request.resolver_match.app_name == 'publisher' or '/apps/' in request.path and '/jobs/' not in request.path and '/agents/' not in request.path %}active{% endif %}"><span>▦</span>Applications</a>
+      <a href="{% url 'jobs' %}" class="{% if '/jobs/' in request.path %}active{% endif %}"><span>↻</span>Jobs</a>
+      <a href="{% url 'agents' %}" class="{% if '/agents/' in request.path %}active{% endif %}"><span>◇</span>Build agents</a>
+      <a href="{% url 'reports' %}" class="{% if '/reports/' in request.path %}active{% endif %}"><span>⌁</span>Analytics</a>
+      <a href="{% url 'issues' %}" class="{% if '/issues/' in request.path %}active{% endif %}"><span>!</span>Technical issues</a>
+      <a href="{% url 'integration_accounts' %}" class="{% if '/integrations/' in request.path %}active{% endif %}"><span>⛓</span>Store accounts</a>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="profile"><span class="avatar">{{ user.username|slice:':1'|upper }}</span><span><strong>{{ user.get_full_name|default:user.username }}</strong><small>{{ user.email|default:'Administrator' }}</small></span></div>
+      <form action="{% url 'logout' %}" method="post">{% csrf_token %}<button class="text-button">Sign out</button></form>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <button class="menu-button" data-toggle-sidebar aria-label="Menu">☰</button>
+      <div><span class="eyebrow">A+ Solution GmbH</span><h1>{% block page_title %}Publisher{% endblock %}</h1></div>
+      <div class="top-actions">{% block top_actions %}{% endblock %}<span class="system-dot" title="System online"></span></div>
+    </header>
+    <div class="content">
+      {% for message in messages %}<div class="alert alert-{{ message.tags|default:'info' }}">{{ message }}<button data-dismiss>×</button></div>{% endfor %}
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+{% else %}
+  {% block guest_content %}{% endblock %}
+{% endif %}
+</body>
+</html>

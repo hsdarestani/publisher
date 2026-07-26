@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · A+ Publisher{% endblock %}
+{% block page_title %}{{ title }}{% endblock %}
+{% block top_actions %}<a href="{{ back_url }}" class="btn btn-quiet">Cancel</a>{% endblock %}
+{% block content %}
+<form method="post" enctype="multipart/form-data" class="card form-card">{% csrf_token %}
+  {% if form.non_field_errors %}<div class="alert alert-error">{{ form.non_field_errors }}</div>{% endif %}
+  <div class="form-grid">
+  {% for field in form %}
+    <div class="field {% if field.name in 'full_description,review_notes,release_notes,credentials_json,apple_private_key,build_config' %}field-wide{% endif %}">
+      <label for="{{ field.id_for_label }}">{{ field.label }}{% if field.field.required %}<span class="required">*</span>{% endif %}</label>
+      {{ field }}
+      {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+      {% for error in field.errors %}<small class="error">{{ error }}</small>{% endfor %}
+    </div>
+  {% endfor %}
+  </div>
+  <div class="form-actions"><a href="{{ back_url }}" class="btn btn-quiet">Cancel</a><button class="btn btn-primary">Save changes</button></div>
+</form>
+{% endblock %}

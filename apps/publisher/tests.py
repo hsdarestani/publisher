@@ -1,0 +1,48 @@
+import hashlib
+import json
+from django.contrib.auth import get_user_model
+from django.test import TestCase, Client
+from django.urls import reverse
+from .models import MobileApp, AppLocalization, Release, Build, BuildAgent, Job, StoreAccount
+from .readiness import evaluate_release
+
+class PublisherTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("test", password="pass12345")
+        self.client.login(username="test", password="pass12345")
+        self.app = MobileApp.objects.create(name="Test App", slug="test-app", package_name="com.test.app", bundle_id="com.test.app", privacy_policy_url="https://example.com/privacy", support_url="https://example.com/support")
+        AppLocalization.objects.create(app=self.app, locale="en-US", title="Test App", full_description="A complete app description")
+        self.release = Release.objects.create(app=self.app, version_name="1.0.0", build_number=1)
+        Build.objects.create(release=self.release, platform="android", status="succeeded")
+        Build.objects.create(release=self.release, platform="ios", status="succeeded")
+
+    def test_dashboard_and_app_pages(self):
+        self.assertEqual(self.client.get(reverse("dashboard")).status_code, 200)
+        self.assertEqual(self.client.get(self.app.get_absolute_url()).status_code, 200)
+        self.assertEqual(self.client.get(self.release.get_absolute_url()).status_code, 200)
+
+    def test_readiness_reports_missing_assets_without_crashing(self):
+        result = evaluate_release(self.release)
+        self.assertFalse(result["ready"])
+        self.assertGreater(result["errors"], 0)
+        self.assertTrue(any(c["key"] == "android-icon" for c in result["checks"]))
+
+    def test_store_account_credentials_are_encrypted(self):
+        account = StoreAccount(provider="google", name="A+")
+        account.set_credentials({"client_email": "x@example.com", "private_key": "secret"})
+        account.save()
+        self.assertNotIn("secret", account.credential_blob)
+        self.assertEqual(account.get_credentials()["private_key"], "secret")
+
+    def test_agent_claim(self):
+        agent, token = BuildAgent.create_with_token(name="linux-1", platform="linux")
+        job = Job.objects.create(type="build_android", app=self.app, release=self.release, build=self.release.builds.get(platform="android"), available_to_agents=True, required_platform="linux")
+        response = self.client.post(reverse("agent_claim"), HTTP_X_AGENT_TOKEN=token)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["job"]["id"], job.pk)
+        job.refresh_from_db()
+        self.assertEqual(job.status, "running")
+
+    def test_missing_agent_token_is_rejected(self):
+        response = self.client.post(reverse("agent_claim"))
+        self.assertEqual(response.status_code, 401)

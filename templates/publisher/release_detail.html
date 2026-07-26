@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}{{ release }} · A+ Publisher{% endblock %}
+{% block page_title %}Release {{ release.version_name }}{% endblock %}
+{% block top_actions %}<a class="btn btn-quiet" href="{{ release.app.get_absolute_url }}">Back to app</a>{% endblock %}
+{% block content %}
+<section class="release-hero card"><div><span class="eyebrow">{{ release.app.name }}</span><h2>Version {{ release.version_name }} <small>Build {{ release.build_number }}</small></h2><div class="platform-pills"><span class="status status-{{ release.status }}">{{ release.get_status_display }}</span><i>{{ release.source_branch }}</i>{% if release.source_commit %}<i>{{ release.source_commit|slice:':8' }}</i>{% endif %}</div></div><div class="score-ring {% if readiness.ready %}ready{% endif %}"><strong>{{ readiness.passed }}</strong><small>checks passed</small></div></section>
+<div class="release-layout">
+  <section class="card"><div class="card-head"><div><span class="eyebrow">Preflight</span><h3>Store readiness</h3></div><form method="post" action="{% url 'release_action' release.pk 'check' %}">{% csrf_token %}<button class="btn btn-quiet">Run checks</button></form></div>
+    <div class="check-summary"><span class="pass">✓ {{ readiness.passed }} passed</span><span class="warn">△ {{ readiness.warnings }} warnings</span><span class="fail">× {{ readiness.errors }} errors</span></div>
+    <div class="check-list">{% for check in readiness.checks %}<div class="check check-{{ check.status }}"><span>{% if check.status == 'pass' %}✓{% elif check.status == 'warning' %}△{% else %}×{% endif %}</span><div><strong>{{ check.label }}</strong><small>{{ check.message }}</small></div><i>{{ check.platform }}</i></div>{% endfor %}</div>
+  </section>
+  <aside>
+    <section class="card"><div class="card-head"><div><span class="eyebrow">Artifacts</span><h3>Builds</h3></div></div>{% for build in release.builds.all %}<div class="build-card"><div><strong>{{ build.get_platform_display }}</strong><span class="status status-{{ build.status }}">{{ build.get_status_display }}</span></div><small>{% if build.agent %}{{ build.agent.name }} · {% endif %}{% if build.artifact %}{{ build.artifact_size|filesizeformat }}{% else %}No artifact yet{% endif %}</small>{% if build.artifact %}<a href="{{ build.artifact.url }}">Download artifact</a>{% endif %}</div>{% endfor %}</section>
+    <section class="card"><div class="card-head"><div><span class="eyebrow">Pipeline</span><h3>Actions</h3></div></div><div class="action-stack">
+      {% if release.app.supports_android %}<form method="post" action="{% url 'release_action' release.pk 'build_android' %}">{% csrf_token %}<button class="btn btn-quiet btn-block">1. Build Android</button></form><form method="post" action="{% url 'release_action' release.pk 'upload_google' %}">{% csrf_token %}<button class="btn btn-primary btn-block" {% if not release.app.google_account.configured %}disabled{% endif %}>2. Upload & submit Google</button></form>{% endif %}
+      {% if release.app.supports_ios %}<form method="post" action="{% url 'release_action' release.pk 'build_ios' %}">{% csrf_token %}<button class="btn btn-quiet btn-block">1. Build iOS</button></form><form method="post" action="{% url 'release_action' release.pk 'upload_apple' %}">{% csrf_token %}<button class="btn btn-quiet btn-block" {% if not release.app.apple_account.configured %}disabled{% endif %}>2. Upload with Transporter</button></form><form method="post" action="{% url 'release_action' release.pk 'submit_apple' %}">{% csrf_token %}<button class="btn btn-primary btn-block" {% if not release.app.apple_account.configured %}disabled{% endif %}>3. Submit Apple review</button></form>{% endif %}
+    </div></section>
+  </aside>
+</div>
+<section class="card"><div class="card-head"><div><span class="eyebrow">Execution history</span><h3>Release jobs</h3></div></div>{% for job in release.jobs.all %}<a class="compact-row" href="{% url 'job_detail' job.pk %}"><span class="job-dot status-{{ job.status }}"></span><span><strong>{{ job.get_type_display }}</strong><small>{{ job.created_at|date:'M j, H:i' }} · {{ job.progress }}%</small></span><span class="status status-{{ job.status }}">{{ job.status }}</span></a>{% empty %}<div class="empty small">No jobs yet.</div>{% endfor %}</section>
+{% endblock %}

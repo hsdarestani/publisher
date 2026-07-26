@@ -3,6 +3,7 @@ name: A+ Cloud Linux
 on:
   workflow_dispatch:
   schedule:
+    # Polling fallback for queued Android jobs.
     - cron: '*/5 * * * *'
   workflow_run:
     workflows: ['Validate and deploy A+ Publisher']

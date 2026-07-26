@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: publisher-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   test:

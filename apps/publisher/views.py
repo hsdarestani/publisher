@@ -220,7 +220,13 @@ def agent_claim(request):
     allowed = [agent.platform]
     if agent.platform == "universal": allowed = ["linux", "macos"]
     with transaction.atomic():
-        job = Job.objects.select_for_update(skip_locked=True).filter(status="queued", available_to_agents=True, required_platform__in=allowed).select_related("app", "release", "build", "app__apple_account").first()
+        # Lock only the Job table. Joining nullable app/release/build relations in
+        # the SELECT FOR UPDATE query is rejected by PostgreSQL.
+        job = Job.objects.select_for_update(skip_locked=True).filter(
+            status="queued",
+            available_to_agents=True,
+            required_platform__in=allowed,
+        ).first()
         if not job: return JsonResponse({"job": None})
         job.status, job.started_at, job.progress = "running", timezone.now(), 1; job.save(update_fields=["status", "started_at", "progress", "updated_at"])
         if job.build:

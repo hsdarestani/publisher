@@ -15,6 +15,9 @@ install_docker_stack() {
     systemctl enable --now docker
     return 0
   fi
+
+  # Fallback to Docker's official apt repository when the Ubuntu mirror does not
+  # expose the Compose v2 package.
   DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl
   apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc >/dev/null 2>&1 || true
   install -m 0755 -d /etc/apt/keyrings
@@ -52,7 +55,7 @@ PUBLIC_URL=https://publisher.smarbiz.sbs
 DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
 ENCRYPTION_KEY=$ENCRYPTION_KEY
 DEBUG=0
-ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1,web
+ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1
 CSRF_TRUSTED_ORIGINS=https://publisher.smarbiz.sbs
 POSTGRES_DB=publisher
 POSTGRES_USER=publisher
@@ -61,16 +64,8 @@ TIME_ZONE=Europe/Berlin
 ENV
 fi
 
-grep -v '^ALLOWED_HOSTS=' .env > .env.tmp || true
-printf '%s\n' 'ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1,web' >> .env.tmp
-mv .env.tmp .env
-
-if ! grep -Eq '^ANDROID_AGENT_TOKEN=.+$' .env; then
-  grep -v '^ANDROID_AGENT_TOKEN=' .env > .env.tmp || true
-  printf 'ANDROID_AGENT_TOKEN=%s\n' "$(openssl rand -hex 48)" >> .env.tmp
-  mv .env.tmp .env
-fi
-
+# Optional values from GitHub secrets. Empty lines are ignored, so deployment never
+# depends on these variables being present.
 if [ -f "$OVERRIDES" ]; then
   while IFS='=' read -r key value; do
     [ -z "$key" ] && continue
@@ -82,6 +77,10 @@ if [ -f "$OVERRIDES" ]; then
 fi
 chmod 600 .env
 
+# A failed first installation may leave partially-created PostgreSQL objects. There
+# is no user data before this marker exists, so reset all first-boot volumes once.
+# The marker is preserved across releases and makes this branch permanently inert
+# after the first successful health check.
 if [ ! -f "$BOOTSTRAP_MARKER" ]; then
   echo "Preparing a clean first-install database..."
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
@@ -90,49 +89,10 @@ fi
 docker compose build --pull
 docker compose up -d --remove-orphans
 
+# The web entrypoint owns migrations, static collection and administrator updates.
 echo "Waiting for application health and startup migrations..."
-for attempt in $(seq 1 60); do
+for attempt in $(seq 1 45); do
   if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
-    docker compose exec -T web python manage.py shell -c '
-import hashlib
-import os
-from apps.publisher.models import BuildAgent
-
-token = os.environ["ANDROID_AGENT_TOKEN"]
-agent, _ = BuildAgent.objects.update_or_create(
-    name="A+ Persistent Linux",
-    defaults={
-        "platform": "linux",
-        "enabled": True,
-        "token_hash": hashlib.sha256(token.encode()).hexdigest(),
-        "labels": ["android", "flutter", "persistent", "server"],
-        "capabilities": {"android": True, "flutter": True, "persistent": True},
-    },
-)
-print(f"Persistent Android agent registered: {agent.pk}")
-'
-
-    echo "Waiting for the persistent Android agent to connect..."
-    agent_online=0
-    for agent_attempt in $(seq 1 45); do
-      if docker compose exec -T web python manage.py shell -c '
-from apps.publisher.models import BuildAgent
-agent = BuildAgent.objects.get(name="A+ Persistent Linux")
-assert agent.online, "Persistent Android agent has not checked in yet"
-print("Persistent Android agent is online.")
-' >/dev/null 2>&1; then
-        agent_online=1
-        break
-      fi
-      sleep 2
-    done
-    if [ "$agent_online" != "1" ]; then
-      echo "Persistent Android agent did not become healthy."
-      docker compose ps android-agent
-      docker compose logs --tail=200 android-agent
-      exit 1
-    fi
-
     if docker compose exec -T web sh -lc '[ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]'; then
       docker compose exec -T web python manage.py shell -c '
 import os
@@ -146,7 +106,7 @@ print("Configured administrator authentication verified.")
     fi
     touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
-    echo "A+ Publisher and the persistent Android agent are healthy."
+    echo "A+ Publisher is healthy."
     docker image prune -f >/dev/null 2>&1 || true
     exit 0
   fi
@@ -154,5 +114,5 @@ print("Configured administrator authentication verified.")
 done
 
 docker compose ps
-docker compose logs --tail=200 web worker beat android-agent caddy
+docker compose logs --tail=200 web worker beat caddy
 exit 1

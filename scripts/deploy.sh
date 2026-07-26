@@ -15,7 +15,6 @@ install_docker_stack() {
     systemctl enable --now docker
     return 0
   fi
-
   DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl
   apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc >/dev/null 2>&1 || true
   install -m 0755 -d /etc/apt/keyrings
@@ -62,21 +61,16 @@ TIME_ZONE=Europe/Berlin
 ENV
 fi
 
-# The internal Docker hostname is required by the persistent Android agent.
 grep -v '^ALLOWED_HOSTS=' .env > .env.tmp || true
 printf '%s\n' 'ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1,web' >> .env.tmp
 mv .env.tmp .env
 
-# Keep a private, persistent token on the server for the always-on Android agent.
-# It is generated only once and never needs to be stored in GitHub secrets.
 if ! grep -Eq '^ANDROID_AGENT_TOKEN=.+$' .env; then
   grep -v '^ANDROID_AGENT_TOKEN=' .env > .env.tmp || true
   printf 'ANDROID_AGENT_TOKEN=%s\n' "$(openssl rand -hex 48)" >> .env.tmp
   mv .env.tmp .env
 fi
 
-# Optional values from GitHub secrets. Empty lines are ignored, so deployment never
-# depends on these variables being present.
 if [ -f "$OVERRIDES" ]; then
   while IFS='=' read -r key value; do
     [ -z "$key" ] && continue
@@ -117,6 +111,28 @@ agent, _ = BuildAgent.objects.update_or_create(
 )
 print(f"Persistent Android agent registered: {agent.pk}")
 '
+
+    echo "Waiting for the persistent Android agent to connect..."
+    agent_online=0
+    for agent_attempt in $(seq 1 45); do
+      if docker compose exec -T web python manage.py shell -c '
+from apps.publisher.models import BuildAgent
+agent = BuildAgent.objects.get(name="A+ Persistent Linux")
+assert agent.online, "Persistent Android agent has not checked in yet"
+print("Persistent Android agent is online.")
+' >/dev/null 2>&1; then
+        agent_online=1
+        break
+      fi
+      sleep 2
+    done
+    if [ "$agent_online" != "1" ]; then
+      echo "Persistent Android agent did not become healthy."
+      docker compose ps android-agent
+      docker compose logs --tail=200 android-agent
+      exit 1
+    fi
+
     if docker compose exec -T web sh -lc '[ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]'; then
       docker compose exec -T web python manage.py shell -c '
 import os
@@ -130,7 +146,7 @@ print("Configured administrator authentication verified.")
     fi
     touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
-    echo "A+ Publisher is healthy."
+    echo "A+ Publisher and the persistent Android agent are healthy."
     docker image prune -f >/dev/null 2>&1 || true
     exit 0
   fi

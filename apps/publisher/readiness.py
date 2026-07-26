@@ -35,6 +35,7 @@ def evaluate_release(release):
     if app.supports_android:
         add("android-id", "Android package", bool(app.package_name), "Package name is set.", "Android package name is missing.", "android")
         add("google-account", "Google account", bool(app.google_account and app.google_account.configured), "Google Play credentials are configured.", "Google Play is not configured; Android publishing stays disabled.", "android", "warning")
+        add("android-signing", "Android upload key", hasattr(app, "android_signing"), "A persistent encrypted upload key is configured.", "The upload key will be generated automatically when the first Android build starts.", "android", "warning")
         add("android-icon", "Android icon", app.assets.filter(kind="icon", platform__in=["android", "shared"]).exists(), "Android icon exists.", "Upload an Android/shared app icon.", "android")
         add("android-screens", "Android screenshots", app.assets.filter(kind="screenshot", platform="android").exists(), "Android screenshots exist.", "Upload Android screenshots.", "android", "warning")
     if app.supports_ios:

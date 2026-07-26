@@ -57,11 +57,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `### CI runtime failure
-
-\`\`\`text
-${log}
-\`\`\``
+              body: '### CI runtime failure\n\n```text\n' + log + '\n```'
             });
       - name: Enforce Django result
         if: steps.django.outcome == 'failure'

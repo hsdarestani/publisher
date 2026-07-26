@@ -83,16 +83,16 @@ jobs:
             const log = fs.existsSync('/tmp/cloud-linux.log')
               ? fs.readFileSync('/tmp/cloud-linux.log', 'utf8').slice(-12000)
               : 'No cloud Linux agent log was produced.';
+            const body = ok
+              ? '✅ Cloud Linux completed successfully.\n\n```text\n' + log + '\n```'
+              : '### Cloud Linux failure\n\n```text\n' + log + '\n```';
             await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: 4,
               title: ok ? 'A+ Cloud Linux healthy' : 'A+ Cloud Linux failed',
               state: ok ? 'closed' : 'open',
-              body: (ok
-                ? '✅ GitHub provisioned a Linux runner with Java and Flutter, OIDC authentication to Publisher succeeded, and the agent checked the Android queue.'
-                : '### Cloud Linux failure\n\n```text\n' + log + '\n```')
-                + '\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
+              body: body + '\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
             });
 
       - name: Enforce cloud Linux result

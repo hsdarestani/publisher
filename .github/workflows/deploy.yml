@@ -103,10 +103,10 @@ jobs:
           [ -n "$ADMIN_EMAIL" ] && printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
-      - name: Deploy over SSH
+      - name: Deploy over SSH and verify public HTTPS
         id: production
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 35
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -119,6 +119,11 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
             sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
             sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+            echo "Verifying the public DNS, TLS certificate and reverse proxy..."
+            curl --fail --silent --show-error \
+              --retry 12 --retry-all-errors --retry-delay 10 \
+              --connect-timeout 10 --max-time 20 \
+              https://publisher.smarbiz.sbs/healthz/
           } 2>&1 | tee /tmp/deploy-ci.log
       - name: Report production result
         if: always()
@@ -134,7 +139,7 @@ jobs:
               issue_number: 2,
               title: ok ? 'Production deployment healthy' : 'Production deployment failed',
               state: ok ? 'closed' : 'open',
-              body: ok ? '✅ Production deployment completed successfully on `publisher.smarbiz.sbs`.\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId : '### Production deployment failure\n\n```text\n' + log + '\n```'
+              body: ok ? '✅ Production deployment and public HTTPS health check completed successfully on `publisher.smarbiz.sbs`.\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId : '### Production deployment failure\n\n```text\n' + log + '\n```'
             });
       - name: Enforce production result
         if: steps.production.outcome == 'failure'

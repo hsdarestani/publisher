@@ -8,7 +8,8 @@ on:
       - '.github/workflows/cloud-linux.yml'
       - 'agents/**'
   schedule:
-    # Polling fallback for queued Android jobs.
+    # Combined with the watch window below, this keeps an Android runner ready
+    # for newly queued Build/Retry actions without a permanent Mac or Linux host.
     - cron: '*/5 * * * *'
   workflow_run:
     workflows: ['Validate and deploy A+ Publisher']
@@ -66,13 +67,15 @@ jobs:
             --connect-timeout 10 --max-time 20 \
             https://publisher.smarbiz.sbs/healthz/
 
-      - name: Claim and execute Android jobs
+      - name: Watch, claim and execute Android jobs
         id: cloud
         continue-on-error: true
         env:
           PYTHONUNBUFFERED: '1'
           PUBLISHER_URL: https://publisher.smarbiz.sbs
-          PUBLISHER_MAX_JOBS: '3'
+          PUBLISHER_MAX_JOBS: '10'
+          PUBLISHER_POLL_INTERVAL: '10'
+          PUBLISHER_WATCH_SECONDS: '240'
         run: |
           set +e
           python agents/cloud_linux.py 2>&1 | tee /tmp/cloud-linux.log

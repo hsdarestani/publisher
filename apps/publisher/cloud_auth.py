@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 
 import jwt
+from django.db import transaction
 from jwt import PyJWKClient
 
 from .models import BuildAgent
 
 
+logger = logging.getLogger(__name__)
 _GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 _GITHUB_JWKS = PyJWKClient(f"{_GITHUB_OIDC_ISSUER}/.well-known/jwks")
+_CLOUD_AGENT_NAME = "A+ Cloud Mac · GitHub Actions"
 
 
 def github_cloud_agent(request):
@@ -38,7 +42,8 @@ def github_cloud_agent(request):
             issuer=_GITHUB_OIDC_ISSUER,
             options={"require": ["exp", "iat", "iss", "aud", "repository", "ref"]},
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("Rejected GitHub OIDC token: %s", exc)
         return None
 
     if claims.get("repository") != allowed_repository:
@@ -55,25 +60,41 @@ def github_cloud_agent(request):
     token_hash = hashlib.sha256(
         f"github-oidc:{allowed_repository}:cloud-macos".encode()
     ).hexdigest()
-    agent, _ = BuildAgent.objects.get_or_create(
-        token_hash=token_hash,
-        defaults={
-            "name": "A+ Cloud Mac · GitHub Actions",
-            "platform": "macos",
-            "enabled": True,
-            "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
-            "capabilities": {"oidc": True, "ephemeral": True},
-        },
-    )
 
-    changed = []
-    if not agent.enabled:
-        agent.enabled = True
-        changed.append("enabled")
-    if agent.platform != "macos":
+    # Older deployments or a manually-created agent may already own either the
+    # stable name or token hash. Resolve both identities before creating anything,
+    # then normalize the record in one transaction. Repeated ephemeral runners are
+    # therefore safe and never hit the unique name/token constraints.
+    with transaction.atomic():
+        agent = BuildAgent.objects.select_for_update().filter(token_hash=token_hash).first()
+        if agent is None:
+            agent = BuildAgent.objects.select_for_update().filter(name=_CLOUD_AGENT_NAME).first()
+        if agent is None:
+            agent = BuildAgent.objects.create(
+                name=_CLOUD_AGENT_NAME,
+                platform="macos",
+                enabled=True,
+                token_hash=token_hash,
+                labels=["github-hosted", "ephemeral", "xcode", "cloud"],
+                capabilities={"oidc": True, "ephemeral": True},
+            )
+            return agent
+
+        agent.name = _CLOUD_AGENT_NAME
         agent.platform = "macos"
-        changed.append("platform")
-    if changed:
-        changed.append("updated_at")
-        agent.save(update_fields=changed)
-    return agent
+        agent.enabled = True
+        agent.token_hash = token_hash
+        agent.labels = ["github-hosted", "ephemeral", "xcode", "cloud"]
+        agent.capabilities = {"oidc": True, "ephemeral": True}
+        agent.save(
+            update_fields=[
+                "name",
+                "platform",
+                "enabled",
+                "token_hash",
+                "labels",
+                "capabilities",
+                "updated_at",
+            ]
+        )
+        return agent

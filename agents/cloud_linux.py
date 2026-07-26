@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Ephemeral GitHub-hosted Linux/Android agent for A+ Publisher."""
+from __future__ import annotations
+
+import base64
+import glob
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+
+from cloud_macos import CloudMacAgent
+
+
+class CloudLinuxAgent(CloudMacAgent):
+    def __init__(self, server: str, max_jobs: int = 3):
+        super().__init__(server, max_jobs=max_jobs)
+        self.session.headers["X-Agent-Platform"] = "linux"
+
+    def run(self):
+        print(f"A+ Cloud Linux connected to {self.server}", flush=True)
+        processed = 0
+        while processed < self.max_jobs:
+            response = self.session.post(f"{self.server}/apps/agent-api/claim/", timeout=45)
+            response.raise_for_status()
+            job = response.json().get("job")
+            if not job:
+                print("No Android job is queued.", flush=True)
+                return
+            if job["type"] == "build_android":
+                signing_response = self.session.get(
+                    f"{self.server}/signing/jobs/{job['id']}/credentials/",
+                    timeout=60,
+                )
+                signing_response.raise_for_status()
+                signing_payload = signing_response.json()
+                job["payload"]["android_signing"] = signing_payload["android_signing"]
+                job["payload"]["android_certificate_sha256"] = signing_payload.get(
+                    "certificate_sha256", ""
+                )
+            self.execute(job)
+            processed += 1
+
+    def build(self, job_id, job_type, payload, workspace):
+        if job_type != "build_android":
+            return super().build(job_id, job_type, payload, workspace)
+
+        repo_dir = workspace / "repo"
+        self._clone(job_id, payload, workspace, repo_dir)
+        if payload.get("commit"):
+            self._run(job_id, ["git", "fetch", "--depth", "1", "origin", payload["commit"]], repo_dir, 12)
+            self._run(job_id, ["git", "checkout", payload["commit"]], repo_dir, 14)
+
+        signing = payload.get("android_signing") or {}
+        missing = [
+            key
+            for key in ("keystore_base64", "key_alias", "store_password", "key_password")
+            if not signing.get(key)
+        ]
+        if missing:
+            raise RuntimeError("Android upload signing is incomplete: " + ", ".join(missing))
+
+        android_dir = repo_dir / "android"
+        android_dir.mkdir(parents=True, exist_ok=True)
+        key_path = android_dir / "upload-keystore.jks"
+        properties_path = android_dir / "key.properties"
+        key_path.write_bytes(base64.b64decode(signing["keystore_base64"]))
+        key_path.chmod(0o600)
+        properties_path.write_text(
+            "\n".join(
+                [
+                    f"storePassword={signing['store_password']}",
+                    f"keyPassword={signing['key_password']}",
+                    f"keyAlias={signing['key_alias']}",
+                    "storeFile=../upload-keystore.jks",
+                    "",
+                ]
+            )
+        )
+        properties_path.chmod(0o600)
+
+        config = payload.get("build_config") or {}
+        env = os.environ.copy()
+        env.update({str(key): str(value) for key, value in (config.get("env") or {}).items()})
+        env.update(
+            {
+                "APP_VERSION_NAME": str(payload["version_name"]),
+                "APP_BUILD_NUMBER": str(payload["build_number"]),
+            }
+        )
+
+        if config.get("android_command"):
+            command = config["android_command"]
+        elif payload.get("framework") == "flutter":
+            command_parts = [
+                "flutter pub get",
+                "flutter build appbundle --release",
+                f"--build-name {shlex.quote(str(payload['version_name']))}",
+                f"--build-number {int(payload['build_number'])}",
+            ]
+            for key, value in (config.get("android_dart_defines") or {}).items():
+                command_parts.append(
+                    "--dart-define=" + shlex.quote(f"{key}={value}")
+                )
+            command = " && ".join(command_parts[:1]) + " && " + " ".join(command_parts[1:])
+        else:
+            command = self.default_android_command(payload)
+
+        try:
+            self.run_shell(job_id, command, repo_dir, env, 20)
+            pattern = config.get("android_artifact") or "build/app/outputs/bundle/release/*.aab"
+            files = [
+                Path(path)
+                for path in glob.glob(str(repo_dir / pattern), recursive=True)
+                if Path(path).is_file()
+            ]
+            if not files:
+                raise RuntimeError(f"Build completed but no AAB matched: {pattern}")
+            artifact = max(files, key=lambda path: path.stat().st_mtime)
+            self._run(job_id, ["jarsigner", "-verify", "-strict", str(artifact)], repo_dir, 86)
+            self.log(job_id, f"Signed AAB ready: {artifact.relative_to(repo_dir)}", 92)
+            return artifact, {
+                "sha256": self.sha256(artifact),
+                "commit": self.git_output(repo_dir, "rev-parse", "HEAD"),
+                "agent": "A+ Cloud Linux · GitHub Actions",
+                "android_certificate_sha256": payload.get("android_certificate_sha256", ""),
+                "java": subprocess.check_output(["java", "-version"], stderr=subprocess.STDOUT, text=True).splitlines()[0],
+                "flutter": subprocess.check_output(["flutter", "--version"], text=True).splitlines()[0],
+            }
+        finally:
+            properties_path.unlink(missing_ok=True)
+            key_path.unlink(missing_ok=True)
+
+
+def main():
+    server = os.getenv("PUBLISHER_URL", "https://publisher.smarbiz.sbs")
+    max_jobs = int(os.getenv("PUBLISHER_MAX_JOBS", "3"))
+    CloudLinuxAgent(server, max_jobs=max_jobs).run()
+
+
+if __name__ == "__main__":
+    main()

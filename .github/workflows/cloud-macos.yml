@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  issues: write
 
 concurrency:
   group: aplus-cloud-macos
@@ -45,7 +46,31 @@ jobs:
           xcrun --find iTMSTransporter
 
       - name: Claim and execute macOS jobs
+        id: cloud
+        continue-on-error: true
         env:
           PUBLISHER_URL: https://publisher.smarbiz.sbs
           PUBLISHER_MAX_JOBS: '3'
         run: python agents/cloud_macos.py
+
+      - name: Report cloud Mac status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ok = '${{ steps.cloud.outcome }}' === 'success';
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 3,
+              title: ok ? 'A+ Cloud Mac healthy' : 'A+ Cloud Mac failed',
+              state: ok ? 'closed' : 'open',
+              body: (ok
+                ? '✅ GitHub provisioned a real macOS runner, Xcode and Transporter were available, OIDC authentication to Publisher succeeded, and the agent checked the iOS queue.'
+                : '❌ The cloud Mac validation failed. Open the workflow run for the exact log.')
+                + '\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
+            });
+
+      - name: Enforce cloud Mac result
+        if: steps.cloud.outcome == 'failure'
+        run: exit 1

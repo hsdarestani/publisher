@@ -4,15 +4,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '*/5 * * * *'
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/cloud-macos.yml'
-      - 'agents/cloud_macos.py'
-      - 'agents/runner.py'
-      - 'apps/core/middleware.py'
-      - 'apps/publisher/cloud_auth.py'
-      - 'apps/publisher/views.py'
 
 permissions:
   contents: read
@@ -45,6 +36,13 @@ jobs:
           sw_vers
           xcodebuild -version
           xcrun --find iTMSTransporter
+
+      - name: Wait for Publisher health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 18 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/
 
       - name: Claim and execute macOS jobs
         id: cloud

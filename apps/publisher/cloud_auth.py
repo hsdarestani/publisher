@@ -18,7 +18,7 @@ def github_cloud_agent(request):
 
     No persistent agent secret is required. The token is short-lived, signed by
     GitHub and restricted to the configured repository, main branch, audience,
-    and schedule/manual workflow events.
+    and the cloud macOS workflow's supported trigger events.
     """
 
     token = request.headers.get("X-GitHub-OIDC", "").strip()
@@ -45,7 +45,11 @@ def github_cloud_agent(request):
         return None
     if claims.get("ref") != "refs/heads/main":
         return None
-    if claims.get("event_name") not in {"schedule", "workflow_dispatch"}:
+    if claims.get("event_name") not in {"schedule", "workflow_dispatch", "push"}:
+        return None
+
+    workflow_ref = claims.get("workflow_ref", "")
+    if workflow_ref and ".github/workflows/cloud-macos.yml@" not in workflow_ref:
         return None
 
     token_hash = hashlib.sha256(

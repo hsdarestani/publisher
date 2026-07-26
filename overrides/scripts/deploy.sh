@@ -78,12 +78,13 @@ chmod 600 .env
 
 docker compose build --pull
 docker compose up -d --remove-orphans
-docker compose exec -T web python manage.py migrate --noinput
-docker compose exec -T web python manage.py collectstatic --noinput
 
-echo "Waiting for application health..."
-for attempt in $(seq 1 30); do
-  if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null; then
+# The web entrypoint owns migrations, static collection and initial administrator
+# creation. Running migrate again here can overlap with container startup and cause
+# PostgreSQL DDL races on a fresh database.
+echo "Waiting for application health and startup migrations..."
+for attempt in $(seq 1 45); do
+  if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
     echo "A+ Publisher is healthy."
     docker image prune -f >/dev/null 2>&1 || true
     exit 0
@@ -92,5 +93,5 @@ for attempt in $(seq 1 30); do
 done
 
 docker compose ps
-docker compose logs --tail=150 web caddy
+docker compose logs --tail=200 web worker beat caddy
 exit 1

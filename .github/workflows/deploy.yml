@@ -28,6 +28,9 @@ jobs:
           if [ -f source-bundle.tar.gz ]; then
             tar -xzf source-bundle.tar.gz
           fi
+          if [ -d overrides ]; then
+            cp -a overrides/. .
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -83,6 +86,9 @@ jobs:
           if [ -f source-bundle.tar.gz ]; then
             tar -xzf source-bundle.tar.gz
           fi
+          if [ -d overrides ]; then
+            cp -a overrides/. .
+          fi
       - name: Package release
         run: tar --exclude=.git --exclude=.env -czf /tmp/aplus-publisher.tar.gz .
       - name: Prepare optional deployment settings
@@ -121,7 +127,13 @@ jobs:
           if [ ! -f source-bundle.tar.gz ]; then
             exit 0
           fi
+          cp .github/workflows/deploy.yml /tmp/deploy.yml
           tar -xzf source-bundle.tar.gz
+          cp /tmp/deploy.yml .github/workflows/deploy.yml
+          if [ -d overrides ]; then
+            cp -a overrides/. .
+          fi
+          rm -rf overrides
           rm -f source-bundle.tar.gz source-bundle.b64.part*
           git config user.name "A+ Publisher Bot"
           git config user.email "publisher-bot@users.noreply.github.com"

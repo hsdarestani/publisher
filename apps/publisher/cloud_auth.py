@@ -31,6 +31,65 @@ _AGENT_CONFIG = {
 }
 
 
+def _recover_interrupted_job(agent, request) -> None:
+    """Requeue work left behind when an ephemeral GitHub runner terminated.
+
+    A cloud runner makes another claim only after the prior workflow attempt has
+    ended (the workflows use a concurrency group). Therefore a still-running
+    ``current_job`` at the beginning of a new claim is orphaned and safe to
+    recover automatically.
+    """
+
+    if not request.path.endswith("/agent-api/claim/") or not agent.current_job_id:
+        return
+
+    job = agent.current_job
+    if job.status != "running":
+        agent.current_job = None
+        return
+
+    job.logs = (
+        job.logs
+        + "\nPrevious ephemeral cloud runner stopped before completion; job was recovered automatically."
+    ).strip()[-200000:]
+    job.status = "queued"
+    job.progress = 0
+    job.started_at = None
+    job.finished_at = None
+    job.error = ""
+    job.save(
+        update_fields=[
+            "logs",
+            "status",
+            "progress",
+            "started_at",
+            "finished_at",
+            "error",
+            "updated_at",
+        ]
+    )
+
+    if job.build_id:
+        build = job.build
+        build.status = "queued"
+        build.agent = None
+        build.started_at = None
+        build.finished_at = None
+        build.logs = job.logs
+        build.save(
+            update_fields=[
+                "status",
+                "agent",
+                "started_at",
+                "finished_at",
+                "logs",
+                "updated_at",
+            ]
+        )
+
+    agent.current_job = None
+
+
 def github_cloud_agent(request):
     """Authenticate official A+ GitHub-hosted build workflows via OIDC."""
 
@@ -86,6 +145,7 @@ def github_cloud_agent(request):
                 capabilities=config["capabilities"],
             )
 
+        _recover_interrupted_job(agent, request)
         agent.name = config["name"]
         agent.platform = platform
         agent.enabled = True
@@ -100,6 +160,7 @@ def github_cloud_agent(request):
                 "token_hash",
                 "labels",
                 "capabilities",
+                "current_job",
                 "updated_at",
             ]
         )

@@ -71,6 +71,7 @@ jobs:
         run: |
           python -m py_compile agents/runner.py
           python -m py_compile agents/cloud_macos.py
+          python -m py_compile agents/cloud_linux.py
       - name: Validate compose
         run: |
           cp .env.example .env
@@ -144,17 +145,19 @@ jobs:
               state: ok ? 'closed' : 'open',
               body: ok ? '✅ Production deployment and public HTTPS health check completed successfully on `publisher.smarbiz.sbs`.\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId : '### Production deployment failure\n\n```text\n' + log + '\n```'
             });
-      - name: Wake the A+ Cloud Mac
+      - name: Wake A+ cloud build agents
         if: steps.production.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'cloud-macos.yml',
-              ref: 'main'
-            });
+            for (const workflow_id of ['cloud-macos.yml', 'cloud-linux.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }
       - name: Enforce production result
         if: steps.production.outcome == 'failure'
         run: exit 1

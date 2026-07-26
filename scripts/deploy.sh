@@ -55,13 +55,21 @@ PUBLIC_URL=https://publisher.smarbiz.sbs
 DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
 ENCRYPTION_KEY=$ENCRYPTION_KEY
 DEBUG=0
-ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1
+ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1,web
 CSRF_TRUSTED_ORIGINS=https://publisher.smarbiz.sbs
 POSTGRES_DB=publisher
 POSTGRES_USER=publisher
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 TIME_ZONE=Europe/Berlin
 ENV
+fi
+
+# Keep a private, persistent token on the server for the always-on Android agent.
+# It is generated only once and never needs to be stored in GitHub secrets.
+if ! grep -Eq '^ANDROID_AGENT_TOKEN=.+$' .env; then
+  grep -v '^ANDROID_AGENT_TOKEN=' .env > .env.tmp || true
+  printf 'ANDROID_AGENT_TOKEN=%s\n' "$(openssl rand -hex 48)" >> .env.tmp
+  mv .env.tmp .env
 fi
 
 # Optional values from GitHub secrets. Empty lines are ignored, so deployment never
@@ -91,8 +99,26 @@ docker compose up -d --remove-orphans
 
 # The web entrypoint owns migrations, static collection and administrator updates.
 echo "Waiting for application health and startup migrations..."
-for attempt in $(seq 1 45); do
+for attempt in $(seq 1 60); do
   if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
+    docker compose exec -T web python manage.py shell -c '
+import hashlib
+import os
+from apps.publisher.models import BuildAgent
+
+token = os.environ["ANDROID_AGENT_TOKEN"]
+agent, _ = BuildAgent.objects.update_or_create(
+    name="A+ Persistent Linux",
+    defaults={
+        "platform": "linux",
+        "enabled": True,
+        "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+        "labels": ["android", "flutter", "persistent", "server"],
+        "capabilities": {"android": True, "flutter": True, "persistent": True},
+    },
+)
+print(f"Persistent Android agent registered: {agent.pk}")
+'
     if docker compose exec -T web sh -lc '[ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]'; then
       docker compose exec -T web python manage.py shell -c '
 import os
@@ -114,5 +140,5 @@ print("Configured administrator authentication verified.")
 done
 
 docker compose ps
-docker compose logs --tail=200 web worker beat caddy
+docker compose logs --tail=200 web worker beat android-agent caddy
 exit 1

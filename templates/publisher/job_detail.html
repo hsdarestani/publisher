@@ -1,2 +1,53 @@
-{% extends "base.html" %}{% block title %}Job #{{ job.pk }} · A+ Publisher{% endblock %}{% block page_title %}{{ job.get_type_display }}{% endblock %}{% block top_actions %}<a class="btn btn-quiet" href="{% url 'jobs' %}">All jobs</a>{% if job.status == 'failed' %}<form method="post" action="{% url 'job_retry' job.pk %}">{% csrf_token %}<button class="btn btn-primary">Retry job</button></form>{% endif %}{% endblock %}
-{% block content %}<div class="stats-grid mini-stats"><article class="stat-card"><span>Status</span><strong class="status-text">{{ job.get_status_display }}</strong></article><article class="stat-card"><span>Progress</span><strong>{{ job.progress }}%</strong></article><article class="stat-card"><span>Application</span><strong>{{ job.app.name|default:'System' }}</strong></article><article class="stat-card"><span>Started</span><strong>{{ job.started_at|date:'H:i:s'|default:'—' }}</strong></article></div><div class="two-column wide-left"><section class="card"><div class="card-head"><div><span class="eyebrow">Live output</span><h3>Execution log</h3></div><span class="status status-{{ job.status }}">{{ job.status }}</span></div><pre class="terminal">{{ job.logs|default:'Waiting for output…' }}</pre>{% if job.error %}<div class="alert alert-error">{{ job.error }}</div>{% endif %}</section><aside class="card"><div class="card-head"><div><span class="eyebrow">Context</span><h3>Job details</h3></div></div><div class="detail-list"><span><i>ID</i><strong>#{{ job.pk }}</strong></span><span><i>Release</i><strong>{{ job.release|default:'—' }}</strong></span><span><i>Agent job</i><strong>{{ job.available_to_agents|yesno:'Yes,No' }}</strong></span><span><i>Required platform</i><strong>{{ job.required_platform|default:'Server' }}</strong></span><span><i>Finished</i><strong>{{ job.finished_at|date:'M j, H:i:s'|default:'—' }}</strong></span></div><details><summary>Payload</summary><pre>{{ job.payload }}</pre></details><details><summary>Result</summary><pre>{{ job.result }}</pre></details></aside></div>{% endblock %}
+{% extends "base.html" %}
+{% block title %}Job #{{ job.pk }} · A+ Publisher{% endblock %}
+{% block page_title %}{{ job.get_type_display }}{% endblock %}
+{% block top_actions %}
+<a class="btn btn-quiet" href="{% url 'jobs' %}">All jobs</a>
+{% if job.status == 'failed' %}
+<form method="post" action="{% url 'job_retry' job.pk %}">{% csrf_token %}<button class="btn btn-primary">Retry job</button></form>
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="stats-grid mini-stats">
+  <article class="stat-card"><span>Status</span><strong class="status-text">{{ job.get_status_display }}</strong></article>
+  <article class="stat-card"><span>Progress</span><strong>{{ job.progress }}%</strong></article>
+  <article class="stat-card"><span>Application</span><strong>{{ job.app.name|default:'System' }}</strong></article>
+  <article class="stat-card">
+    {% if job.status == 'queued' %}
+      <span>Queued at</span><strong>{{ job.updated_at|date:'H:i:s'|default:'—' }}</strong>
+    {% else %}
+      <span>Started</span><strong>{{ job.started_at|date:'H:i:s'|default:'—' }}</strong>
+    {% endif %}
+  </article>
+</div>
+<div class="two-column wide-left">
+  <section class="card">
+    <div class="card-head">
+      <div><span class="eyebrow">Live output</span><h3>Execution log</h3></div>
+      <span class="status status-{{ job.status }}">{{ job.status }}</span>
+    </div>
+    {% if job.status == 'queued' %}
+      <pre class="terminal">Waiting for an available {{ job.required_platform|default:'build' }} agent…
+This page refreshes automatically.</pre>
+    {% else %}
+      <pre class="terminal">{{ job.logs|default:'Waiting for output…' }}</pre>
+    {% endif %}
+    {% if job.error %}<div class="alert alert-error">{{ job.error }}</div>{% endif %}
+  </section>
+  <aside class="card">
+    <div class="card-head"><div><span class="eyebrow">Context</span><h3>Job details</h3></div></div>
+    <div class="detail-list">
+      <span><i>ID</i><strong>#{{ job.pk }}</strong></span>
+      <span><i>Release</i><strong>{{ job.release|default:'—' }}</strong></span>
+      <span><i>Agent job</i><strong>{{ job.available_to_agents|yesno:'Yes,No' }}</strong></span>
+      <span><i>Required platform</i><strong>{{ job.required_platform|default:'Server' }}</strong></span>
+      <span><i>Finished</i><strong>{{ job.finished_at|date:'M j, H:i:s'|default:'—' }}</strong></span>
+    </div>
+    <details><summary>Payload</summary><pre>{{ job.payload }}</pre></details>
+    <details><summary>Result</summary><pre>{{ job.result }}</pre></details>
+  </aside>
+</div>
+{% if job.status == 'queued' or job.status == 'running' %}
+<script>window.setTimeout(function () { window.location.reload(); }, 8000);</script>
+{% endif %}
+{% endblock %}

@@ -16,8 +16,6 @@ install_docker_stack() {
     return 0
   fi
 
-  # Fallback to Docker's official apt repository when the Ubuntu mirror does not
-  # expose the Compose v2 package.
   DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl
   apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc >/dev/null 2>&1 || true
   install -m 0755 -d /etc/apt/keyrings
@@ -64,6 +62,11 @@ TIME_ZONE=Europe/Berlin
 ENV
 fi
 
+# The internal Docker hostname is required by the persistent Android agent.
+grep -v '^ALLOWED_HOSTS=' .env > .env.tmp || true
+printf '%s\n' 'ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1,web' >> .env.tmp
+mv .env.tmp .env
+
 # Keep a private, persistent token on the server for the always-on Android agent.
 # It is generated only once and never needs to be stored in GitHub secrets.
 if ! grep -Eq '^ANDROID_AGENT_TOKEN=.+$' .env; then
@@ -85,10 +88,6 @@ if [ -f "$OVERRIDES" ]; then
 fi
 chmod 600 .env
 
-# A failed first installation may leave partially-created PostgreSQL objects. There
-# is no user data before this marker exists, so reset all first-boot volumes once.
-# The marker is preserved across releases and makes this branch permanently inert
-# after the first successful health check.
 if [ ! -f "$BOOTSTRAP_MARKER" ]; then
   echo "Preparing a clean first-install database..."
   docker compose down -v --remove-orphans >/dev/null 2>&1 || true
@@ -97,7 +96,6 @@ fi
 docker compose build --pull
 docker compose up -d --remove-orphans
 
-# The web entrypoint owns migrations, static collection and administrator updates.
 echo "Waiting for application health and startup migrations..."
 for attempt in $(seq 1 60); do
   if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then

@@ -48,7 +48,7 @@ if [ ! -f .env ]; then
 import base64, os
 print(base64.urlsafe_b64encode(os.urandom(32)).decode())
 PY
-)"
+  )"
   cat > .env <<ENV
 DOMAIN=publisher.smarbiz.sbs
 PUBLIC_URL=https://publisher.smarbiz.sbs
@@ -89,12 +89,21 @@ fi
 docker compose build --pull
 docker compose up -d --remove-orphans
 
-# The web entrypoint owns migrations, static collection and initial administrator
-# creation. Running migrate again here can overlap with container startup and cause
-# PostgreSQL DDL races on a fresh database.
+# The web entrypoint owns migrations, static collection and administrator updates.
 echo "Waiting for application health and startup migrations..."
 for attempt in $(seq 1 45); do
   if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
+    if docker compose exec -T web sh -lc '[ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]'; then
+      docker compose exec -T web python manage.py shell -c '
+import os
+from django.contrib.auth import authenticate
+user = authenticate(username=os.environ["ADMIN_EMAIL"], password=os.environ["ADMIN_PASSWORD"])
+assert user is not None and user.is_active and user.is_superuser, "Configured administrator authentication failed"
+print("Configured administrator authentication verified.")
+'
+    else
+      echo "Administrator secrets are not both configured; login verification skipped."
+    fi
     touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
     echo "A+ Publisher is healthy."

@@ -20,13 +20,14 @@ class CloudLinuxAgent(CloudMacAgent):
     def run(self):
         print(f"A+ Cloud Linux connected to {self.server}", flush=True)
         processed = 0
+        had_failures = False
         while processed < self.max_jobs:
             response = self.session.post(f"{self.server}/apps/agent-api/claim/", timeout=45)
             response.raise_for_status()
             job = response.json().get("job")
             if not job:
                 print("No Android job is queued.", flush=True)
-                return
+                break
 
             if job["type"] == "build_android":
                 try:
@@ -48,11 +49,16 @@ class CloudLinuxAgent(CloudMacAgent):
                     error = f"Android signing setup failed: {exc}"
                     self.log(job["id"], f"FAILED: {error}", 95)
                     self.complete(job["id"], "failed", None, {}, error)
+                    had_failures = True
                     processed += 1
                     continue
 
-            self.execute(job)
+            if self.execute(job) is False:
+                had_failures = True
             processed += 1
+
+        if had_failures:
+            raise RuntimeError("One or more Android jobs failed. See the Publisher execution log.")
 
     def build(self, job_id, job_type, payload, workspace):
         if job_type != "build_android":
@@ -130,7 +136,9 @@ class CloudLinuxAgent(CloudMacAgent):
             if not files:
                 raise RuntimeError(f"Build completed but no AAB matched: {pattern}")
             artifact = max(files, key=lambda path: path.stat().st_mtime)
-            self._run(job_id, ["jarsigner", "-verify", "-strict", str(artifact)], repo_dir, 86)
+            # Android upload certificates are self-signed by design. ``-strict``
+            # treats that normal condition as a failure, so verify integrity only.
+            self._run(job_id, ["jarsigner", "-verify", "-verbose", "-certs", str(artifact)], repo_dir, 86)
             self.log(job_id, f"Signed AAB ready: {artifact.relative_to(repo_dir)}", 92)
             return artifact, {
                 "sha256": self.sha256(artifact),

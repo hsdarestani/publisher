@@ -69,7 +69,9 @@ jobs:
       - name: Compile agent
         run: python -m py_compile agents/runner.py
       - name: Validate compose
-        run: docker compose config
+        run: |
+          cp .env.example .env
+          docker compose config
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

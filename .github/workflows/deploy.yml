@@ -57,7 +57,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const log = fs.readFileSync('/tmp/django-ci.log', 'utf8').slice(-12000);
+            const log = fs.readFileSync('/tmp/django-ci.log', 'utf8').split('\n').slice(-80).join('\n');
             await github.rest.issues.updateComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -136,7 +136,8 @@ jobs:
           script: |
             const fs = require('fs');
             const ok = '${{ steps.production.outcome }}' === 'success';
-            const log = fs.existsSync('/tmp/deploy-ci.log') ? fs.readFileSync('/tmp/deploy-ci.log', 'utf8').slice(-12000) : 'No deployment log was produced.';
+            const raw = fs.existsSync('/tmp/deploy-ci.log') ? fs.readFileSync('/tmp/deploy-ci.log', 'utf8') : 'No deployment log was produced.';
+            const log = raw.split('\n').slice(-80).join('\n');
             await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,

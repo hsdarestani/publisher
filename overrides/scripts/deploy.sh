@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR="/opt/aplus-publisher"
+ARCHIVE="${1:-/tmp/aplus-publisher.tar.gz}"
+OVERRIDES="${2:-/tmp/aplus-publisher-overrides.env}"
+mkdir -p "$APP_DIR"
+find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} +
+tar -xzf "$ARCHIVE" -C "$APP_DIR"
+cd "$APP_DIR"
+
+install_docker_stack() {
+  apt-get update
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 ca-certificates curl openssl; then
+    systemctl enable --now docker
+    return 0
+  fi
+
+  # Fallback to Docker's official apt repository when the Ubuntu mirror does not
+  # expose the Compose v2 package.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl
+  apt-get remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc >/dev/null 2>&1 || true
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  . /etc/os-release
+  cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+}
+
+if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+  install_docker_stack
+fi
+
+if [ ! -f .env ]; then
+  DJANGO_SECRET_KEY="$(openssl rand -hex 48)"
+  POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+  ENCRYPTION_KEY="$(python3 - <<'PY'
+import base64, os
+print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+PY
+)"
+  cat > .env <<ENV
+DOMAIN=publisher.smarbiz.sbs
+PUBLIC_URL=https://publisher.smarbiz.sbs
+DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
+ENCRYPTION_KEY=$ENCRYPTION_KEY
+DEBUG=0
+ALLOWED_HOSTS=publisher.smarbiz.sbs,localhost,127.0.0.1
+CSRF_TRUSTED_ORIGINS=https://publisher.smarbiz.sbs
+POSTGRES_DB=publisher
+POSTGRES_USER=publisher
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+TIME_ZONE=Europe/Berlin
+ENV
+fi
+
+# Optional values from GitHub secrets. Empty lines are ignored, so deployment never
+# depends on these variables being present.
+if [ -f "$OVERRIDES" ]; then
+  while IFS='=' read -r key value; do
+    [ -z "$key" ] && continue
+    [ -z "$value" ] && continue
+    grep -v "^${key}=" .env > .env.tmp || true
+    printf '%s=%s\n' "$key" "$value" >> .env.tmp
+    mv .env.tmp .env
+  done < "$OVERRIDES"
+fi
+chmod 600 .env
+
+docker compose build --pull
+docker compose up -d --remove-orphans
+docker compose exec -T web python manage.py migrate --noinput
+docker compose exec -T web python manage.py collectstatic --noinput
+
+echo "Waiting for application health..."
+for attempt in $(seq 1 30); do
+  if docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ >/dev/null; then
+    echo "A+ Publisher is healthy."
+    docker image prune -f >/dev/null 2>&1 || true
+    exit 0
+  fi
+  sleep 4
+done
+
+docker compose ps
+docker compose logs --tail=150 web caddy
+exit 1

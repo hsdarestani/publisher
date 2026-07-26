@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
-import tempfile
 
 from cloud_macos import CloudMacAgent
 
@@ -28,17 +27,30 @@ class CloudLinuxAgent(CloudMacAgent):
             if not job:
                 print("No Android job is queued.", flush=True)
                 return
+
             if job["type"] == "build_android":
-                signing_response = self.session.get(
-                    f"{self.server}/signing/jobs/{job['id']}/credentials/",
-                    timeout=60,
-                )
-                signing_response.raise_for_status()
-                signing_payload = signing_response.json()
-                job["payload"]["android_signing"] = signing_payload["android_signing"]
-                job["payload"]["android_certificate_sha256"] = signing_payload.get(
-                    "certificate_sha256", ""
-                )
+                try:
+                    signing_response = self.session.get(
+                        f"{self.server}/signing/jobs/{job['id']}/credentials/",
+                        timeout=90,
+                    )
+                    if not signing_response.ok:
+                        detail = signing_response.text.strip()[:2000]
+                        raise RuntimeError(
+                            f"Publisher signing endpoint returned HTTP {signing_response.status_code}: {detail}"
+                        )
+                    signing_payload = signing_response.json()
+                    job["payload"]["android_signing"] = signing_payload["android_signing"]
+                    job["payload"]["android_certificate_sha256"] = signing_payload.get(
+                        "certificate_sha256", ""
+                    )
+                except Exception as exc:
+                    error = f"Android signing setup failed: {exc}"
+                    self.log(job["id"], f"FAILED: {error}", 95)
+                    self.complete(job["id"], "failed", None, {}, error)
+                    processed += 1
+                    continue
+
             self.execute(job)
             processed += 1
 

@@ -65,10 +65,12 @@ class Agent:
             else:
                 raise RuntimeError(f"Unsupported agent job type: {job_type}")
             self.complete(job_id, "succeeded", artifact, metadata, "")
+            return True
         except Exception as exc:
             error = str(exc)
             self.log(job_id, f"FAILED: {error}", 95)
             self.complete(job_id, "failed", None, metadata, error)
+            return False
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 

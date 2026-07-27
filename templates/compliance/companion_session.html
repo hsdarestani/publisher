@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Play Console Companion · A+ Publisher{% endblock %}
+{% block page_title %}Play Console Companion{% endblock %}
+{% block top_actions %}<a class="btn btn-quiet" href="{{ profile.get_absolute_url }}">Back to compliance</a>{% endblock %}
+{% block content %}
+<div class="two-column wide-left">
+  <section class="card">
+    <div class="card-head"><div><span class="eyebrow">Secure 30-minute session</span><h2>Autofill Google Play Console</h2><p class="muted">This URL contains a temporary token and may include reviewer credentials. Do not share it.</p></div></div>
+    <label>Companion payload URL<input class="form-control" id="payload-url" readonly value="{{ payload_url }}"></label>
+    <button class="btn btn-primary btn-block" id="copy-payload">Copy payload URL</button>
+    <div class="check-list" style="margin-top:20px">
+      <div class="check check-pass"><span>1</span><div><strong>Install extension</strong><small>Download and unzip A+ Play Console Companion, then load it from chrome://extensions in Developer mode.</small></div><a href="{% url 'compliance_companion_extension' %}">Download</a></div>
+      <div class="check check-pass"><span>2</span><div><strong>Open a Play Console declaration</strong><small>Keep Play Console in English and open Privacy policy, App access, Ads, Target audience, Content rating, or Data Safety.</small></div></div>
+      <div class="check check-pass"><span>3</span><div><strong>Run autofill</strong><small>Open the extension, paste this payload URL, and click Fill current Play Console page. Review highlighted answers and Save/Next.</small></div></div>
+    </div>
+  </section>
+  <aside class="card"><div class="card-head"><div><span class="eyebrow">Security</span><h3>Session details</h3></div></div><div class="detail-list"><span><i>Application</i><strong>{{ profile.app.name }}</strong></span><span><i>Expires</i><strong>{{ profile.companion_token_expires_at|date:'H:i:s' }}</strong></span><span><i>Payload</i><strong>No cache</strong></span><span><i>Scope</i><strong>Current app only</strong></span></div></aside>
+</div>
+<script>document.getElementById('copy-payload').addEventListener('click',async function(){await navigator.clipboard.writeText(document.getElementById('payload-url').value);this.textContent='Copied';});</script>
+{% endblock %}

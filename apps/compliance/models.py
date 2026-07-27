@@ -26,6 +26,20 @@ class ComplianceProfile(TimeStampedModel):
         ("login", "Login or membership is required"),
         ("restricted", "Some functionality is otherwise restricted"),
     ]
+    ACCOUNT_DELETION_CHOICES = [
+        ("unknown", "Not confirmed yet"),
+        ("in_app", "Users can delete their account inside the app"),
+        ("web", "Users can request deletion on a public web page"),
+        ("support", "Users can request deletion through support"),
+        ("unavailable", "Account deletion is not available yet"),
+        ("not_applicable", "The app does not create user accounts"),
+    ]
+    PAYMENT_HANDLING_CHOICES = [
+        ("unknown", "Not confirmed yet"),
+        ("none", "The app does not process payments"),
+        ("external", "Payments are handled by an external provider"),
+        ("direct", "The app or backend directly handles payment data"),
+    ]
 
     app = models.OneToOneField(MobileApp, related_name="compliance", on_delete=models.CASCADE)
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="draft")
@@ -38,6 +52,19 @@ class ComplianceProfile(TimeStampedModel):
     target_age_groups = models.JSONField(default=list, blank=True)
     app_access = models.CharField(max_length=30, choices=ACCESS_CHOICES, default="unrestricted")
     app_access_instructions = models.TextField(blank=True)
+
+    account_deletion = models.CharField(
+        max_length=30,
+        choices=ACCOUNT_DELETION_CHOICES,
+        default="unknown",
+    )
+    account_deletion_url = models.URLField(blank=True)
+    payment_handling = models.CharField(
+        max_length=30,
+        choices=PAYMENT_HANDLING_CHOICES,
+        default="unknown",
+    )
+    payment_details = models.TextField(blank=True)
 
     source_analysis = models.JSONField(default=dict, blank=True)
     data_practices = models.JSONField(default=dict, blank=True)

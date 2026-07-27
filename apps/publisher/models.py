@@ -47,7 +47,6 @@ class StoreAccount(TimeStampedModel):
 
     @property
     def credential_identity(self):
-        """Return a non-secret identity suitable for the UI and audit screens."""
         data = self.get_credentials()
         if self.provider == "google":
             return data.get("client_email", "")
@@ -161,137 +160,157 @@ class AppAsset(TimeStampedModel):
     device_type = models.CharField(max_length=80, blank=True)
     file = models.FileField(upload_to=asset_upload_path)
     sort_order = models.PositiveIntegerField(default=0)
+    checksum = models.CharField(max_length=64, blank=True)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["platform", "locale", "kind", "sort_order"]
 
-    def __str__(self):
-        return f"{self.app} · {self.kind} · {self.locale}"
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.file and not self.checksum:
+            try:
+                h = hashlib.sha256()
+                for chunk in self.file.chunks():
+                    h.update(chunk)
+                self.checksum = h.hexdigest()
+                super().save(update_fields=["checksum"])
+            except Exception:
+                pass
 
 class Release(TimeStampedModel):
-    STATUSES = [("draft", "Draft"), ("checking", "Checking"), ("building", "Building"), ("ready", "Ready"), ("submitted", "Submitted"), ("in_review", "In review"), ("approved", "Approved"), ("rejected", "Rejected"), ("released", "Released"), ("failed", "Failed")]
+    STATUSES = [("draft", "Draft"), ("checking", "Checking"), ("ready", "Ready"), ("building", "Building"), ("uploaded", "Uploaded"), ("in_review", "In review"), ("approved", "Approved"), ("released", "Released"), ("rejected", "Rejected"), ("failed", "Failed")]
     app = models.ForeignKey(MobileApp, related_name="releases", on_delete=models.CASCADE)
-    version_name = models.CharField(max_length=60)
+    version_name = models.CharField(max_length=40)
     build_number = models.PositiveIntegerField()
-    source_branch = models.CharField(max_length=120, default="main")
-    source_commit = models.CharField(max_length=64, blank=True)
     status = models.CharField(max_length=30, choices=STATUSES, default="draft")
-    android_track = models.CharField(max_length=30, default="internal")
+    source_branch = models.CharField(max_length=120, blank=True)
+    source_commit = models.CharField(max_length=64, blank=True)
+    android_track = models.CharField(max_length=40, default="internal")
     android_rollout = models.DecimalField(max_digits=5, decimal_places=4, default=1)
-    ios_release_type = models.CharField(max_length=30, default="manual")
+    ios_release_type = models.CharField(max_length=40, default="manual")
     auto_submit = models.BooleanField(default=False)
     release_notes = models.TextField(blank=True)
+    readiness_snapshot = models.JSONField(default=dict, blank=True)
     scheduled_at = models.DateTimeField(null=True, blank=True)
-    submitted_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
-        constraints = [models.UniqueConstraint(fields=["app", "build_number"], name="unique_app_build_number")]
+        constraints = [models.UniqueConstraint(fields=["app", "version_name", "build_number"], name="unique_release_build")]
 
     def __str__(self):
-        return f"{self.app} {self.version_name} ({self.build_number})"
+        return f"{self.app.name} {self.version_name} ({self.build_number})"
 
     def get_absolute_url(self):
         return reverse("release_detail", args=[self.pk])
 
-class BuildArtifact(TimeStampedModel):
+class BuildAgent(TimeStampedModel):
+    PLATFORMS = [("linux", "Linux / Android"), ("macos", "macOS / iOS"), ("universal", "Universal")]
+    name = models.CharField(max_length=120, unique=True)
+    platform = models.CharField(max_length=20, choices=PLATFORMS)
+    enabled = models.BooleanField(default=True)
+    token_hash = models.CharField(max_length=64, unique=True)
+    labels = models.JSONField(default=list, blank=True)
+    capabilities = models.JSONField(default=dict, blank=True)
+    hostname = models.CharField(max_length=180, blank=True)
+    app_version = models.CharField(max_length=40, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    current_job = models.ForeignKey("Job", null=True, blank=True, related_name="assigned_agents", on_delete=models.SET_NULL)
+
+    class Meta:
+        ordering = ["name"]
+
+    @classmethod
+    def create_with_token(cls, **kwargs):
+        token = secrets.token_urlsafe(36)
+        obj = cls.objects.create(token_hash=hashlib.sha256(token.encode()).hexdigest(), **kwargs)
+        return obj, token
+
+    def verify_token(self, token: str) -> bool:
+        return secrets.compare_digest(self.token_hash, hashlib.sha256(token.encode()).hexdigest())
+
+    @property
+    def online(self):
+        return bool(self.last_seen_at and self.last_seen_at >= timezone.now() - timedelta(minutes=5))
+
+    def __str__(self):
+        return self.name
+
+class Build(TimeStampedModel):
     PLATFORMS = [("android", "Android"), ("ios", "iOS")]
-    STATUSES = [("queued", "Queued"), ("running", "Running"), ("succeeded", "Succeeded"), ("failed", "Failed")]
+    STATUSES = [("queued", "Queued"), ("claimed", "Claimed"), ("running", "Running"), ("succeeded", "Succeeded"), ("failed", "Failed"), ("cancelled", "Cancelled")]
     release = models.ForeignKey(Release, related_name="builds", on_delete=models.CASCADE)
     platform = models.CharField(max_length=20, choices=PLATFORMS)
     status = models.CharField(max_length=20, choices=STATUSES, default="queued")
-    agent = models.ForeignKey("BuildAgent", null=True, blank=True, related_name="builds", on_delete=models.SET_NULL)
+    agent = models.ForeignKey(BuildAgent, null=True, blank=True, related_name="builds", on_delete=models.SET_NULL)
+    commit_sha = models.CharField(max_length=64, blank=True)
     artifact = models.FileField(upload_to="builds/%Y/%m/", blank=True)
-    artifact_name = models.CharField(max_length=255, blank=True)
     artifact_size = models.BigIntegerField(default=0)
-    artifact_sha256 = models.CharField(max_length=64, blank=True)
+    artifact_checksum = models.CharField(max_length=64, blank=True)
     logs = models.TextField(blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    external_build_id = models.CharField(max_length=160, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=["release", "platform"], name="unique_release_platform_build")]
+        ordering = ["-created_at"]
 
     def __str__(self):
         return f"{self.release} · {self.platform}"
 
-class ReleaseCheck(TimeStampedModel):
-    LEVELS = [("pass", "Pass"), ("warning", "Warning"), ("error", "Error")]
-    release = models.ForeignKey(Release, related_name="checks", on_delete=models.CASCADE)
-    platform = models.CharField(max_length=20, blank=True)
-    code = models.CharField(max_length=100)
-    label = models.CharField(max_length=220)
-    detail = models.TextField(blank=True)
-    level = models.CharField(max_length=20, choices=LEVELS)
-    sort_order = models.PositiveIntegerField(default=0)
-
-    class Meta:
-        ordering = ["sort_order", "id"]
-
 class Job(TimeStampedModel):
-    TYPES = [("sync_repository", "Sync repository"), ("run_checks", "Run checks"), ("build_android", "Build Android"), ("build_ios", "Build iOS"), ("upload_google", "Upload & submit Google"), ("upload_apple", "Upload & submit Apple"), ("sync_store_status", "Sync store status"), ("sync_google_reports", "Sync Google reports"), ("sync_apple_reports", "Sync Apple reports")]
+    TYPES = [
+        ("build_android", "Build Android"), ("build_ios", "Build iOS"),
+        ("upload_google", "Upload Google Play"), ("upload_apple", "Upload App Store"),
+        ("submit_google", "Submit Google review"), ("submit_apple", "Submit Apple review"),
+        ("sync_google_reports", "Sync Google reports"), ("sync_apple_reports", "Sync Apple reports"),
+        ("sync_store_status", "Sync store status"), ("sync_repository", "Sync repository"),
+    ]
     STATUSES = [("queued", "Queued"), ("running", "Running"), ("succeeded", "Succeeded"), ("failed", "Failed"), ("cancelled", "Cancelled")]
-    type = models.CharField(max_length=40, choices=TYPES)
     app = models.ForeignKey(MobileApp, null=True, blank=True, related_name="jobs", on_delete=models.CASCADE)
     release = models.ForeignKey(Release, null=True, blank=True, related_name="jobs", on_delete=models.CASCADE)
-    build = models.ForeignKey(BuildArtifact, null=True, blank=True, related_name="jobs", on_delete=models.SET_NULL)
-    agent = models.ForeignKey("BuildAgent", null=True, blank=True, related_name="jobs", on_delete=models.SET_NULL)
+    build = models.ForeignKey(Build, null=True, blank=True, related_name="jobs", on_delete=models.CASCADE)
+    type = models.CharField(max_length=40, choices=TYPES)
     status = models.CharField(max_length=20, choices=STATUSES, default="queued")
     progress = models.PositiveSmallIntegerField(default=0)
     payload = models.JSONField(default=dict, blank=True)
     result = models.JSONField(default=dict, blank=True)
     logs = models.TextField(blank=True)
     error = models.TextField(blank=True)
+    available_to_agents = models.BooleanField(default=False)
+    required_platform = models.CharField(max_length=20, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
 
+    def append_log(self, line: str):
+        self.logs = (self.logs + "\n" + line).strip()[-200000:]
+        self.save(update_fields=["logs", "updated_at"])
+
     def __str__(self):
-        return f"{self.get_type_display()} #{self.pk}"
+        return f"{self.get_type_display()} · {self.get_status_display()}"
 
-class BuildAgent(TimeStampedModel):
-    PLATFORMS = [("macos", "macOS"), ("linux", "Linux"), ("windows", "Windows")]
-    name = models.CharField(max_length=160, unique=True)
+class Submission(TimeStampedModel):
+    PLATFORMS = [("android", "Google Play"), ("ios", "App Store")]
+    app = models.ForeignKey(MobileApp, related_name="submissions", on_delete=models.CASCADE)
+    release = models.ForeignKey(Release, related_name="submissions", on_delete=models.CASCADE)
     platform = models.CharField(max_length=20, choices=PLATFORMS)
-    token_hash = models.CharField(max_length=64, unique=True, blank=True)
-    enabled = models.BooleanField(default=True)
-    last_seen_at = models.DateTimeField(null=True, blank=True)
-    capabilities = models.JSONField(default=dict, blank=True)
-    labels = models.JSONField(default=list, blank=True)
-    current_job = models.ForeignKey(Job, null=True, blank=True, related_name="claimed_by", on_delete=models.SET_NULL)
-
-    @property
-    def online(self):
-        return bool(self.last_seen_at and self.last_seen_at > timezone.now() - timedelta(minutes=5))
-
-    @classmethod
-    def issue_token(cls):
-        token = secrets.token_urlsafe(36)
-        return token, hashlib.sha256(token.encode()).hexdigest()
-
-    def verify_token(self, token):
-        return secrets.compare_digest(self.token_hash, hashlib.sha256(token.encode()).hexdigest())
-
-class TechnicalIssue(TimeStampedModel):
-    SEVERITIES = [("critical", "Critical"), ("high", "High"), ("medium", "Medium"), ("low", "Low")]
-    STATUSES = [("open", "Open"), ("acknowledged", "Acknowledged"), ("resolved", "Resolved"), ("ignored", "Ignored")]
-    STORES = [("google", "Google Play"), ("apple", "Apple"), ("github", "GitHub"), ("build", "Build")]
-    app = models.ForeignKey(MobileApp, related_name="issues", on_delete=models.CASCADE)
-    store = models.CharField(max_length=20, choices=STORES)
-    external_id = models.CharField(max_length=255, blank=True)
-    severity = models.CharField(max_length=20, choices=SEVERITIES, default="medium")
-    status = models.CharField(max_length=20, choices=STATUSES, default="open")
-    title = models.CharField(max_length=255)
-    detail = models.TextField(blank=True)
-    occurrences = models.PositiveIntegerField(default=1)
-    first_seen_at = models.DateTimeField(default=timezone.now)
-    last_seen_at = models.DateTimeField(default=timezone.now)
+    state = models.CharField(max_length=60, default="not_submitted")
+    external_id = models.CharField(max_length=160, blank=True)
+    store_url = models.URLField(blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
     raw = models.JSONField(default=dict, blank=True)
 
     class Meta:
-        ordering = ["-last_seen_at"]
+        ordering = ["-updated_at"]
+        constraints = [models.UniqueConstraint(fields=["release", "platform"], name="unique_release_submission")]
 
     def __str__(self):
-        return self.title
+        return f"{self.release} · {self.platform}"

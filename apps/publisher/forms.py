@@ -47,11 +47,60 @@ class ReleaseForm(StyledModelForm):
         widgets = {"release_notes": forms.Textarea(attrs={"rows": 6}), "scheduled_at": forms.DateTimeInput(attrs={"type": "datetime-local"})}
 
 class StoreAccountForm(StyledModelForm):
-    credentials_json = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 10, "placeholder": "Paste Google service-account JSON, or leave empty to keep existing credentials."}))
-    apple_private_key = forms.CharField(required=False, widget=forms.Textarea(attrs={"rows": 8, "placeholder": "Paste AuthKey_XXXX.p8 content, or leave empty to keep existing credentials."}))
+    stored_credentials = forms.CharField(
+        required=False,
+        disabled=True,
+        label="Stored credential identity",
+        help_text="Sensitive key material is encrypted and is never displayed again.",
+    )
+    credentials_json = forms.CharField(
+        required=False,
+        label="Credentials JSON",
+        widget=forms.Textarea(
+            attrs={
+                "rows": 10,
+                "placeholder": "Paste a NEW Google service-account JSON only when replacing credentials. Leave empty to keep the stored credentials.",
+                "autocomplete": "off",
+                "spellcheck": "false",
+            }
+        ),
+    )
+    apple_private_key = forms.CharField(
+        required=False,
+        widget=forms.Textarea(
+            attrs={
+                "rows": 8,
+                "placeholder": "Paste a NEW AuthKey_XXXX.p8 only when replacing credentials. Leave empty to keep the stored key.",
+                "autocomplete": "off",
+                "spellcheck": "false",
+            }
+        ),
+    )
+
     class Meta:
         model = StoreAccount
-        fields = ["provider", "name", "organization", "enabled", "google_bucket_id", "apple_issuer_id", "apple_key_id", "apple_team_id", "apple_vendor_number", "credentials_json", "apple_private_key"]
+        fields = ["provider", "name", "organization", "enabled", "google_bucket_id", "apple_issuer_id", "apple_key_id", "apple_team_id", "apple_vendor_number", "stored_credentials", "credentials_json", "apple_private_key"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        account = self.instance if getattr(self.instance, "pk", None) else None
+        if account and account.configured:
+            identity = account.credential_identity or "Encrypted credentials are stored"
+            if account.provider == "google" and account.credential_project_id:
+                identity = f"{identity} · project: {account.credential_project_id}"
+            self.fields["stored_credentials"].initial = f"✓ {identity}"
+            self.fields["credentials_json"].help_text = (
+                "Existing Google credentials are stored securely. This box intentionally stays empty after Save. "
+                "Paste JSON only to replace the current service account."
+            )
+            self.fields["apple_private_key"].help_text = (
+                "Existing Apple private key is stored securely. This box intentionally stays empty after Save. "
+                "Paste a .p8 key only to replace it."
+            )
+        else:
+            self.fields["stored_credentials"].initial = "No encrypted credentials are stored yet"
+            self.fields["credentials_json"].help_text = "Paste the complete Google service-account JSON object."
+            self.fields["apple_private_key"].help_text = "Paste the full App Store Connect .p8 key content."
 
     def clean_credentials_json(self):
         value = self.cleaned_data.get("credentials_json", "").strip()
@@ -63,14 +112,32 @@ class StoreAccountForm(StyledModelForm):
             raise forms.ValidationError(f"Invalid JSON: {exc}")
         if not isinstance(data, dict):
             raise forms.ValidationError("Credentials must be a JSON object.")
+        if self.cleaned_data.get("provider") == "google":
+            required = ["type", "project_id", "client_email", "private_key"]
+            missing = [key for key in required if not str(data.get(key, "")).strip()]
+            if missing:
+                raise forms.ValidationError("Google service-account JSON is missing: " + ", ".join(missing))
+            if data.get("type") != "service_account":
+                raise forms.ValidationError("Google credentials must have type=service_account.")
+            if "BEGIN PRIVATE KEY" not in data.get("private_key", ""):
+                raise forms.ValidationError("The Google private_key value is not a valid PEM private key.")
+            if not str(data.get("client_email", "")).endswith(".iam.gserviceaccount.com"):
+                raise forms.ValidationError("client_email does not look like a Google service-account address.")
         return data
 
     def save(self, commit=True):
         obj = super().save(commit=False)
+        replaced = False
         if obj.provider == "google" and self.cleaned_data.get("credentials_json"):
             obj.set_credentials(self.cleaned_data["credentials_json"])
+            replaced = True
         elif obj.provider == "apple" and self.cleaned_data.get("apple_private_key"):
             obj.set_credentials({"private_key": self.cleaned_data["apple_private_key"].strip()})
+            replaced = True
+        if replaced:
+            obj.status = "not_tested"
+            obj.last_error = ""
+            obj.last_tested_at = None
         if commit:
             obj.save()
         return obj

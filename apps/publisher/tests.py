@@ -4,9 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, Client
+from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 
+from .github_actions import wake_cloud_agent
 from .models import MobileApp, AppLocalization, Release, Build, BuildAgent, Job, StoreAccount
 from .readiness import evaluate_release
 
@@ -76,6 +77,38 @@ class PublisherTests(TestCase):
         self.assertEqual(response.json()["job"]["id"], job.pk)
         job.refresh_from_db()
         self.assertEqual(job.status, "running")
+
+    @patch("apps.publisher.signals.wake_cloud_agent")
+    def test_queued_agent_job_wakes_matching_cloud_runner(self, wake):
+        with self.captureOnCommitCallbacks(execute=True):
+            Job.objects.create(
+                type="build_android",
+                app=self.app,
+                release=self.release,
+                build=self.release.builds.get(platform="android"),
+                available_to_agents=True,
+                required_platform="linux",
+            )
+        wake.assert_called_once_with("linux")
+
+    @override_settings(
+        PUBLISHER_GITHUB_TOKEN="test-token",
+        PUBLISHER_GITHUB_REPOSITORY="hsdarestani/publisher",
+        PUBLISHER_GITHUB_REF="main",
+    )
+    @patch("apps.publisher.github_actions.requests.post")
+    def test_cloud_runner_dispatch_uses_github_workflow_api(self, post):
+        post.return_value.status_code = 204
+        self.assertTrue(wake_cloud_agent("linux"))
+        post.assert_called_once()
+        self.assertIn("cloud-linux.yml/dispatches", post.call_args.args[0])
+        self.assertEqual(post.call_args.kwargs["json"], {"ref": "main"})
+
+    @override_settings(PUBLISHER_GITHUB_TOKEN="")
+    @patch("apps.publisher.github_actions.requests.post")
+    def test_missing_dispatch_token_is_a_safe_noop(self, post):
+        self.assertFalse(wake_cloud_agent("linux"))
+        post.assert_not_called()
 
     @patch("apps.publisher.cloud_auth.jwt.decode")
     @patch("apps.publisher.cloud_auth._GITHUB_JWKS.get_signing_key_from_jwt")

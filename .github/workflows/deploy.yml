@@ -101,11 +101,13 @@ jobs:
         env:
           ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          PUBLISHER_GITHUB_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           : > /tmp/aplus-publisher-overrides.env
           [ -n "$ADMIN_EMAIL" ] && printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$PUBLISHER_GITHUB_TOKEN" ] && printf 'PUBLISHER_GITHUB_TOKEN=%s\n' "$PUBLISHER_GITHUB_TOKEN" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
       - name: Deploy over SSH and verify public HTTPS
         id: production

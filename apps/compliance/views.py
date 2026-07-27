@@ -154,7 +154,12 @@ def companion_payload(request, token):
         return JsonResponse({"error": "expired"}, status=410)
     response = JsonResponse(profile.console_autofill)
     response["Cache-Control"] = "no-store"
-    response["Access-Control-Allow-Origin"] = "chrome-extension://*"
+    # A random, short-lived bearer URL is the authorization boundary. The wildcard
+    # allows a locally loaded extension whose chrome-extension:// origin is unknown
+    # until installation; cookies and credentials are never accepted here.
+    response["Access-Control-Allow-Origin"] = "*"
+    response["Access-Control-Allow-Credentials"] = "false"
+    response["Referrer-Policy"] = "no-referrer"
     return response
 
 

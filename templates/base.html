@@ -17,6 +17,7 @@
     <nav>
       <a href="{% url 'dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}"><span>⌂</span>Overview</a>
       <a href="{% url 'app_list' %}" class="{% if request.resolver_match.app_name == 'publisher' or '/apps/' in request.path and '/jobs/' not in request.path and '/agents/' not in request.path %}active{% endif %}"><span>▦</span>Applications</a>
+      <a href="{% url 'compliance_list' %}" class="{% if '/compliance/' in request.path %}active{% endif %}"><span>✓</span>Compliance Center</a>
       <a href="{% url 'jobs' %}" class="{% if '/jobs/' in request.path %}active{% endif %}"><span>↻</span>Jobs</a>
       <a href="{% url 'agents' %}" class="{% if '/agents/' in request.path %}active{% endif %}"><span>◇</span>Build agents</a>
       <a href="{% url 'reports' %}" class="{% if '/reports/' in request.path %}active{% endif %}"><span>⌁</span>Analytics</a>

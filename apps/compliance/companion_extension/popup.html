@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body{font-family:Arial,sans-serif;width:340px;margin:0;padding:18px;background:#f5f8fd;color:#10223d}
+    h1{font-size:17px;margin:0 0 5px}p{font-size:12px;line-height:1.5;color:#62718a}
+    input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ced8e8;border-radius:9px;margin:8px 0}
+    button{width:100%;border:0;border-radius:9px;padding:11px;background:#1769e0;color:white;font-weight:700;cursor:pointer;margin-top:6px}
+    button.secondary{background:white;color:#174576;border:1px solid #d3deed}
+    #status{white-space:pre-wrap;font-size:12px;margin-top:12px;padding:10px;border-radius:8px;background:#fff;display:none}
+  </style>
+</head>
+<body>
+  <h1>A+ Play Console Companion</h1>
+  <p>Keep Play Console in English. Create a 30-minute Companion session in A+ Publisher and paste its payload URL here.</p>
+  <input id="payloadUrl" type="url" placeholder="https://publisher.smarbiz.sbs/compliance/companion/.../payload.json">
+  <button id="fill">Fill current Play Console page</button>
+  <button class="secondary" id="clear">Clear session</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

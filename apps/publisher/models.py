@@ -45,6 +45,26 @@ class StoreAccount(TimeStampedModel):
             return bool(data.get("client_email") and data.get("private_key"))
         return bool(self.apple_issuer_id and self.apple_key_id and self.get_credentials().get("private_key"))
 
+    @property
+    def credential_identity(self):
+        data = self.get_credentials()
+        if self.provider == "google":
+            return data.get("client_email", "")
+        return self.apple_key_id or data.get("key_id", "")
+
+    @property
+    def credential_project_id(self):
+        if self.provider != "google":
+            return ""
+        return self.get_credentials().get("project_id", "")
+
+    @property
+    def credential_type(self):
+        data = self.get_credentials()
+        if self.provider == "google":
+            return data.get("type", "")
+        return "App Store Connect API key" if data.get("private_key") else ""
+
 class MobileApp(TimeStampedModel):
     PLATFORMS = [("both", "Android + iOS"), ("android", "Android"), ("ios", "iOS")]
     FRAMEWORKS = [("flutter", "Flutter"), ("react_native", "React Native"), ("native", "Native"), ("other", "Other")]

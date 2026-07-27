@@ -57,11 +57,11 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const log = fs.readFileSync('/tmp/django-ci.log', 'utf8').split('\n').slice(-80).join('\n');
-            await github.rest.issues.updateComment({
+            const log = fs.readFileSync('/tmp/django-ci.log', 'utf8').split('\n').slice(-120).join('\n');
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              comment_id: 5082658337,
+              issue_number: context.issue.number,
               body: '### CI runtime failure\n\n```text\n' + log + '\n```'
             });
       - name: Enforce Django result

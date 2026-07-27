@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Compliance run #{{ run.pk }} · A+ Publisher{% endblock %}
+{% block page_title %}{{ run.get_action_display }}{% endblock %}
+{% block top_actions %}<a class="btn btn-quiet" href="{{ run.profile.get_absolute_url }}">Back to compliance</a>{% endblock %}
+{% block content %}
+<div class="stats-grid mini-stats">
+  <article class="stat-card"><span>Status</span><strong>{{ run.get_status_display }}</strong></article>
+  <article class="stat-card"><span>Progress</span><strong>{{ run.progress }}%</strong></article>
+  <article class="stat-card"><span>Application</span><strong>{{ run.profile.app.name }}</strong></article>
+  <article class="stat-card"><span>Started</span><strong>{{ run.started_at|date:'H:i:s'|default:'—' }}</strong></article>
+</div>
+<div class="two-column wide-left">
+  <section class="card"><div class="card-head"><div><span class="eyebrow">Live output</span><h3>Compliance execution</h3></div><span class="status status-{{ run.status }}">{{ run.status }}</span></div><pre class="terminal">{{ run.logs|default:'Waiting for the compliance worker…' }}</pre>{% if run.error %}<div class="alert alert-error">{{ run.error }}</div>{% endif %}</section>
+  <aside class="card"><div class="card-head"><div><span class="eyebrow">Result</span><h3>Generated output</h3></div></div><details open><summary>Result JSON</summary><pre>{{ run.result }}</pre></details></aside>
+</div>
+{% if run.status == 'queued' or run.status == 'running' %}<script>window.setTimeout(function(){window.location.reload();},5000);</script>{% endif %}
+{% endblock %}

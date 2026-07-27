@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import traceback
+
+from celery import shared_task
+from django.utils import timezone
+
+from .models import ComplianceRun
+from .services import apply_google_apis, generate_pack
+
+
+@shared_task
+def execute_compliance_run(run_id: int):
+    run = ComplianceRun.objects.select_related("profile", "profile__app").get(pk=run_id)
+    run.status = "running"
+    run.progress = 5
+    run.started_at = timezone.now()
+    run.error = ""
+    run.save(update_fields=["status", "progress", "started_at", "error", "updated_at"])
+    profile = run.profile
+    try:
+        if run.action in {"analyze", "generate"}:
+            profile.status = "analyzing"
+            profile.save(update_fields=["status", "updated_at"])
+            run.append_log("Reading repository metadata, Android permissions and SDK dependencies.")
+            run.progress = 30
+            run.save(update_fields=["progress", "updated_at"])
+            result = generate_pack(profile)
+            run.append_log("Compliance pack generated. Privacy policy, declarations and Data Safety evidence are ready.")
+            run.result = {
+                "status": profile.status,
+                "confidence": float(profile.confidence),
+                "ai_used": profile.ai_used,
+                "ai_model": profile.ai_model,
+                "unresolved_questions": profile.unresolved_questions,
+                "generated_sections": sorted(result.keys()),
+            }
+            run.status = "succeeded"
+        elif run.action == "apply":
+            run.append_log("Applying localized store listing and image assets through the official Google Play API.")
+            run.progress = 35
+            run.save(update_fields=["progress", "updated_at"])
+            result = apply_google_apis(profile).as_dict()
+            run.result = result
+            run.status = "partial" if result.get("skipped") else "succeeded"
+            run.append_log("Official API-compatible sections were applied. Console-only declarations are available to the companion autofill.")
+        else:
+            raise RuntimeError(f"Unsupported compliance action: {run.action}")
+        run.progress = 100
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "progress", "finished_at", "result", "logs", "updated_at"])
+    except Exception as exc:
+        profile.status = "failed"
+        profile.last_error = str(exc)
+        profile.save(update_fields=["status", "last_error", "updated_at"])
+        run.status = "failed"
+        run.error = str(exc)
+        run.logs = (run.logs + "\n" + traceback.format_exc())[-100000:]
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "error", "logs", "finished_at", "updated_at"])
+        raise

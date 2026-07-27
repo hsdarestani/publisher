@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     "apps.integrations",
     "apps.reports",
     "apps.signing",
+    "apps.compliance",
 ]
 
 MIDDLEWARE = [

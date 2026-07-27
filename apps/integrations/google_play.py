@@ -1,23 +1,24 @@
 from __future__ import annotations
+
 import csv
 import io
-import json
 import logging
-from datetime import date, datetime
-from pathlib import Path
 from typing import Iterable
-import requests
-from google.oauth2 import service_account
+
 from google.auth.transport.requests import AuthorizedSession, Request as GoogleAuthRequest
+from google.cloud import storage
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google.cloud import storage
+
 from .base import IntegrationError, IntegrationNotConfigured, IntegrationResult
+
 
 logger = logging.getLogger(__name__)
 PUBLISH_SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 REPORT_SCOPE = "https://www.googleapis.com/auth/playdeveloperreporting"
 CLOUD_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only"
+
 
 class GooglePlayClient:
     def __init__(self, store_account):
@@ -40,11 +41,92 @@ class GooglePlayClient:
                 if edit_id:
                     self.publisher().edits().delete(packageName=package_name, editId=edit_id).execute()
             else:
-                # Credential construction and token refresh catches malformed keys without requiring an app.
                 self.credentials([PUBLISH_SCOPE]).refresh(GoogleAuthRequest())
             return IntegrationResult(True, "Google Play credentials are valid.")
         except Exception as exc:
             return IntegrationResult(False, str(exc))
+
+    def apply_store_content(self, app, localizations: Iterable, assets: Iterable):
+        """Apply localized listing text and visual assets without uploading a build."""
+        if not app.package_name:
+            raise IntegrationError("Android package name is missing.")
+        service = self.publisher()
+        edit = service.edits().insert(packageName=app.package_name, body={}).execute()
+        edit_id = edit["id"]
+        warnings = []
+        try:
+            localization_count = 0
+            for loc in localizations:
+                body = {
+                    "title": loc.title,
+                    "shortDescription": loc.short_description or loc.subtitle,
+                    "fullDescription": loc.full_description,
+                    "video": "",
+                }
+                service.edits().listings().update(
+                    packageName=app.package_name,
+                    editId=edit_id,
+                    language=loc.locale,
+                    body=body,
+                ).execute()
+                localization_count += 1
+
+            grouped = {}
+            for asset in assets:
+                if asset.platform not in {"android", "shared"}:
+                    continue
+                image_type = self._image_type(asset)
+                if not image_type:
+                    continue
+                grouped.setdefault((asset.locale, image_type), []).append(asset)
+            image_count = 0
+            for (locale, image_type), values in grouped.items():
+                service.edits().images().deleteall(
+                    packageName=app.package_name,
+                    editId=edit_id,
+                    language=locale,
+                    imageType=image_type,
+                ).execute()
+                for asset in sorted(values, key=lambda x: x.sort_order):
+                    try:
+                        media = MediaFileUpload(asset.file.path, resumable=True)
+                    except (NotImplementedError, AttributeError):
+                        warnings.append(f"{asset}: storage backend does not expose a local path; image upload skipped.")
+                        continue
+                    service.edits().images().upload(
+                        packageName=app.package_name,
+                        editId=edit_id,
+                        language=locale,
+                        imageType=image_type,
+                        media_body=media,
+                    ).execute()
+                    image_count += 1
+            service.edits().validate(packageName=app.package_name, editId=edit_id).execute()
+            committed = service.edits().commit(
+                packageName=app.package_name,
+                editId=edit_id,
+                changesInReviewBehavior="ERROR_IF_IN_REVIEW",
+            ).execute()
+            return {
+                "edit": committed,
+                "localizations": localization_count,
+                "images": image_count,
+                "warnings": warnings,
+            }
+        except Exception:
+            try:
+                service.edits().delete(packageName=app.package_name, editId=edit_id).execute()
+            except Exception:
+                logger.exception("Could not delete failed Google Play content edit")
+            raise
+
+    def apply_data_safety(self, package_name: str, safety_labels_csv: str):
+        if not safety_labels_csv.strip():
+            raise IntegrationError("Data Safety CSV is empty.")
+        return self.publisher().applications().dataSafety(
+            packageName=package_name,
+            body={"safetyLabels": safety_labels_csv},
+        ).execute()
 
     def publish_release(self, app, release, build_obj, localizations: Iterable, assets: Iterable, submit=True):
         if not app.package_name:
@@ -68,7 +150,12 @@ class GooglePlayClient:
                     "fullDescription": loc.full_description,
                     "video": "",
                 }
-                service.edits().listings().update(packageName=app.package_name, editId=edit_id, language=loc.locale, body=body).execute()
+                service.edits().listings().update(
+                    packageName=app.package_name,
+                    editId=edit_id,
+                    language=loc.locale,
+                    body=body,
+                ).execute()
             grouped = {}
             for asset in assets:
                 if asset.platform not in {"android", "shared"}:
@@ -78,20 +165,42 @@ class GooglePlayClient:
                     continue
                 grouped.setdefault((asset.locale, image_type), []).append(asset)
             for (locale, image_type), values in grouped.items():
-                service.edits().images().deleteall(packageName=app.package_name, editId=edit_id, language=locale, imageType=image_type).execute()
+                service.edits().images().deleteall(
+                    packageName=app.package_name,
+                    editId=edit_id,
+                    language=locale,
+                    imageType=image_type,
+                ).execute()
                 for asset in sorted(values, key=lambda x: x.sort_order):
                     service.edits().images().upload(
-                        packageName=app.package_name, editId=edit_id, language=locale, imageType=image_type,
+                        packageName=app.package_name,
+                        editId=edit_id,
+                        language=locale,
+                        imageType=image_type,
                         media_body=MediaFileUpload(asset.file.path, resumable=True),
                     ).execute()
-            track_body = {"track": release.android_track, "releases": [{
-                "name": release.version_name,
-                "versionCodes": [version_code],
-                "status": "completed" if float(release.android_rollout) >= 1 else "inProgress",
-                **({"userFraction": float(release.android_rollout)} if float(release.android_rollout) < 1 else {}),
-                "releaseNotes": [{"language": loc.locale, "text": loc.release_notes or release.release_notes[:500]} for loc in localizations if (loc.release_notes or release.release_notes)],
-            }]}
-            service.edits().tracks().update(packageName=app.package_name, editId=edit_id, track=release.android_track, body=track_body).execute()
+            track_body = {
+                "track": release.android_track,
+                "releases": [
+                    {
+                        "name": release.version_name,
+                        "versionCodes": [version_code],
+                        "status": "completed" if float(release.android_rollout) >= 1 else "inProgress",
+                        **({"userFraction": float(release.android_rollout)} if float(release.android_rollout) < 1 else {}),
+                        "releaseNotes": [
+                            {"language": loc.locale, "text": loc.release_notes or release.release_notes[:500]}
+                            for loc in localizations
+                            if (loc.release_notes or release.release_notes)
+                        ],
+                    }
+                ],
+            }
+            service.edits().tracks().update(
+                packageName=app.package_name,
+                editId=edit_id,
+                track=release.android_track,
+                body=track_body,
+            ).execute()
             service.edits().validate(packageName=app.package_name, editId=edit_id).execute()
             if submit:
                 committed = service.edits().commit(
@@ -99,6 +208,12 @@ class GooglePlayClient:
                     editId=edit_id,
                     changesInReviewBehavior="ERROR_IF_IN_REVIEW",
                 ).execute()
+                try:
+                    compliance = app.compliance
+                except Exception:
+                    compliance = None
+                if compliance and compliance.data_safety_csv.strip():
+                    self.apply_data_safety(app.package_name, compliance.data_safety_csv)
                 return {"edit": committed, "bundle": bundle, "version_code": version_code}
             return {"edit_id": edit_id, "bundle": bundle, "version_code": version_code}
         except Exception:
@@ -109,7 +224,11 @@ class GooglePlayClient:
             raise
 
     def reviews(self, package_name, max_results=100):
-        return self.publisher().reviews().list(packageName=package_name, maxResults=max_results, translationLanguage="en").execute().get("reviews", [])
+        return self.publisher().reviews().list(
+            packageName=package_name,
+            maxResults=max_results,
+            translationLanguage="en",
+        ).execute().get("reviews", [])
 
     def query_vitals(self, package_name: str, metric_set: str, body: dict):
         creds = self.credentials([REPORT_SCOPE])
@@ -157,14 +276,20 @@ class GooglePlayClient:
 
     @staticmethod
     def _image_type(asset):
-        if asset.kind == "icon": return "icon"
-        if asset.kind == "feature_graphic": return "featureGraphic"
-        if asset.kind == "promo": return "promoGraphic"
+        if asset.kind == "icon":
+            return "icon"
+        if asset.kind == "feature_graphic":
+            return "featureGraphic"
+        if asset.kind == "promo":
+            return "promoGraphic"
         if asset.kind == "screenshot":
             mapping = {
-                "phone": "phoneScreenshots", "seven_inch": "sevenInchScreenshots",
-                "ten_inch": "tenInchScreenshots", "tv": "tvScreenshots",
-                "wear": "wearScreenshots", "chromeos": "chromeosScreenshots",
+                "phone": "phoneScreenshots",
+                "seven_inch": "sevenInchScreenshots",
+                "ten_inch": "tenInchScreenshots",
+                "tv": "tvScreenshots",
+                "wear": "wearScreenshots",
+                "chromeos": "chromeosScreenshots",
             }
             return mapping.get(asset.device_type, "phoneScreenshots")
         return None

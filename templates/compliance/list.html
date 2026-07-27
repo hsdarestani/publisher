@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Compliance Center · A+ Publisher{% endblock %}
+{% block page_title %}Compliance Center{% endblock %}
+{% block top_actions %}<a class="btn btn-quiet" href="{% url 'compliance_companion_extension' %}">Download Console Companion</a>{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-head"><div><span class="eyebrow">Google Play policy automation</span><h2>Applications</h2><p class="muted">Generate, verify and apply privacy, policy, audience, rating, access and store declarations.</p></div></div>
+  <div class="release-list">
+    {% for row in rows %}
+      <a class="release-row" href="{% url 'compliance_detail' row.app.pk %}">
+        <span class="version">{{ row.app.name }}<small>{{ row.app.package_name|default:'Package missing' }}</small></span>
+        <span>{{ row.app.client_name|default:'A+ Solution GmbH' }}</span>
+        <span class="status status-{% if row.profile %}{{ row.profile.status }}{% else %}draft{% endif %}">{% if row.profile %}{{ row.profile.get_status_display }}{% else %}Not generated{% endif %}</span>
+        <span>{% if row.profile %}{{ row.profile.confidence|floatformat:0 }} confidence{% else %}—{% endif %}</span>
+        <span>›</span>
+      </a>
+    {% empty %}<div class="empty">No Android applications found.</div>{% endfor %}
+  </div>
+</section>
+{% endblock %}

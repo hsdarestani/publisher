@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ app.name }} compliance · A+ Publisher{% endblock %}
+{% block page_title %}{{ app.name }} compliance{% endblock %}
+{% block top_actions %}
+  <a class="btn btn-quiet" href="{% url 'compliance_edit' app.pk %}">Inputs</a>
+  <a class="btn btn-quiet" href="{% url 'compliance_download_pack' app.pk %}">Download pack</a>
+  <a class="btn btn-quiet" href="{{ profile.privacy_policy_url }}" target="_blank">Privacy policy</a>
+{% endblock %}
+{% block content %}
+<section class="release-hero card">
+  <div><span class="eyebrow">Google Play compliance profile</span><h2>{{ app.name }}</h2><div class="platform-pills"><span class="status status-{{ profile.status }}">{{ profile.get_status_display }}</span><i>{{ app.package_name }}</i>{% if profile.ai_used %}<i>AI · {{ profile.ai_model }}</i>{% else %}<i>Rule engine</i>{% endif %}</div></div>
+  <div class="score-ring {% if profile.status == 'ready' or profile.status == 'applied' %}ready{% endif %}"><strong>{% widthratio profile.confidence 1 100 %}</strong><small>confidence</small></div>
+</section>
+
+<div class="release-layout">
+  <section>
+    <div class="card">
+      <div class="card-head"><div><span class="eyebrow">One-click preparation</span><h3>Compliance pipeline</h3><p class="muted">Source code, permissions, SDKs and store metadata are analyzed together.</p></div></div>
+      <div class="action-stack">
+        <form method="post" action="{% url 'compliance_action' app.pk 'generate' %}">{% csrf_token %}<button class="btn btn-primary btn-block">1. Analyze source & generate everything</button></form>
+        <form method="post" action="{% url 'compliance_action' app.pk 'apply' %}">{% csrf_token %}<button class="btn btn-primary btn-block" {% if not profile.last_generated_at or not app.google_account.configured %}disabled{% endif %}>2. Apply official Google APIs</button></form>
+        <form method="post" action="{% url 'compliance_companion_session' app.pk %}">{% csrf_token %}<button class="btn btn-quiet btn-block" {% if not profile.last_generated_at %}disabled{% endif %}>3. Create Play Console Autofill session</button></form>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div><span class="eyebrow">Prepared declarations</span><h3>Policy pack</h3></div><a href="{% url 'compliance_overrides' app.pk %}">Expert JSON overrides →</a></div>
+      <div class="check-list">
+        <div class="check check-{% if app.privacy_policy_url and profile.privacy_policy_text %}pass{% else %}error{% endif %}"><span>{% if app.privacy_policy_url and profile.privacy_policy_text %}✓{% else %}×{% endif %}</span><div><strong>Privacy policy</strong><small>{{ app.privacy_policy_url|default:'Generate the pack to host a policy automatically.' }}</small></div><i>COMPANION</i></div>
+        <div class="check check-{% if profile.app_access %}pass{% else %}error{% endif %}"><span>✓</span><div><strong>App access</strong><small>{{ profile.get_app_access_display }}{% if app.review_username %} · reviewer account ready{% endif %}</small></div><i>COMPANION</i></div>
+        <div class="check check-pass"><span>✓</span><div><strong>Ads declaration</strong><small>{% if profile.has_ads %}Contains ads{% else %}No ad SDK detected{% endif %}</small></div><i>COMPANION</i></div>
+        <div class="check check-{% if profile.target_age_groups %}pass{% else %}warning{% endif %}"><span>{% if profile.target_age_groups %}✓{% else %}△{% endif %}</span><div><strong>Target audience</strong><small>{{ profile.target_age_groups|join:', '|default:'Not generated' }}</small></div><i>COMPANION</i></div>
+        <div class="check check-{% if profile.content_rating_answers %}pass{% else %}warning{% endif %}"><span>{% if profile.content_rating_answers %}✓{% else %}△{% endif %}</span><div><strong>Content rating</strong><small>{{ profile.content_rating_answers|length }} questionnaire signals prepared</small></div><i>COMPANION</i></div>
+        <div class="check check-{% if profile.data_practices %}pass{% else %}warning{% endif %}"><span>{% if profile.data_practices %}✓{% else %}△{% endif %}</span><div><strong>Data Safety</strong><small>{% if profile.data_safety_csv %}Current Google CSV filled and API-ready{% elif profile.data_practices %}Answers generated; upload a current exported CSV template once for direct API submission{% else %}Not generated{% endif %}</small></div><i>API</i></div>
+        <div class="check check-{% if app.localizations.exists %}pass{% else %}error{% endif %}"><span>{% if app.localizations.exists %}✓{% else %}×{% endif %}</span><div><strong>Store listing</strong><small>{{ app.localizations.count }} localization{{ app.localizations.count|pluralize }} prepared</small></div><i>API</i></div>
+        <div class="check check-{% if app.assets.exists %}pass{% else %}warning{% endif %}"><span>{% if app.assets.exists %}✓{% else %}△{% endif %}</span><div><strong>Images</strong><small>{{ app.assets.count }} asset{{ app.assets.count|pluralize }} available for upload</small></div><i>API</i></div>
+      </div>
+    </div>
+
+    {% if profile.unresolved_questions %}
+    <div class="card"><div class="card-head"><div><span class="eyebrow">Human verification</span><h3>Questions requiring confirmation</h3></div></div><div class="check-list">{% for question in profile.unresolved_questions %}<div class="check check-warning"><span>△</span><div><strong>Confirm</strong><small>{{ question }}</small></div></div>{% endfor %}</div></div>
+    {% endif %}
+  </section>
+
+  <aside>
+    <section class="card"><div class="card-head"><div><span class="eyebrow">Official API</span><h3>Directly applied</h3></div></div>{% for item in official_sections %}<div class="compact-row"><span class="status status-ready">API</span><span><strong>{{ item }}</strong></span></div>{% endfor %}</section>
+    <section class="card"><div class="card-head"><div><span class="eyebrow">Our browser automation</span><h3>Console Companion</h3></div></div>{% for item in companion_sections %}<div class="compact-row"><span class="status status-checking">AUTO</span><span><strong>{{ item }}</strong></span></div>{% endfor %}<a class="btn btn-quiet btn-block" href="{% url 'compliance_companion_extension' %}">Download Chrome extension</a></section>
+    <section class="card"><div class="card-head"><div><span class="eyebrow">Evidence</span><h3>Source analysis</h3></div></div><div class="detail-list"><span><i>Permissions</i><strong>{{ profile.source_analysis.permissions|length }}</strong></span><span><i>SDK packages</i><strong>{{ profile.source_analysis.packages|length }}</strong></span><span><i>Detected data types</i><strong>{{ profile.data_practices.data_types|length }}</strong></span><span><i>Last generated</i><strong>{{ profile.last_generated_at|date:'M j, H:i'|default:'Never' }}</strong></span></div><details><summary>Raw source evidence</summary><pre>{{ profile.source_analysis }}</pre></details></section>
+  </aside>
+</div>
+
+<section class="card"><div class="card-head"><div><span class="eyebrow">Audit trail</span><h3>Compliance runs</h3></div></div>{% for run in runs %}<a class="compact-row" href="{% url 'compliance_run' run.pk %}"><span class="job-dot status-{{ run.status }}"></span><span><strong>{{ run.get_action_display }}</strong><small>{{ run.created_at|date:'M j, H:i' }} · {{ run.progress }}%</small></span><span class="status status-{{ run.status }}">{{ run.status }}</span></a>{% empty %}<div class="empty small">Generate the first compliance pack.</div>{% endfor %}</section>
+{% endblock %}

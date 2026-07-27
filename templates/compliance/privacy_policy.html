@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="{% if profile.primary_locale|slice:':2' == 'de' %}de{% else %}en{% endif %}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="index,follow">
+  <title>{% if profile.primary_locale|slice:':2' == 'de' %}Datenschutzerklärung{% else %}Privacy Policy{% endif %} · {{ app.name }}</title>
+  <style>body{margin:0;background:#f5f8fc;color:#14243b;font-family:Inter,Arial,sans-serif;line-height:1.72}.wrap{max-width:860px;margin:0 auto;padding:54px 24px}.brand{display:inline-flex;align-items:center;gap:12px;margin-bottom:38px}.mark{display:grid;place-items:center;width:42px;height:42px;border-radius:12px;background:#1769e0;color:#fff;font-weight:800;box-shadow:0 10px 25px #1769e033}.brand strong{display:block}.brand small{color:#72819a}.card{background:#fff;border:1px solid #dfe7f2;border-radius:22px;padding:38px;box-shadow:0 18px 55px #203b6610}h1{font-size:34px;line-height:1.15;margin:0 0 8px}.meta{color:#70809a;margin-bottom:30px}.policy{white-space:pre-wrap;font-size:16px}footer{font-size:12px;color:#8996aa;text-align:center;margin-top:24px}@media(max-width:600px){.wrap{padding:24px 14px}.card{padding:24px}h1{font-size:28px}}</style>
+</head>
+<body><div class="wrap"><div class="brand"><span class="mark">A+</span><span><strong>{{ app.name }}</strong><small>{{ app.client_name|default:'A+ Solution GmbH' }}</small></span></div><main class="card"><h1>{% if profile.primary_locale|slice:':2' == 'de' %}Datenschutzerklärung{% else %}Privacy Policy{% endif %}</h1><div class="meta">{{ app.name }} · {{ app.package_name|default:app.bundle_id }}</div><div class="policy">{{ profile.privacy_policy_text }}</div></main><footer>Generated and maintained through A+ Publisher · Last updated {{ profile.updated_at|date:'Y-m-d' }}</footer></div></body>
+</html>

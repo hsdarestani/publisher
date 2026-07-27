@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ("publisher", "0005_mobileapp_android_signing"),
+        ("publisher", "0001_initial"),
     ]
 
     operations = [

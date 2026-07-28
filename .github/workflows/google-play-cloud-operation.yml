@@ -52,11 +52,42 @@ jobs:
             --callback-url '${{ inputs.publisher_url }}/compliance/cloud/google/${{ inputs.run_id }}/callback/' \
             --token "$CALLBACK_TOKEN" \
             --output google-play-cloud-result.json
+      - name: Capture exact Data Safety CSV
+        if: always()
+        env:
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          PAYLOAD_URL: ${{ inputs.publisher_url }}/compliance/cloud/google/${{ inputs.run_id }}/payload.json
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import requests
+
+          response = requests.get(
+              os.environ["PAYLOAD_URL"],
+              params={"token": os.environ["CALLBACK_TOKEN"]},
+              timeout=60,
+              headers={"User-Agent": "APlus-Publisher-GooglePlay-Cloud/1.0"},
+          )
+          if not response.ok:
+              print(f"Could not capture Data Safety CSV: HTTP {response.status_code}")
+              raise SystemExit(0)
+
+          csv_text = response.json().get("data_safety_csv", "")
+          if csv_text:
+              Path("google-play-data-safety.csv").write_text(csv_text, encoding="utf-8")
+              print("Captured exact Data Safety CSV submitted by this run.")
+          else:
+              print("This run did not include a Data Safety CSV.")
+          PY
       - name: Upload sanitized operation result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: google-play-cloud-result-${{ inputs.run_id }}
-          path: google-play-cloud-result.json
+          path: |
+            google-play-cloud-result.json
+            google-play-data-safety.csv
           if-no-files-found: ignore
           retention-days: 7

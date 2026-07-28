@@ -40,6 +40,19 @@ def verify_cloud_token(token: str, run_id: int, max_age=3600) -> dict:
     return payload
 
 
+def is_google_edge_blocked(exc: Exception) -> bool:
+    diagnostics = getattr(exc, "diagnostics", {}) or {}
+    probes = diagnostics.get("endpoint_probes", [])
+    if probes:
+        return all(
+            int(probe.get("status") or 0) == 403
+            and str(probe.get("content_type") or "").lower() == "text/html"
+            for probe in probes
+        )
+    text = str(exc).lower()
+    return "http 403" in text and "text/html" in text and "permission to get url" in text
+
+
 def dispatch_google_play_cloud(run_id: int) -> CloudDispatch:
     token = settings.PUBLISHER_GITHUB_TOKEN.strip()
     repository = settings.PUBLISHER_GITHUB_REPOSITORY.strip()

@@ -1,0 +1,48 @@
+name: Google Play Cloud Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: Android package name to test
+        required: true
+        default: de.freiraum.parking
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate required secret
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::error::Repository secret GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing. Paste the complete service-account JSON as the secret value."
+            exit 2
+          fi
+      - name: Install diagnostic dependencies
+        run: python -m pip install --disable-pip-version-check google-auth requests
+      - name: Test Google Play from GitHub cloud network
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/google_play_cloud_diagnostic.py \
+            --package '${{ inputs.package_name }}' \
+            --output google-play-diagnostic.json
+      - name: Upload sanitized diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-play-diagnostic
+          path: google-play-diagnostic.json
+          if-no-files-found: ignore
+          retention-days: 7

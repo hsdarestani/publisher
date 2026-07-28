@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 from pathlib import Path
@@ -9,11 +10,13 @@ from urllib.parse import quote
 import requests
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2 import service_account
+from PIL import Image, ImageFilter, ImageOps
 
 
 SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 API_BASE = "https://androidpublisher.googleapis.com/androidpublisher/v3"
 UPLOAD_BASE = "https://androidpublisher.googleapis.com/upload/androidpublisher/v3"
+RESAMPLE = Image.Resampling.LANCZOS
 
 
 def q(value):
@@ -54,13 +57,106 @@ def delete_edit(session, package_name, edit_id):
         pass
 
 
+def _png_bytes(image):
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True, compress_level=9)
+    return output.getvalue()
+
+
+def _flatten_rgba(image, background=(245, 247, 250)):
+    rgba = image.convert("RGBA")
+    flattened = Image.new("RGB", rgba.size, background)
+    flattened.paste(rgba, mask=rgba.getchannel("A"))
+    return flattened
+
+
+def normalize_store_asset(image_type, content):
+    """Return Play-compliant bytes, content type and an optional audit message.
+
+    Google Play's fixed-size slots reject otherwise valid images before an edit
+    can be committed. We preserve the whole source artwork: feature graphics use
+    a softly blurred cover background with a contained foreground, while icons
+    use transparent padding. No stretching is applied.
+    """
+    if image_type not in {"featureGraphic", "icon"}:
+        return content, None, None
+
+    try:
+        with Image.open(io.BytesIO(content)) as source:
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            original_size = image.size
+            original_mode = image.mode
+
+            if image_type == "featureGraphic":
+                target = (1024, 500)
+                rgba = image.convert("RGBA")
+                flat = _flatten_rgba(rgba)
+                if original_size == target:
+                    normalized = flat
+                else:
+                    background = ImageOps.fit(flat, target, method=RESAMPLE).filter(
+                        ImageFilter.GaussianBlur(radius=22)
+                    )
+                    foreground = ImageOps.contain(rgba, target, method=RESAMPLE)
+                    canvas = background.convert("RGBA")
+                    offset = (
+                        (target[0] - foreground.width) // 2,
+                        (target[1] - foreground.height) // 2,
+                    )
+                    canvas.alpha_composite(foreground, dest=offset)
+                    normalized = canvas.convert("RGB")
+                output = _png_bytes(normalized)
+                message = None
+                if original_size != target or original_mode not in {"RGB", "P"}:
+                    message = (
+                        f"Feature graphic automatically normalized from {original_size[0]}×{original_size[1]} "
+                        f"({original_mode}) to Google Play's required 1024×500 RGB PNG without stretching."
+                    )
+                return output, "image/png", message
+
+            target = (512, 512)
+            rgba = image.convert("RGBA")
+            if original_size == target:
+                normalized = rgba
+            else:
+                foreground = ImageOps.contain(rgba, target, method=RESAMPLE)
+                normalized = Image.new("RGBA", target, (0, 0, 0, 0))
+                offset = (
+                    (target[0] - foreground.width) // 2,
+                    (target[1] - foreground.height) // 2,
+                )
+                normalized.alpha_composite(foreground, dest=offset)
+            output = _png_bytes(normalized)
+            if len(output) > 1024 * 1024:
+                raise RuntimeError(
+                    "Normalized Google Play icon exceeds the 1 MB limit. Use a simpler 512×512 source icon."
+                )
+            message = None
+            if original_size != target or original_mode != "RGBA":
+                message = (
+                    f"App icon automatically normalized from {original_size[0]}×{original_size[1]} "
+                    f"({original_mode}) to Google Play's required 512×512 RGBA PNG."
+                )
+            return output, "image/png", message
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Could not decode {image_type} image: {exc}") from exc
+
+
 def download_asset(asset):
     response = requests.get(asset["url"], timeout=120)
     require(response, f"Download asset {asset.get('name') or asset['url']}", parse_json=False)
+    content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
+    content, normalized_type, normalization_warning = normalize_store_asset(
+        asset.get("image_type", ""), response.content
+    )
     return {
         **asset,
-        "content": response.content,
-        "content_type": response.headers.get("content-type", "application/octet-stream").split(";")[0],
+        "content": content,
+        "content_type": normalized_type or content_type,
+        "normalization_warning": normalization_warning,
     }
 
 
@@ -80,8 +176,12 @@ def upload_image(session, package_name, edit_id, locale, image_type, asset):
 def apply_payload(payload, credentials):
     package_name = payload["package_name"]
     prepared_groups = {}
+    warnings = []
     for asset in payload.get("assets", []):
-        prepared_groups.setdefault((asset["locale"], asset["image_type"]), []).append(download_asset(asset))
+        prepared = download_asset(asset)
+        prepared_groups.setdefault((asset["locale"], asset["image_type"]), []).append(prepared)
+        if prepared.get("normalization_warning"):
+            warnings.append(prepared["normalization_warning"])
 
     session = AuthorizedSession(credentials)
     edit_id = create_edit(session, package_name)
@@ -154,7 +254,7 @@ def apply_payload(payload, credentials):
             "listing_count": listing_count,
             "image_count": image_count,
             "data_safety_applied": data_safety_applied,
-            "warnings": [],
+            "warnings": warnings,
             "edit": committed,
             "executor": "github-actions",
         }

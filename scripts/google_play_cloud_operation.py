@@ -54,16 +54,23 @@ def delete_edit(session, package_name, edit_id):
         pass
 
 
-def upload_image(session, package_name, edit_id, locale, image_type, asset):
+def download_asset(asset):
     response = requests.get(asset["url"], timeout=120)
     require(response, f"Download asset {asset.get('name') or asset['url']}", parse_json=False)
-    content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
+    return {
+        **asset,
+        "content": response.content,
+        "content_type": response.headers.get("content-type", "application/octet-stream").split(";")[0],
+    }
+
+
+def upload_image(session, package_name, edit_id, locale, image_type, asset):
     return require(
         session.post(
             f"{UPLOAD_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(locale)}/{q(image_type)}",
             params={"uploadType": "media"},
-            data=response.content,
-            headers={"Content-Type": content_type},
+            data=asset["content"],
+            headers={"Content-Type": asset["content_type"]},
             timeout=300,
         ),
         f"Upload {image_type}",
@@ -72,9 +79,12 @@ def upload_image(session, package_name, edit_id, locale, image_type, asset):
 
 def apply_payload(payload, credentials):
     package_name = payload["package_name"]
+    prepared_groups = {}
+    for asset in payload.get("assets", []):
+        prepared_groups.setdefault((asset["locale"], asset["image_type"]), []).append(download_asset(asset))
+
     session = AuthorizedSession(credentials)
     edit_id = create_edit(session, package_name)
-    warnings = []
     try:
         listing_count = 0
         for listing in payload.get("localizations", []):
@@ -95,10 +105,7 @@ def apply_payload(payload, credentials):
             listing_count += 1
 
         image_count = 0
-        groups = {}
-        for asset in payload.get("assets", []):
-            groups.setdefault((asset["locale"], asset["image_type"]), []).append(asset)
-        for (locale, image_type), assets in groups.items():
+        for (locale, image_type), assets in prepared_groups.items():
             require(
                 session.delete(
                     f"{API_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(locale)}/{q(image_type)}",
@@ -107,11 +114,8 @@ def apply_payload(payload, credentials):
                 f"Clear {image_type} for {locale}",
             )
             for asset in sorted(assets, key=lambda item: item.get("sort_order", 0)):
-                try:
-                    upload_image(session, package_name, edit_id, locale, image_type, asset)
-                    image_count += 1
-                except Exception as exc:
-                    warnings.append(str(exc))
+                upload_image(session, package_name, edit_id, locale, image_type, asset)
+                image_count += 1
 
         require(
             session.post(
@@ -150,7 +154,7 @@ def apply_payload(payload, credentials):
             "listing_count": listing_count,
             "image_count": image_count,
             "data_safety_applied": data_safety_applied,
-            "warnings": warnings,
+            "warnings": [],
             "edit": committed,
             "executor": "github-actions",
         }

@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from apps.integrations.google_play_cloud import dispatch_google_play_cloud, is_google_edge_blocked
 
+from .data_safety import fill_data_safety_template
 from .models import ComplianceRun
 from .services import apply_google_apis, generate_pack
 
@@ -28,6 +29,10 @@ def execute_compliance_run(run_id: int):
             run.progress = 30
             run.save(update_fields=["progress", "updated_at"])
             result = generate_pack(profile)
+            strict_csv = fill_data_safety_template(profile)
+            if strict_csv:
+                profile.data_safety_csv = strict_csv
+                profile.save(update_fields=["data_safety_csv", "updated_at"])
             run.append_log("Compliance pack generated. Privacy policy, declarations and Data Safety evidence are ready.")
             run.result = {
                 "status": profile.status,
@@ -39,6 +44,11 @@ def execute_compliance_run(run_id: int):
             }
             run.status = "succeeded"
         elif run.action == "apply":
+            strict_csv = fill_data_safety_template(profile)
+            if strict_csv:
+                profile.data_safety_csv = strict_csv
+                profile.save(update_fields=["data_safety_csv", "updated_at"])
+                run.append_log("Validated Data Safety CSV: SINGLE_CHOICE questions contain at most one selected response.")
             run.append_log("Applying localized store listing and image assets through the official Google Play API.")
             run.progress = 35
             run.save(update_fields=["progress", "updated_at"])

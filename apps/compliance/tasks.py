@@ -5,6 +5,8 @@ import traceback
 from celery import shared_task
 from django.utils import timezone
 
+from apps.integrations.google_play_cloud import dispatch_google_play_cloud, is_google_edge_blocked
+
 from .models import ComplianceRun
 from .services import apply_google_apis, generate_pack
 
@@ -40,7 +42,25 @@ def execute_compliance_run(run_id: int):
             run.append_log("Applying localized store listing and image assets through the official Google Play API.")
             run.progress = 35
             run.save(update_fields=["progress", "updated_at"])
-            result = apply_google_apis(profile).as_dict()
+            try:
+                result = apply_google_apis(profile).as_dict()
+            except Exception as direct_error:
+                if not is_google_edge_blocked(direct_error):
+                    raise
+                run.append_log(
+                    "Google Edge rejected the Publisher server IP with an HTML 403. "
+                    "Dispatching the same official API operation to the trusted GitHub cloud runner."
+                )
+                dispatch = dispatch_google_play_cloud(run.pk)
+                run.progress = 50
+                run.result = {
+                    "execution": "github-actions",
+                    "state": "dispatched",
+                    "dispatch": dispatch.as_dict(),
+                    "direct_error": str(direct_error)[:2000],
+                }
+                run.save(update_fields=["progress", "result", "logs", "updated_at"])
+                return
             run.result = result
             run.status = "partial" if result.get("skipped") else "succeeded"
             run.append_log("Official API-compatible sections were applied. Console-only declarations are available to the companion autofill.")

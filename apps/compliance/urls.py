@@ -1,6 +1,7 @@
 from django.urls import path
 
 from . import views
+from .public_views import public_account_deletion
 
 
 urlpatterns = [
@@ -16,5 +17,6 @@ urlpatterns = [
     path("cloud/google/<int:run_id>/callback/", views.google_cloud_callback, name="compliance_google_cloud_callback"),
     path("companion/extension.zip", views.download_companion_extension, name="compliance_companion_extension"),
     path("companion/<uuid:token>/payload.json", views.companion_payload, name="compliance_companion_payload"),
+    path("delete-account/<slug:slug>/", public_account_deletion, name="public_account_deletion"),
     path("privacy/<slug:slug>/", views.public_privacy_policy, name="public_privacy_policy"),
 ]

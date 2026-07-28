@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,11 +27,13 @@ def response_detail(response):
         return " ".join(response.text.replace("\n", " ").split())[:1200]
 
 
-def require(response, action):
+def require(response, action, *, parse_json=True):
     if not response.ok:
         raise RuntimeError(
             f"{action} failed: HTTP {response.status_code} {json.dumps(response_detail(response), ensure_ascii=False)}"
         )
+    if not parse_json:
+        return response
     return response.json() if response.content else {}
 
 
@@ -55,7 +56,7 @@ def delete_edit(session, package_name, edit_id):
 
 def upload_image(session, package_name, edit_id, locale, image_type, asset):
     response = requests.get(asset["url"], timeout=120)
-    require(response, f"Download asset {asset.get('name') or asset['url']}")
+    require(response, f"Download asset {asset.get('name') or asset['url']}", parse_json=False)
     content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
     return require(
         session.post(
@@ -193,8 +194,8 @@ def main():
             timeout=60,
             headers={"User-Agent": "APlus-Publisher-GooglePlay-Cloud/1.0"},
         )
-        require(payload_response, "Fetch Publisher operation payload")
-        result = apply_payload(payload_response.json(), credentials)
+        payload = require(payload_response, "Fetch Publisher operation payload")
+        result = apply_payload(payload, credentials)
     except Exception as exc:
         result = {
             "success": False,

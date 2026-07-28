@@ -4,7 +4,7 @@ import csv
 import io
 import re
 
-from .data_safety import DATA_ID_TOKENS
+from .data_safety import DATA_ID_TOKENS, fill_data_safety_template as _fill_data_safety_template
 
 
 ACCOUNT_CONDITIONAL_QUESTION_PREFIXES = (
@@ -12,6 +12,12 @@ ACCOUNT_CONDITIONAL_QUESTION_PREFIXES = (
     "PSL_ACCOUNT_DELETION_URL",
     "PSL_ACM_SPECIFY",
 )
+
+
+def strict_data_safety_csv(profile) -> str:
+    """Generate and sanitize the exact CSV that may leave Publisher."""
+    generated = _fill_data_safety_template(profile)
+    return clear_unselected_data_answers(generated, profile) if generated else ""
 
 
 def clear_unselected_data_answers(csv_text: str, profile) -> str:

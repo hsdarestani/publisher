@@ -5,6 +5,8 @@ import io
 import re
 from collections import defaultdict
 
+from django.conf import settings
+
 
 DATA_LABELS = {
     "location.precise": "Precise location",
@@ -26,39 +28,55 @@ DATA_LABELS = {
     "device.identifiers": "Device or other IDs",
 }
 
+# Google changes the human labels, but these machine response IDs are stable in
+# exported Data Safety templates. Include historical aliases as a compatibility
+# layer so an older exported template remains usable.
 DATA_ID_TOKENS = {
-    "location.precise": ("PRECISE_LOCATION",),
-    "location.approximate": ("APPROX_LOCATION", "APPROXIMATE_LOCATION"),
+    "location.precise": ("PSL_PRECISE_LOCATION", "PRECISE_LOCATION"),
+    "location.approximate": ("PSL_APPROX_LOCATION", "PSL_APPROXIMATE_LOCATION", "APPROX_LOCATION"),
     "personal_info.name": ("PSL_NAME",),
-    "personal_info.email": ("EMAIL_ADDRESS",),
-    "personal_info.phone": ("PHONE_NUMBER",),
-    "personal_info.other": ("OTHER_PERSONAL_INFO",),
-    "user_ids": ("USER_IDS", "USER_ID"),
-    "financial_info.purchase_history": ("PURCHASE_HISTORY",),
-    "photos.files": ("PHOTOS", "VIDEOS"),
-    "files.documents": ("FILES_AND_DOCS", "FILES_AND_DOCUMENTS"),
-    "contacts": ("CONTACTS",),
-    "audio.voice": ("VOICE_OR_SOUND_RECORDINGS", "AUDIO"),
-    "app_activity.app_interactions": ("APP_INTERACTIONS",),
-    "app_activity.notifications": ("OTHER_USER_GENERATED_CONTENT",),
-    "diagnostics.crash_logs": ("CRASH_LOGS",),
-    "diagnostics.other": ("DIAGNOSTICS",),
-    "device.identifiers": ("DEVICE_OR_OTHER_IDS", "DEVICE_IDENTIFIERS"),
+    "personal_info.email": ("PSL_EMAIL", "EMAIL_ADDRESS"),
+    "personal_info.phone": ("PSL_PHONE", "PHONE_NUMBER"),
+    "personal_info.other": ("PSL_OTHER_PERSONAL", "OTHER_PERSONAL_INFO"),
+    "user_ids": ("PSL_USER_ACCOUNT", "PSL_USER_IDS", "USER_IDS", "USER_ID"),
+    "financial_info.purchase_history": ("PSL_PURCHASE_HISTORY", "PURCHASE_HISTORY"),
+    "photos.files": ("PSL_PHOTOS", "PSL_VIDEOS", "PHOTOS", "VIDEOS"),
+    "files.documents": ("PSL_FILES_AND_DOCS", "FILES_AND_DOCS", "FILES_AND_DOCUMENTS"),
+    "contacts": ("PSL_CONTACTS", "CONTACTS"),
+    "audio.voice": ("PSL_VOICE_OR_SOUND_RECORDINGS", "VOICE_OR_SOUND_RECORDINGS"),
+    "app_activity.app_interactions": ("PSL_USER_INTERACTION", "APP_INTERACTIONS"),
+    "app_activity.notifications": ("PSL_USER_GENERATED_CONTENT", "OTHER_USER_GENERATED_CONTENT"),
+    "diagnostics.crash_logs": ("PSL_CRASH_LOGS", "CRASH_LOGS"),
+    "diagnostics.other": ("PSL_PERFORMANCE_DIAGNOSTICS", "DIAGNOSTICS"),
+    "device.identifiers": ("PSL_DEVICE_ID", "DEVICE_OR_OTHER_IDS", "DEVICE_IDENTIFIERS"),
 }
 
 PURPOSE_TOKENS = {
-    "app_functionality": ("APP_FUNCTIONALITY",),
-    "analytics": ("ANALYTICS",),
-    "account_management": ("ACCOUNT_MANAGEMENT",),
-    "advertising": ("ADVERTISING", "MARKETING"),
-    "fraud_prevention": ("FRAUD_PREVENTION", "SECURITY", "COMPLIANCE"),
-    "personalization": ("PERSONALIZATION",),
-    "developer_communications": ("DEVELOPER_COMMUNICATIONS",),
+    "app_functionality": ("PSL_APP_FUNCTIONALITY", "APP_FUNCTIONALITY"),
+    "analytics": ("PSL_ANALYTICS", "ANALYTICS"),
+    "account_management": ("PSL_ACCOUNT_MANAGEMENT", "ACCOUNT_MANAGEMENT"),
+    "advertising": ("PSL_ADVERTISING", "ADVERTISING", "MARKETING"),
+    "fraud_prevention": ("PSL_FRAUD_PREVENTION_SECURITY", "FRAUD_PREVENTION", "SECURITY", "COMPLIANCE"),
+    "personalization": ("PSL_PERSONALIZATION", "PERSONALIZATION"),
+    "developer_communications": ("PSL_DEVELOPER_COMMUNICATIONS", "DEVELOPER_COMMUNICATIONS"),
+}
+
+KNOWN_REQUIRED_PARENT_IDS = {
+    "PSL_DATA_COLLECTION_COLLECTS_PERSONAL_DATA",
+    "PSL_DATA_COLLECTION_ENCRYPTED_IN_TRANSIT",
+    "PSL_SUPPORTED_ACCOUNT_CREATION_METHODS",
+    "PSL_SUPPORT_DATA_DELETION_BY_USER",
 }
 
 
+def public_deletion_url(profile) -> str:
+    if profile.account_deletion_url:
+        return profile.account_deletion_url.strip()
+    return f"{settings.PUBLIC_URL.rstrip('/')}/compliance/delete-account/{profile.app.slug}/"
+
+
 def fill_data_safety_template(profile) -> str:
-    """Fill Google's exported CSV while enforcing its choice constraints."""
+    """Fill Google's exported CSV using machine IDs and validate required answers."""
     if not profile.data_safety_template:
         return ""
     try:
@@ -86,20 +104,23 @@ def fill_data_safety_template(profile) -> str:
 
     rows = [dict(row) for row in reader]
     originals = [str(row.get(response_key, "") or "").strip().upper() for row in rows]
-    decisions: list[bool | None] = []
+    decisions: list[bool | str | None] = []
     for row in rows:
         decision = _csv_response(profile, row, columns)
         decisions.append(decision)
         if decision is None:
             continue
-        requirement = _value(row, columns["requirement"]).upper().replace(" ", "_")
-        if requirement in {"SINGLE_CHOICE", "MULTIPLE_CHOICE"}:
+        requirement = _requirement(row, columns)
+        if isinstance(decision, str):
+            row[response_key] = decision
+        elif requirement in {"SINGLE_CHOICE", "MULTIPLE_CHOICE"}:
             row[response_key] = "TRUE" if decision else ""
         else:
             row[response_key] = "TRUE" if decision else "FALSE"
 
     _enforce_single_choice(rows, originals, decisions, columns)
     _validate_single_choice(rows, columns)
+    _validate_required_answers(rows, columns, profile)
 
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\n")
@@ -112,8 +133,7 @@ def _enforce_single_choice(rows, originals, decisions, columns):
     response_key = columns["response_value"]
     groups = defaultdict(list)
     for index, row in enumerate(rows):
-        requirement = _value(row, columns["requirement"]).upper().replace(" ", "_")
-        if requirement == "SINGLE_CHOICE":
+        if _requirement(row, columns) == "SINGLE_CHOICE":
             groups[_value(row, columns["question_id"]) or f"row:{index}"].append(index)
 
     for indexes in groups.values():
@@ -137,14 +157,41 @@ def _validate_single_choice(rows, columns):
     response_key = columns["response_value"]
     selected = defaultdict(int)
     for index, row in enumerate(rows):
-        requirement = _value(row, columns["requirement"]).upper().replace(" ", "_")
-        if requirement != "SINGLE_CHOICE":
+        if _requirement(row, columns) != "SINGLE_CHOICE":
             continue
         if str(row.get(response_key, "")).strip().upper() == "TRUE":
             selected[_value(row, columns["question_id"]) or f"row:{index}"] += 1
     invalid = [question for question, count in selected.items() if count > 1]
     if invalid:
         raise ValueError(f"Invalid Google Data Safety SINGLE_CHOICE groups: {', '.join(invalid[:8])}")
+
+
+def _validate_required_answers(rows, columns, profile):
+    response_key = columns["response_value"]
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[_machine(_value(row, columns["question_id"]))].append(row)
+
+    missing = []
+    for question_id in KNOWN_REQUIRED_PARENT_IDS:
+        candidates = grouped.get(question_id, [])
+        if candidates and not any(str(row.get(response_key, "") or "").strip() for row in candidates):
+            missing.append(question_id)
+
+    account_creation = _account_creation(profile)
+    deletion_supported = _deletion_supported(profile)
+    if account_creation:
+        for question_id in ("PSL_ACCOUNT_DELETION_URL",):
+            candidates = grouped.get(question_id, [])
+            if candidates and not any(str(row.get(response_key, "") or "").strip() for row in candidates):
+                missing.append(question_id)
+    if deletion_supported:
+        candidates = grouped.get("PSL_DATA_DELETION_URL", [])
+        if candidates and not any(str(row.get(response_key, "") or "").strip() for row in candidates):
+            missing.append("PSL_DATA_DELETION_URL")
+
+    if missing:
+        raise ValueError(f"Google Data Safety required responses are missing: {', '.join(sorted(set(missing)))}")
 
 
 def _single_choice_score(row, decision, columns):
@@ -165,10 +212,44 @@ def _csv_response(profile, row, columns):
     label_lower = label.lower()
     practices = profile.data_practices or {}
     data_types = practices.get("data_types", {})
+
+    # Required parent questions do not have Yes/No response rows. Their value is
+    # written directly into the Response value column.
+    if question_id == "PSL_DATA_COLLECTION_COLLECTS_PERSONAL_DATA":
+        return bool(data_types)
+    if question_id == "PSL_DATA_COLLECTION_ENCRYPTED_IN_TRANSIT":
+        return bool(practices.get("encrypted_in_transit", True))
+    if question_id == "PSL_SUPPORTED_ACCOUNT_CREATION_METHODS":
+        creates_accounts = _account_creation(profile)
+        if response_id == "PSL_ACM_NONE":
+            return not creates_accounts
+        if response_id == "PSL_ACM_USER_ID_PASSWORD":
+            return creates_accounts
+        return False
+    if question_id == "PSL_ACM_SPECIFY":
+        return None
+    if question_id == "PSL_ACCOUNT_DELETION_URL":
+        return public_deletion_url(profile) if _account_creation(profile) else None
+    if question_id == "PSL_SUPPORT_DATA_DELETION_BY_USER":
+        supported = _deletion_supported(profile)
+        if response_id == "DATA_DELETION_YES":
+            return supported
+        if response_id == "DATA_DELETION_NO":
+            return not supported
+        if response_id == "DATA_DELETION_NO_AUTO_DELETED":
+            return False
+    if question_id == "PSL_DATA_DELETION_URL":
+        return public_deletion_url(profile) if _deletion_supported(profile) else None
+    if question_id == "PSL_HAS_OUTSIDE_APP_ACCOUNTS":
+        return False
+
     matched_key = _match_data_key(question_id, response_id, label_lower, data_types)
     item = data_types.get(matched_key, {}) if matched_key else {}
 
     yes_no = _yes_no_choice(response_id, label)
+    if question_id == "PSL_DATA_COLLECTION" and yes_no is not None:
+        answer = bool(data_types)
+        return answer if yes_no else not answer
     if _contains(label_lower, "collect or share", "erhebt oder teilt", "erhoben oder weitergegeben") and yes_no is not None:
         answer = bool(data_types)
         return answer if yes_no else not answer
@@ -176,7 +257,7 @@ def _csv_response(profile, row, columns):
         answer = bool(practices.get("encrypted_in_transit", True))
         return answer if yes_no else not answer
     if ("delet" in label_lower or "lösch" in label_lower) and yes_no is not None:
-        answer = bool(practices.get("deletion_request", False))
+        answer = _deletion_supported(profile)
         return answer if yes_no else not answer
 
     if "DATA_TYPES" in question_id and matched_key:
@@ -189,13 +270,17 @@ def _csv_response(profile, row, columns):
         if "BOTH" in response_id:
             return bool(item.get("collected") and item.get("shared"))
     if "EPHEMERAL" in question_id or _contains(label_lower, "processed ephemerally", "sitzungsspezifisch verarbeitet"):
-        return bool(item.get("ephemeral", False))
+        return bool(item.get("ephemeral", False)) if matched_key else None
     if "USER_CONTROL" in question_id or _contains(label_lower, "required for your app", "für deine app erforderlich"):
+        if not matched_key:
+            return None
         if "OPTIONAL" in response_id or "users can choose" in label_lower or "nutzer können entscheiden" in label_lower:
             return not bool(item.get("required", False))
         if "REQUIRED" in response_id or "data collection is required" in label_lower or "datenerhebung ist erforderlich" in label_lower:
             return bool(item.get("required", False))
     if "PURPOSE" in question_id or _contains(label_lower, "why is this user data", "warum werden diese nutzerdaten"):
+        if not matched_key:
+            return None
         for purpose, tokens in PURPOSE_TOKENS.items():
             if any(token in response_id for token in tokens):
                 return purpose in item.get("purposes", [])
@@ -213,16 +298,40 @@ def _csv_response(profile, row, columns):
     return None
 
 
+def _account_creation(profile) -> bool:
+    practices = profile.data_practices or {}
+    if profile.account_deletion == "not_applicable":
+        return False
+    return bool(
+        practices.get("account_creation")
+        or getattr(profile.app, "requires_login", False)
+        or profile.app_access == "login"
+    )
+
+
+def _deletion_supported(profile) -> bool:
+    if profile.account_deletion in {"in_app", "web", "support"}:
+        return True
+    if profile.account_deletion in {"unavailable", "not_applicable"}:
+        return False
+    return bool((profile.data_practices or {}).get("deletion_request", False))
+
+
 def _match_data_key(question_id, response_id, label_lower, data_types):
     machine = f"{question_id} {response_id}"
-    for key in data_types:
-        if any(token in machine for token in DATA_ID_TOKENS.get(key, ())):
-            return key
     matches = []
+    for key in data_types:
+        for token in DATA_ID_TOKENS.get(key, ()):
+            if token in machine:
+                matches.append((len(token), key))
+    if matches:
+        return max(matches)[1]
+
+    label_matches = []
     for key, label in DATA_LABELS.items():
         if key in data_types and label.lower() in label_lower:
-            matches.append((len(label), key))
-    return max(matches)[1] if matches else None
+            label_matches.append((len(label), key))
+    return max(label_matches)[1] if label_matches else None
 
 
 def _yes_no_choice(response_id, label):
@@ -252,6 +361,10 @@ def _find_column(fieldnames, wanted, exclude=None):
             if score > best_score:
                 best, best_score = field, score
     return best
+
+
+def _requirement(row, columns):
+    return _value(row, columns["requirement"]).upper().replace(" ", "_")
 
 
 def _normalize_header(value):

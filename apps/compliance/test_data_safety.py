@@ -8,7 +8,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
 from apps.publisher.models import MobileApp
-from scripts.google_play_cloud_operation import apply_payload
+from scripts.google_play_cloud_operation import apply_payload, replace_image_group
 
 from .data_safety import fill_data_safety_template
 from .services import get_or_create_profile
@@ -173,3 +173,40 @@ class GoogleCloudPartialResultTests(TestCase):
         self.assertFalse(result["data_safety_applied"])
         self.assertIn("Selected more than one response", result["data_safety_error"])
         self.assertEqual(result["listing_count"], 1)
+
+
+class GoogleCloudImageRetryTests(TestCase):
+    @patch("scripts.google_play_cloud_operation.time.sleep")
+    def test_transient_feature_graphic_500_clears_and_retries_whole_group(self, sleep):
+        session = Mock()
+        session.delete.return_value = Mock(ok=True, content=b"", json=lambda: {})
+        transient = Mock(
+            ok=False,
+            status_code=500,
+            content=b"{}",
+            text="internal",
+            json=lambda: {"error": {"message": "Internal error encountered."}},
+        )
+        success = Mock(ok=True, status_code=200, content=b"{}", json=lambda: {"sha256": "ok"})
+        session.post.side_effect = [transient, success]
+
+        uploaded = replace_image_group(
+            session,
+            "de.freiraum.parking",
+            "edit-1",
+            "de-DE",
+            "featureGraphic",
+            [
+                {
+                    "content": b"png",
+                    "content_type": "image/png",
+                    "sort_order": 0,
+                }
+            ],
+            attempts=2,
+        )
+
+        self.assertEqual(uploaded, 1)
+        self.assertEqual(session.delete.call_count, 2)
+        self.assertEqual(session.post.call_count, 2)
+        sleep.assert_called_once()

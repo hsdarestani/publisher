@@ -11,3 +11,5 @@ If Google Edge returns an HTML `403` before the request reaches the API, Publish
 5. Updates the original Compliance Run, so users remain on the same job page.
 
 The callback token is scoped to one compliance run and expires after one hour. Service-account private keys and OAuth access tokens are never included in the payload or callback.
+
+The FREIRAUM control diagnostic returned HTTP 200 from `androidpublisher.googleapis.com` on GitHub Actions while the production server received an HTML 403. This validates GitHub Actions as the automatic network fallback for this deployment.

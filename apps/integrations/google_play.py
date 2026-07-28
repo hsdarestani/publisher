@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
+import mimetypes
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
+import requests
 from google.auth.transport.requests import AuthorizedSession, Request as GoogleAuthRequest
 from google.cloud import storage
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
 from .base import IntegrationError, IntegrationNotConfigured, IntegrationResult
 
@@ -20,7 +25,31 @@ REPORT_SCOPE = "https://www.googleapis.com/auth/playdeveloperreporting"
 CLOUD_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only"
 
 
+@dataclass
+class EditSession:
+    session: AuthorizedSession
+    api_base: str
+    upload_base: str
+    endpoint: str
+    package_name: str
+    edit_id: str
+    diagnostics: dict
+
+
 class GooglePlayClient:
+    API_ENDPOINTS = (
+        (
+            "androidpublisher.googleapis.com",
+            "https://androidpublisher.googleapis.com/androidpublisher/v3",
+            "https://androidpublisher.googleapis.com/upload/androidpublisher/v3",
+        ),
+        (
+            "www.googleapis.com legacy",
+            "https://www.googleapis.com/androidpublisher/v3",
+            "https://www.googleapis.com/upload/androidpublisher/v3",
+        ),
+    )
+
     def __init__(self, store_account):
         self.account = store_account
         self.info = store_account.get_credentials()
@@ -35,24 +64,51 @@ class GooglePlayClient:
 
     def test(self, package_name: str | None = None) -> IntegrationResult:
         try:
-            if package_name:
-                response = self.publisher().edits().insert(packageName=package_name, body={}).execute()
-                edit_id = response.get("id")
-                if edit_id:
-                    self.publisher().edits().delete(packageName=package_name, editId=edit_id).execute()
-            else:
-                self.credentials([PUBLISH_SCOPE]).refresh(GoogleAuthRequest())
-            return IntegrationResult(True, "Google Play credentials are valid.")
+            credentials = self.credentials([PUBLISH_SCOPE])
+            credentials.refresh(GoogleAuthRequest())
+            token_details = self._token_details(credentials.token)
+            scope = token_details.get("scope", "")
+            if PUBLISH_SCOPE not in scope.split():
+                return IntegrationResult(
+                    False,
+                    "OAuth token was minted, but the androidpublisher scope is missing.",
+                    {"token": self._safe_token_details(token_details)},
+                )
+            if not package_name:
+                return IntegrationResult(
+                    True,
+                    f"Google OAuth is valid for {self.info.get('client_email')} and includes the Android Publisher scope.",
+                    {"token": self._safe_token_details(token_details)},
+                )
+
+            edit = self._open_edit(package_name, credentials=credentials, token_details=token_details)
+            self._delete_edit(edit)
+            service_usage = self._service_usage_probe(credentials)
+            return IntegrationResult(
+                True,
+                (
+                    f"Google Play Publishing API is connected for {package_name}. "
+                    f"Authenticated as {self.info.get('client_email')} through {edit.endpoint}."
+                ),
+                {
+                    "identity": self.info.get("client_email"),
+                    "project_id": self.info.get("project_id"),
+                    "endpoint": edit.endpoint,
+                    "token": self._safe_token_details(token_details),
+                    "service_usage": service_usage,
+                    "endpoint_probes": edit.diagnostics.get("endpoint_probes", []),
+                },
+            )
+        except IntegrationError as exc:
+            return IntegrationResult(False, str(exc), getattr(exc, "diagnostics", {}))
         except Exception as exc:
-            return IntegrationResult(False, str(exc))
+            return IntegrationResult(False, f"Google OAuth failed before the Publishing API call: {exc}")
 
     def apply_store_content(self, app, localizations: Iterable, assets: Iterable):
         """Apply localized listing text and visual assets without uploading a build."""
         if not app.package_name:
             raise IntegrationError("Android package name is missing.")
-        service = self.publisher()
-        edit = service.edits().insert(packageName=app.package_name, body={}).execute()
-        edit_id = edit["id"]
+        edit = self._open_edit(app.package_name)
         warnings = []
         try:
             localization_count = 0
@@ -63,12 +119,12 @@ class GooglePlayClient:
                     "fullDescription": loc.full_description,
                     "video": "",
                 }
-                service.edits().listings().update(
-                    packageName=app.package_name,
-                    editId=edit_id,
-                    language=loc.locale,
-                    body=body,
-                ).execute()
+                self._edit_request(
+                    edit,
+                    "PUT",
+                    f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(loc.locale)}",
+                    json_body=body,
+                )
                 localization_count += 1
 
             grouped = {}
@@ -81,67 +137,71 @@ class GooglePlayClient:
                 grouped.setdefault((asset.locale, image_type), []).append(asset)
             image_count = 0
             for (locale, image_type), values in grouped.items():
-                service.edits().images().deleteall(
-                    packageName=app.package_name,
-                    editId=edit_id,
-                    language=locale,
-                    imageType=image_type,
-                ).execute()
+                self._edit_request(
+                    edit,
+                    "DELETE",
+                    f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(locale)}/{self._q(image_type)}",
+                )
                 for asset in sorted(values, key=lambda x: x.sort_order):
                     try:
-                        media = MediaFileUpload(asset.file.path, resumable=True)
+                        path = Path(asset.file.path)
                     except (NotImplementedError, AttributeError):
                         warnings.append(f"{asset}: storage backend does not expose a local path; image upload skipped.")
                         continue
-                    service.edits().images().upload(
-                        packageName=app.package_name,
-                        editId=edit_id,
-                        language=locale,
-                        imageType=image_type,
-                        media_body=media,
-                    ).execute()
+                    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                    with path.open("rb") as stream:
+                        self._upload_request(
+                            edit,
+                            f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(locale)}/{self._q(image_type)}",
+                            stream.read(),
+                            content_type,
+                        )
                     image_count += 1
-            service.edits().validate(packageName=app.package_name, editId=edit_id).execute()
-            committed = service.edits().commit(
-                packageName=app.package_name,
-                editId=edit_id,
-                changesInReviewBehavior="ERROR_IF_IN_REVIEW",
-            ).execute()
+            self._validate_edit(edit)
+            committed = self._commit_edit(edit)
             return {
                 "edit": committed,
+                "endpoint": edit.endpoint,
                 "localizations": localization_count,
                 "images": image_count,
                 "warnings": warnings,
             }
         except Exception:
-            try:
-                service.edits().delete(packageName=app.package_name, editId=edit_id).execute()
-            except Exception:
-                logger.exception("Could not delete failed Google Play content edit")
+            self._safe_delete_edit(edit)
             raise
 
     def apply_data_safety(self, package_name: str, safety_labels_csv: str):
         if not safety_labels_csv.strip():
             raise IntegrationError("Data Safety CSV is empty.")
-        return self.publisher().applications().dataSafety(
-            packageName=package_name,
-            body={"safetyLabels": safety_labels_csv},
-        ).execute()
+        credentials = self.credentials([PUBLISH_SCOPE])
+        credentials.refresh(GoogleAuthRequest())
+        probes = []
+        for endpoint, api_base, _upload_base in self.API_ENDPOINTS:
+            session = AuthorizedSession(credentials)
+            response = session.post(
+                f"{api_base}/applications/{self._q(package_name)}/dataSafety",
+                json={"safetyLabels": safety_labels_csv},
+                timeout=60,
+            )
+            probes.append(self._response_summary(endpoint, response))
+            if response.ok:
+                return response.json() if response.content else {"ok": True, "endpoint": endpoint}
+        raise self._api_error("Google rejected the Data Safety submission on every supported endpoint.", probes)
 
     def publish_release(self, app, release, build_obj, localizations: Iterable, assets: Iterable, submit=True):
         if not app.package_name:
             raise IntegrationError("Android package name is missing.")
         if not build_obj.artifact:
             raise IntegrationError("Android build artifact is missing.")
-        service = self.publisher()
-        edit = service.edits().insert(packageName=app.package_name, body={}).execute()
-        edit_id = edit["id"]
+        edit = self._open_edit(app.package_name)
         try:
-            bundle = service.edits().bundles().upload(
-                packageName=app.package_name,
-                editId=edit_id,
-                media_body=MediaFileUpload(build_obj.artifact.path, mimetype="application/octet-stream", resumable=True),
-            ).execute()
+            with Path(build_obj.artifact.path).open("rb") as stream:
+                bundle = self._upload_request(
+                    edit,
+                    f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/bundles",
+                    stream.read(),
+                    "application/octet-stream",
+                )
             version_code = str(bundle["versionCode"])
             for loc in localizations:
                 body = {
@@ -150,12 +210,12 @@ class GooglePlayClient:
                     "fullDescription": loc.full_description,
                     "video": "",
                 }
-                service.edits().listings().update(
-                    packageName=app.package_name,
-                    editId=edit_id,
-                    language=loc.locale,
-                    body=body,
-                ).execute()
+                self._edit_request(
+                    edit,
+                    "PUT",
+                    f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(loc.locale)}",
+                    json_body=body,
+                )
             grouped = {}
             for asset in assets:
                 if asset.platform not in {"android", "shared"}:
@@ -165,20 +225,21 @@ class GooglePlayClient:
                     continue
                 grouped.setdefault((asset.locale, image_type), []).append(asset)
             for (locale, image_type), values in grouped.items():
-                service.edits().images().deleteall(
-                    packageName=app.package_name,
-                    editId=edit_id,
-                    language=locale,
-                    imageType=image_type,
-                ).execute()
+                self._edit_request(
+                    edit,
+                    "DELETE",
+                    f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(locale)}/{self._q(image_type)}",
+                )
                 for asset in sorted(values, key=lambda x: x.sort_order):
-                    service.edits().images().upload(
-                        packageName=app.package_name,
-                        editId=edit_id,
-                        language=locale,
-                        imageType=image_type,
-                        media_body=MediaFileUpload(asset.file.path, resumable=True),
-                    ).execute()
+                    path = Path(asset.file.path)
+                    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                    with path.open("rb") as stream:
+                        self._upload_request(
+                            edit,
+                            f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/listings/{self._q(locale)}/{self._q(image_type)}",
+                            stream.read(),
+                            content_type,
+                        )
             track_body = {
                 "track": release.android_track,
                 "releases": [
@@ -195,40 +256,51 @@ class GooglePlayClient:
                     }
                 ],
             }
-            service.edits().tracks().update(
-                packageName=app.package_name,
-                editId=edit_id,
-                track=release.android_track,
-                body=track_body,
-            ).execute()
-            service.edits().validate(packageName=app.package_name, editId=edit_id).execute()
+            self._edit_request(
+                edit,
+                "PUT",
+                f"/applications/{self._q(app.package_name)}/edits/{edit.edit_id}/tracks/{self._q(release.android_track)}",
+                json_body=track_body,
+            )
+            self._validate_edit(edit)
             if submit:
-                committed = service.edits().commit(
-                    packageName=app.package_name,
-                    editId=edit_id,
-                    changesInReviewBehavior="ERROR_IF_IN_REVIEW",
-                ).execute()
+                committed = self._commit_edit(edit)
                 try:
                     compliance = app.compliance
                 except Exception:
                     compliance = None
                 if compliance and compliance.data_safety_csv.strip():
                     self.apply_data_safety(app.package_name, compliance.data_safety_csv)
-                return {"edit": committed, "bundle": bundle, "version_code": version_code}
-            return {"edit_id": edit_id, "bundle": bundle, "version_code": version_code}
+                return {
+                    "edit": committed,
+                    "bundle": bundle,
+                    "version_code": version_code,
+                    "endpoint": edit.endpoint,
+                }
+            return {
+                "edit_id": edit.edit_id,
+                "bundle": bundle,
+                "version_code": version_code,
+                "endpoint": edit.endpoint,
+            }
         except Exception:
-            try:
-                service.edits().delete(packageName=app.package_name, editId=edit_id).execute()
-            except Exception:
-                logger.exception("Could not delete failed Google Play edit")
+            self._safe_delete_edit(edit)
             raise
 
     def reviews(self, package_name, max_results=100):
-        return self.publisher().reviews().list(
-            packageName=package_name,
-            maxResults=max_results,
-            translationLanguage="en",
-        ).execute().get("reviews", [])
+        credentials = self.credentials([PUBLISH_SCOPE])
+        credentials.refresh(GoogleAuthRequest())
+        probes = []
+        for endpoint, api_base, _upload_base in self.API_ENDPOINTS:
+            response = AuthorizedSession(credentials).get(
+                f"{api_base}/applications/{self._q(package_name)}/reviews",
+                params={"maxResults": max_results, "translationLanguage": "en"},
+                timeout=60,
+            )
+            probes.append(self._response_summary(endpoint, response))
+            if response.ok:
+                return response.json().get("reviews", [])
+        raise self._api_error("Google rejected the reviews request on every supported endpoint.", probes)
 
     def query_vitals(self, package_name: str, metric_set: str, body: dict):
         creds = self.credentials([REPORT_SCOPE])
@@ -264,6 +336,217 @@ class GooglePlayClient:
         raw = blob.download_as_bytes()
         text = self._decode_report(raw)
         return list(csv.DictReader(io.StringIO(text)))
+
+    def _open_edit(self, package_name: str, credentials=None, token_details=None) -> EditSession:
+        credentials = credentials or self.credentials([PUBLISH_SCOPE])
+        if not credentials.valid:
+            credentials.refresh(GoogleAuthRequest())
+        token_details = token_details or self._token_details(credentials.token)
+        probes = []
+        for endpoint, api_base, upload_base in self.API_ENDPOINTS:
+            session = AuthorizedSession(credentials)
+            response = session.post(
+                f"{api_base}/applications/{self._q(package_name)}/edits",
+                json={},
+                timeout=60,
+            )
+            probes.append(self._response_summary(endpoint, response))
+            if response.ok:
+                body = response.json()
+                return EditSession(
+                    session=session,
+                    api_base=api_base,
+                    upload_base=upload_base,
+                    endpoint=endpoint,
+                    package_name=package_name,
+                    edit_id=body["id"],
+                    diagnostics={
+                        "identity": self.info.get("client_email"),
+                        "project_id": self.info.get("project_id"),
+                        "token": self._safe_token_details(token_details),
+                        "endpoint_probes": probes,
+                    },
+                )
+        service_usage = self._service_usage_probe(credentials)
+        diagnostics = {
+            "identity": self.info.get("client_email"),
+            "project_id": self.info.get("project_id"),
+            "package_name": package_name,
+            "token": self._safe_token_details(token_details),
+            "service_usage": service_usage,
+            "endpoint_probes": probes,
+        }
+        message = self._diagnostic_message(diagnostics)
+        error = IntegrationError(message)
+        error.diagnostics = diagnostics
+        raise error
+
+    def _edit_request(self, edit: EditSession, method: str, path: str, json_body=None, params=None):
+        response = edit.session.request(
+            method,
+            f"{edit.api_base}{path}",
+            json=json_body,
+            params=params,
+            timeout=120,
+        )
+        if not response.ok:
+            raise self._api_error(
+                f"Google Play {method} {path} failed through {edit.endpoint}.",
+                [self._response_summary(edit.endpoint, response)],
+            )
+        return response.json() if response.content else {}
+
+    def _upload_request(self, edit: EditSession, path: str, data: bytes, content_type: str):
+        response = edit.session.post(
+            f"{edit.upload_base}{path}",
+            params={"uploadType": "media"},
+            data=data,
+            headers={"Content-Type": content_type},
+            timeout=600,
+        )
+        if not response.ok:
+            raise self._api_error(
+                f"Google Play media upload failed through {edit.endpoint}.",
+                [self._response_summary(edit.endpoint, response)],
+            )
+        return response.json() if response.content else {}
+
+    def _validate_edit(self, edit: EditSession):
+        return self._edit_request(
+            edit,
+            "POST",
+            f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:validate",
+            json_body={},
+        )
+
+    def _commit_edit(self, edit: EditSession):
+        return self._edit_request(
+            edit,
+            "POST",
+            f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:commit",
+            json_body={},
+            params={"changesInReviewBehavior": "ERROR_IF_IN_REVIEW"},
+        )
+
+    def _delete_edit(self, edit: EditSession):
+        response = edit.session.delete(
+            f"{edit.api_base}/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}",
+            timeout=60,
+        )
+        if not response.ok:
+            raise self._api_error(
+                "The test edit was created, but Google rejected cleanup.",
+                [self._response_summary(edit.endpoint, response)],
+            )
+
+    def _safe_delete_edit(self, edit: EditSession):
+        try:
+            self._delete_edit(edit)
+        except Exception:
+            logger.exception("Could not delete failed Google Play edit")
+
+    def _token_details(self, access_token: str):
+        try:
+            response = requests.get(
+                "https://oauth2.googleapis.com/tokeninfo",
+                params={"access_token": access_token},
+                timeout=30,
+            )
+            if response.ok:
+                return response.json()
+            return {"status": response.status_code, "error": response.text[:500]}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _service_usage_probe(self, credentials):
+        project_id = self.info.get("project_id", "")
+        if not project_id:
+            return {"state": "unknown", "detail": "project_id is missing"}
+        try:
+            response = AuthorizedSession(credentials).get(
+                f"https://serviceusage.googleapis.com/v1/projects/{quote(project_id, safe='')}/services/androidpublisher.googleapis.com",
+                timeout=30,
+            )
+            if response.ok:
+                body = response.json()
+                return {"state": body.get("state", "unknown"), "name": body.get("name", "")}
+            return {
+                "state": "unverified",
+                "status": response.status_code,
+                "detail": self._response_text(response),
+            }
+        except Exception as exc:
+            return {"state": "unverified", "detail": str(exc)}
+
+    def _diagnostic_message(self, diagnostics: dict) -> str:
+        token = diagnostics.get("token", {})
+        probes = diagnostics.get("endpoint_probes", [])
+        service_usage = diagnostics.get("service_usage", {})
+        scope_ok = PUBLISH_SCOPE in str(token.get("scope", "")).split()
+        lines = [
+            "Google OAuth succeeded, but the Play Publishing API rejected edits.insert.",
+            f"Identity: {diagnostics.get('identity')}",
+            f"Cloud project: {diagnostics.get('project_id')}",
+            f"Package: {diagnostics.get('package_name')}",
+            f"Android Publisher OAuth scope: {'present' if scope_ok else 'missing'}",
+            f"API enablement probe: {service_usage.get('state', 'unknown')}",
+        ]
+        for probe in probes:
+            lines.append(
+                f"Endpoint {probe.get('endpoint')}: HTTP {probe.get('status')} "
+                f"({probe.get('content_type') or 'unknown content type'}) · {probe.get('body')}"
+            )
+        if probes and all(int(item.get("status") or 0) == 403 for item in probes):
+            lines.append(
+                "Play Console permissions are not the only authorization layer. Since this identity already has app admin access, "
+                "the remaining likely causes are API enablement in the exact credential project or Play backend activation for this package."
+            )
+        return "\n".join(lines)
+
+    @classmethod
+    def _api_error(cls, message: str, probes: list[dict]):
+        safe = "; ".join(
+            f"{item.get('endpoint')}: HTTP {item.get('status')} {item.get('body')}" for item in probes
+        )
+        error = IntegrationError(f"{message} {safe}".strip())
+        error.diagnostics = {"endpoint_probes": probes}
+        return error
+
+    @staticmethod
+    def _response_summary(endpoint: str, response):
+        return {
+            "endpoint": endpoint,
+            "status": response.status_code,
+            "content_type": response.headers.get("content-type", "").split(";")[0],
+            "request_id": response.headers.get("x-guploader-uploadid")
+            or response.headers.get("x-goog-request-id")
+            or response.headers.get("x-request-id")
+            or "",
+            "body": GooglePlayClient._response_text(response),
+        }
+
+    @staticmethod
+    def _response_text(response):
+        try:
+            body = response.json()
+            text = json.dumps(body, ensure_ascii=False)
+        except Exception:
+            text = " ".join(response.text.replace("\n", " ").split())
+        return text[:800]
+
+    @staticmethod
+    def _safe_token_details(details: dict):
+        return {
+            "email": details.get("email", ""),
+            "scope": details.get("scope", ""),
+            "expires_in": details.get("expires_in", ""),
+            "access_type": details.get("access_type", ""),
+            "verified_email": details.get("verified_email", ""),
+        }
+
+    @staticmethod
+    def _q(value):
+        return quote(str(value), safe="._-")
 
     @staticmethod
     def _decode_report(raw):

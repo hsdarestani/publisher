@@ -8,8 +8,14 @@ from django.utils import timezone
 from apps.integrations.google_play_cloud import dispatch_google_play_cloud, is_google_edge_blocked
 
 from .data_safety import fill_data_safety_template
+from .data_safety_sanitize import clear_unselected_data_answers
 from .models import ComplianceRun
 from .services import apply_google_apis, generate_pack
+
+
+def _strict_data_safety_csv(profile) -> str:
+    generated = fill_data_safety_template(profile)
+    return clear_unselected_data_answers(generated, profile) if generated else ""
 
 
 @shared_task
@@ -29,7 +35,7 @@ def execute_compliance_run(run_id: int):
             run.progress = 30
             run.save(update_fields=["progress", "updated_at"])
             result = generate_pack(profile)
-            strict_csv = fill_data_safety_template(profile)
+            strict_csv = _strict_data_safety_csv(profile)
             if strict_csv:
                 profile.data_safety_csv = strict_csv
                 profile.save(update_fields=["data_safety_csv", "updated_at"])
@@ -44,11 +50,13 @@ def execute_compliance_run(run_id: int):
             }
             run.status = "succeeded"
         elif run.action == "apply":
-            strict_csv = fill_data_safety_template(profile)
+            strict_csv = _strict_data_safety_csv(profile)
             if strict_csv:
                 profile.data_safety_csv = strict_csv
                 profile.save(update_fields=["data_safety_csv", "updated_at"])
-                run.append_log("Validated Data Safety CSV: SINGLE_CHOICE questions contain at most one selected response.")
+                run.append_log(
+                    "Validated Data Safety CSV: choice constraints are valid and conditional answers for unselected data types are blank."
+                )
             run.append_log("Applying localized store listing and image assets through the official Google Play API.")
             run.progress = 35
             run.save(update_fields=["progress", "updated_at"])

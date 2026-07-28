@@ -18,6 +18,7 @@ from apps.integrations.google_play import GooglePlayClient
 from apps.integrations.google_play_cloud import verify_cloud_token
 from apps.publisher.models import MobileApp
 
+from .data_safety import fill_data_safety_template
 from .forms import ComplianceOverrideForm, ComplianceProfileForm
 from .models import ComplianceProfile, ComplianceRun
 from .services import get_or_create_profile, issue_companion_token
@@ -119,6 +120,10 @@ def compliance_run(request, pk):
 def download_pack(request, app_pk):
     app = get_object_or_404(MobileApp, pk=app_pk)
     profile = get_or_create_profile(app)
+    strict_csv = fill_data_safety_template(profile)
+    if strict_csv and strict_csv != profile.data_safety_csv:
+        profile.data_safety_csv = strict_csv
+        profile.save(update_fields=["data_safety_csv", "updated_at"])
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("privacy-policy.txt", profile.privacy_policy_text or "Generate the compliance pack first.")
@@ -181,6 +186,10 @@ def google_cloud_payload(request, run_id):
         action="apply",
     )
     app = run.profile.app
+    strict_csv = fill_data_safety_template(run.profile)
+    if strict_csv and strict_csv != run.profile.data_safety_csv:
+        run.profile.data_safety_csv = strict_csv
+        run.profile.save(update_fields=["data_safety_csv", "updated_at"])
     assets = []
     for asset in app.assets.all():
         if asset.platform not in {"android", "shared"}:
@@ -241,8 +250,13 @@ def google_cloud_callback(request, run_id):
     if result.get("success"):
         applied = ["Store listing and images"]
         skipped = []
+        warnings = list(result.get("warnings", []))
         if result.get("data_safety_applied"):
             applied.append("Data safety")
+        elif result.get("data_safety_error"):
+            skipped.append("Data safety: Google rejected the generated declaration; the store listing and images were still applied.")
+            if result["data_safety_error"] not in " ".join(warnings):
+                warnings.append(result["data_safety_error"])
         else:
             skipped.append(
                 "Data safety: upload an exported Play Console CSV template once so Publisher can preserve Google's current question IDs."
@@ -252,7 +266,7 @@ def google_cloud_callback(request, run_id):
         run.result = {
             "applied": applied,
             "skipped": skipped,
-            "warnings": result.get("warnings", []),
+            "warnings": warnings,
             "execution": "github-actions",
             "cloud_result": result,
         }
@@ -263,9 +277,11 @@ def google_cloud_callback(request, run_id):
             f"Google Play operation completed on GitHub Actions: {result.get('listing_count', 0)} listings, "
             f"{result.get('image_count', 0)} images."
         )
+        if result.get("data_safety_error"):
+            run.append_log("Store content was committed successfully; Data Safety remains pending and can be retried independently.")
         profile.status = "partially_applied" if skipped else "applied"
         profile.last_applied_at = timezone.now()
-        profile.last_error = ""
+        profile.last_error = result.get("data_safety_error", "")
         profile.save(update_fields=["status", "last_applied_at", "last_error", "updated_at"])
     else:
         run.status = "failed"

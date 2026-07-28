@@ -71,13 +71,7 @@ def _flatten_rgba(image, background=(245, 247, 250)):
 
 
 def normalize_store_asset(image_type, content):
-    """Return Play-compliant bytes, content type and an optional audit message.
-
-    Google Play's fixed-size slots reject otherwise valid images before an edit
-    can be committed. We preserve the whole source artwork: feature graphics use
-    a softly blurred cover background with a contained foreground, while icons
-    use transparent padding. No stretching is applied.
-    """
+    """Return Play-compliant bytes, content type and an optional audit message."""
     if image_type not in {"featureGraphic", "icon"}:
         return content, None, None
 
@@ -234,10 +228,15 @@ def apply_payload(payload, credentials):
             ),
             "Commit Google Play edit",
         )
+    except Exception:
+        delete_edit(session, package_name, edit_id)
+        raise
 
-        data_safety_applied = False
-        data_safety_csv = payload.get("data_safety_csv", "").strip()
-        if data_safety_csv:
+    data_safety_applied = False
+    data_safety_error = ""
+    data_safety_csv = payload.get("data_safety_csv", "").strip()
+    if data_safety_csv:
+        try:
             require(
                 session.post(
                     f"{API_BASE}/applications/{q(package_name)}/dataSafety",
@@ -247,20 +246,24 @@ def apply_payload(payload, credentials):
                 "Apply Data Safety",
             )
             data_safety_applied = True
+        except Exception as exc:
+            data_safety_error = str(exc)
+            warnings.append(
+                "Store listing and images were committed successfully, but Data Safety was not applied: "
+                + data_safety_error
+            )
 
-        return {
-            "success": True,
-            "package_name": package_name,
-            "listing_count": listing_count,
-            "image_count": image_count,
-            "data_safety_applied": data_safety_applied,
-            "warnings": warnings,
-            "edit": committed,
-            "executor": "github-actions",
-        }
-    except Exception:
-        delete_edit(session, package_name, edit_id)
-        raise
+    return {
+        "success": True,
+        "package_name": package_name,
+        "listing_count": listing_count,
+        "image_count": image_count,
+        "data_safety_applied": data_safety_applied,
+        "data_safety_error": data_safety_error,
+        "warnings": warnings,
+        "edit": committed,
+        "executor": "github-actions",
+    }
 
 
 def callback(url, token, result):

@@ -9,6 +9,7 @@ from django.urls import reverse
 from apps.integrations.base import IntegrationError
 from apps.integrations.google_play_cloud import is_google_edge_blocked, make_cloud_token
 from apps.publisher.models import AppLocalization, MobileApp
+from scripts.google_play_cloud_operation import apply_payload, download_asset
 
 from .models import ComplianceRun
 from .services import get_or_create_profile
@@ -126,3 +127,31 @@ class GooglePlayCloudFallbackTests(TestCase):
         )
         self.assertEqual(payload.status_code, 403)
         self.assertEqual(callback.status_code, 403)
+
+    @patch("scripts.google_play_cloud_operation.requests.get")
+    def test_binary_asset_download_does_not_attempt_json_parsing(self, get):
+        response = Mock(ok=True, status_code=200, content=b"\x89PNG\r\n", headers={"content-type": "image/png"})
+        get.return_value = response
+        asset = download_asset({"url": "https://publisher.example.test/media/icon.png", "name": "icon.png"})
+        self.assertEqual(asset["content"], b"\x89PNG\r\n")
+        self.assertEqual(asset["content_type"], "image/png")
+        response.json.assert_not_called()
+
+    @patch("scripts.google_play_cloud_operation.create_edit")
+    @patch("scripts.google_play_cloud_operation.download_asset")
+    def test_asset_preflight_failure_happens_before_google_edit(self, download, create_edit):
+        download.side_effect = RuntimeError("asset unavailable")
+        payload = {
+            "package_name": "de.freiraum.parking",
+            "localizations": [],
+            "assets": [
+                {
+                    "locale": "de-DE",
+                    "image_type": "icon",
+                    "url": "https://publisher.example.test/media/icon.png",
+                }
+            ],
+        }
+        with self.assertRaisesMessage(RuntimeError, "asset unavailable"):
+            apply_payload(payload, Mock())
+        create_edit.assert_not_called()

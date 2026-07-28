@@ -19,10 +19,8 @@ UPLOAD_BASE = "https://androidpublisher.googleapis.com/upload/androidpublisher/v
 RESAMPLE = Image.Resampling.LANCZOS
 
 
-
 def q(value):
     return quote(str(value), safe="._-")
-
 
 
 def response_detail(response):
@@ -30,7 +28,6 @@ def response_detail(response):
         return response.json()
     except Exception:
         return " ".join(response.text.replace("\n", " ").split())[:1200]
-
 
 
 def require(response, action, *, parse_json=True):
@@ -43,13 +40,11 @@ def require(response, action, *, parse_json=True):
     return response.json() if response.content else {}
 
 
-
 def create_edit(session, package_name):
     return require(
         session.post(f"{API_BASE}/applications/{q(package_name)}/edits", json={}, timeout=60),
         "Create Google Play edit",
     )["id"]
-
 
 
 def delete_edit(session, package_name, edit_id):
@@ -62,12 +57,10 @@ def delete_edit(session, package_name, edit_id):
         pass
 
 
-
 def _png_bytes(image):
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True, compress_level=9)
     return output.getvalue()
-
 
 
 def _flatten_rgba(image, background=(245, 247, 250)):
@@ -75,7 +68,6 @@ def _flatten_rgba(image, background=(245, 247, 250)):
     flattened = Image.new("RGB", rgba.size, background)
     flattened.paste(rgba, mask=rgba.getchannel("A"))
     return flattened
-
 
 
 def normalize_store_asset(image_type, content):
@@ -153,13 +145,12 @@ def normalize_store_asset(image_type, content):
         raise RuntimeError(f"Could not decode {image_type} image: {exc}") from exc
 
 
-
 def download_asset(asset):
     response = requests.get(asset["url"], timeout=120)
     require(response, f"Download asset {asset.get('name') or asset['url']}", parse_json=False)
     content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
     content, normalized_type, normalization_warning = normalize_store_asset(
-        asset["image_type"], response.content
+        asset.get("image_type", ""), response.content
     )
     return {
         **asset,
@@ -167,7 +158,6 @@ def download_asset(asset):
         "content_type": normalized_type or content_type,
         "normalization_warning": normalization_warning,
     }
-
 
 
 def upload_image(session, package_name, edit_id, locale, image_type, asset):
@@ -181,7 +171,6 @@ def upload_image(session, package_name, edit_id, locale, image_type, asset):
         ),
         f"Upload {image_type}",
     )
-
 
 
 def apply_payload(payload, credentials):
@@ -274,7 +263,6 @@ def apply_payload(payload, credentials):
         raise
 
 
-
 def callback(url, token, result):
     response = requests.post(
         url,
@@ -285,7 +273,6 @@ def callback(url, token, result):
     )
     if not response.ok:
         raise RuntimeError(f"Publisher callback failed: HTTP {response.status_code} {response.text[:800]}")
-
 
 
 def main():

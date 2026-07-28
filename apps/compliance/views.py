@@ -7,10 +7,15 @@ from pathlib import Path
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core import signing
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
+from apps.integrations.google_play import GooglePlayClient
+from apps.integrations.google_play_cloud import verify_cloud_token
 from apps.publisher.models import MobileApp
 
 from .forms import ComplianceOverrideForm, ComplianceProfileForm
@@ -154,13 +159,127 @@ def companion_payload(request, token):
         return JsonResponse({"error": "expired"}, status=410)
     response = JsonResponse(profile.console_autofill)
     response["Cache-Control"] = "no-store"
-    # A random, short-lived bearer URL is the authorization boundary. The wildcard
-    # allows a locally loaded extension whose chrome-extension:// origin is unknown
-    # until installation; cookies and credentials are never accepted here.
     response["Access-Control-Allow-Origin"] = "*"
     response["Access-Control-Allow-Credentials"] = "false"
     response["Referrer-Policy"] = "no-referrer"
     return response
+
+
+@require_GET
+def google_cloud_payload(request, run_id):
+    token = request.GET.get("token", "")
+    try:
+        verify_cloud_token(token, run_id)
+    except signing.BadSignature:
+        return JsonResponse({"error": "invalid_or_expired_token"}, status=403)
+
+    run = get_object_or_404(
+        ComplianceRun.objects.select_related("profile", "profile__app").prefetch_related(
+            "profile__app__localizations", "profile__app__assets"
+        ),
+        pk=run_id,
+        action="apply",
+    )
+    app = run.profile.app
+    assets = []
+    for asset in app.assets.all():
+        if asset.platform not in {"android", "shared"}:
+            continue
+        image_type = GooglePlayClient._image_type(asset)
+        if not image_type or not asset.file:
+            continue
+        assets.append(
+            {
+                "locale": asset.locale,
+                "image_type": image_type,
+                "sort_order": asset.sort_order,
+                "name": asset.file.name,
+                "url": request.build_absolute_uri(asset.file.url),
+            }
+        )
+
+    payload = {
+        "operation": "apply_compliance",
+        "package_name": app.package_name,
+        "localizations": [
+            {
+                "locale": loc.locale,
+                "title": loc.title,
+                "short_description": loc.short_description or loc.subtitle,
+                "full_description": loc.full_description,
+                "video": "",
+            }
+            for loc in app.localizations.all()
+        ],
+        "assets": assets,
+        "data_safety_csv": run.profile.data_safety_csv,
+    }
+    response = JsonResponse(payload)
+    response["Cache-Control"] = "no-store"
+    response["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@csrf_exempt
+@require_POST
+def google_cloud_callback(request, run_id):
+    token = request.GET.get("token", "")
+    try:
+        verify_cloud_token(token, run_id)
+    except signing.BadSignature:
+        return JsonResponse({"error": "invalid_or_expired_token"}, status=403)
+
+    run = get_object_or_404(ComplianceRun.objects.select_related("profile", "profile__app"), pk=run_id, action="apply")
+    if run.status not in {"queued", "running"}:
+        return JsonResponse({"ok": True, "status": run.status, "duplicate": True})
+    try:
+        result = json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return JsonResponse({"error": "invalid_json"}, status=400)
+
+    profile = run.profile
+    if result.get("success"):
+        applied = ["Store listing and images"]
+        skipped = []
+        if result.get("data_safety_applied"):
+            applied.append("Data safety")
+        else:
+            skipped.append(
+                "Data safety: upload an exported Play Console CSV template once so Publisher can preserve Google's current question IDs."
+            )
+        for label in ("Privacy policy", "App access", "Ads declaration", "Target audience", "Content rating"):
+            skipped.append(f"{label}: no public Google Play API; prepared for A+ Play Console Companion autofill.")
+        run.result = {
+            "applied": applied,
+            "skipped": skipped,
+            "warnings": result.get("warnings", []),
+            "execution": "github-actions",
+            "cloud_result": result,
+        }
+        run.status = "partial" if skipped else "succeeded"
+        run.progress = 100
+        run.error = ""
+        run.append_log(
+            f"Google Play operation completed on GitHub Actions: {result.get('listing_count', 0)} listings, "
+            f"{result.get('image_count', 0)} images."
+        )
+        profile.status = "partially_applied" if skipped else "applied"
+        profile.last_applied_at = timezone.now()
+        profile.last_error = ""
+        profile.save(update_fields=["status", "last_applied_at", "last_error", "updated_at"])
+    else:
+        run.status = "failed"
+        run.progress = 100
+        run.error = result.get("error", "Google Play cloud operation failed.")
+        run.result = {"execution": "github-actions", "cloud_result": result}
+        run.append_log(f"Google Play cloud operation failed: {run.error}")
+        profile.status = "failed"
+        profile.last_error = run.error
+        profile.save(update_fields=["status", "last_error", "updated_at"])
+
+    run.finished_at = timezone.now()
+    run.save(update_fields=["status", "progress", "error", "result", "logs", "finished_at", "updated_at"])
+    return JsonResponse({"ok": True, "status": run.status})
 
 
 @require_GET

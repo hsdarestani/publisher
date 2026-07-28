@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -17,6 +18,7 @@ SCOPE = "https://www.googleapis.com/auth/androidpublisher"
 API_BASE = "https://androidpublisher.googleapis.com/androidpublisher/v3"
 UPLOAD_BASE = "https://androidpublisher.googleapis.com/upload/androidpublisher/v3"
 RESAMPLE = Image.Resampling.LANCZOS
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
 def q(value):
@@ -38,6 +40,25 @@ def require(response, action, *, parse_json=True):
     if not parse_json:
         return response
     return response.json() if response.content else {}
+
+
+def _retry_delay(attempt: int) -> int:
+    return min(2**attempt, 16)
+
+
+def require_with_retry(request_call, action, *, attempts=5, parse_json=True):
+    """Retry safe/idempotent Google Play requests on transient edge failures."""
+    for attempt in range(1, attempts + 1):
+        response = request_call()
+        if response.ok or response.status_code not in TRANSIENT_HTTP_STATUSES or attempt == attempts:
+            return require(response, action, parse_json=parse_json)
+        delay = _retry_delay(attempt)
+        print(
+            f"{action} returned transient HTTP {response.status_code}; "
+            f"retrying attempt {attempt + 1}/{attempts} in {delay}s."
+        )
+        time.sleep(delay)
+    raise RuntimeError(f"{action} failed after {attempts} attempts.")
 
 
 def create_edit(session, package_name):
@@ -154,17 +175,65 @@ def download_asset(asset):
     }
 
 
-def upload_image(session, package_name, edit_id, locale, image_type, asset):
-    return require(
-        session.post(
-            f"{UPLOAD_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(locale)}/{q(image_type)}",
-            params={"uploadType": "media"},
-            data=asset["content"],
-            headers={"Content-Type": asset["content_type"]},
-            timeout=300,
-        ),
-        f"Upload {image_type}",
+def upload_image_response(session, package_name, edit_id, locale, image_type, asset):
+    return session.post(
+        f"{UPLOAD_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(locale)}/{q(image_type)}",
+        params={"uploadType": "media"},
+        data=asset["content"],
+        headers={"Content-Type": asset["content_type"]},
+        timeout=300,
     )
+
+
+def replace_image_group(session, package_name, edit_id, locale, image_type, assets, *, attempts=5):
+    """Atomically retry an image group after transient Google upload failures.
+
+    A failed upload may have reached Google's backend even when the client receives
+    HTTP 500. Each retry therefore clears the whole image type again before
+    uploading the ordered group, preventing duplicate screenshots or graphics.
+    """
+    ordered_assets = sorted(assets, key=lambda item: item.get("sort_order", 0))
+    clear_url = (
+        f"{API_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}"
+        f"/listings/{q(locale)}/{q(image_type)}"
+    )
+
+    for attempt in range(1, attempts + 1):
+        clear_response = session.delete(clear_url, timeout=60)
+        if not clear_response.ok:
+            if clear_response.status_code in TRANSIENT_HTTP_STATUSES and attempt < attempts:
+                delay = _retry_delay(attempt)
+                print(
+                    f"Clear {image_type} for {locale} returned transient HTTP "
+                    f"{clear_response.status_code}; retrying group attempt {attempt + 1}/{attempts} in {delay}s."
+                )
+                time.sleep(delay)
+                continue
+            require(clear_response, f"Clear {image_type} for {locale}")
+
+        retry_group = False
+        for asset in ordered_assets:
+            response = upload_image_response(session, package_name, edit_id, locale, image_type, asset)
+            if response.ok:
+                require(response, f"Upload {image_type}")
+                continue
+            if response.status_code in TRANSIENT_HTTP_STATUSES and attempt < attempts:
+                delay = _retry_delay(attempt)
+                print(
+                    f"Upload {image_type} returned transient HTTP {response.status_code}; "
+                    f"clearing and retrying the complete {locale}/{image_type} group "
+                    f"({attempt + 1}/{attempts}) in {delay}s."
+                )
+                time.sleep(delay)
+                retry_group = True
+                break
+            require(response, f"Upload {image_type}")
+
+        if retry_group:
+            continue
+        return len(ordered_assets)
+
+    raise RuntimeError(f"Upload {image_type} failed after {attempts} attempts.")
 
 
 def apply_payload(payload, credentials):
@@ -188,8 +257,8 @@ def apply_payload(payload, credentials):
                 "fullDescription": listing.get("full_description", ""),
                 "video": listing.get("video", ""),
             }
-            require(
-                session.put(
+            require_with_retry(
+                lambda listing=listing, body=body: session.put(
                     f"{API_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(listing['locale'])}",
                     json=body,
                     timeout=60,
@@ -200,19 +269,17 @@ def apply_payload(payload, credentials):
 
         image_count = 0
         for (locale, image_type), assets in prepared_groups.items():
-            require(
-                session.delete(
-                    f"{API_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}/listings/{q(locale)}/{q(image_type)}",
-                    timeout=60,
-                ),
-                f"Clear {image_type} for {locale}",
+            image_count += replace_image_group(
+                session,
+                package_name,
+                edit_id,
+                locale,
+                image_type,
+                assets,
             )
-            for asset in sorted(assets, key=lambda item: item.get("sort_order", 0)):
-                upload_image(session, package_name, edit_id, locale, image_type, asset)
-                image_count += 1
 
-        require(
-            session.post(
+        require_with_retry(
+            lambda: session.post(
                 f"{API_BASE}/applications/{q(package_name)}/edits/{q(edit_id)}:validate",
                 json={},
                 timeout=60,
@@ -237,8 +304,8 @@ def apply_payload(payload, credentials):
     data_safety_csv = payload.get("data_safety_csv", "").strip()
     if data_safety_csv:
         try:
-            require(
-                session.post(
+            require_with_retry(
+                lambda: session.post(
                     f"{API_BASE}/applications/{q(package_name)}/dataSafety",
                     json={"safetyLabels": data_safety_csv},
                     timeout=120,

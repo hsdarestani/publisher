@@ -8,7 +8,7 @@ from django.utils import timezone
 from apps.integrations.google_play_cloud import dispatch_google_play_cloud, is_google_edge_blocked
 
 from .data_safety import fill_data_safety_template
-from .data_safety_sanitize import clear_unselected_data_answers
+from .data_safety_applicability import clear_unselected_data_answers
 from .models import ComplianceRun
 from .services import apply_google_apis, generate_pack
 

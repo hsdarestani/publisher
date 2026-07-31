@@ -2,6 +2,7 @@
   const normalize = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
   const visible = (el) => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
   const text = (el) => normalize(el?.innerText || el?.textContent || el?.getAttribute?.('aria-label'));
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function candidates() {
     return [...document.querySelectorAll('label, button, [role="radio"], [role="checkbox"], mat-radio-button, mat-checkbox, [aria-label]')].filter(visible);
@@ -20,6 +21,33 @@
     target.style.outline = '2px solid #1769e0';
     target.style.outlineOffset = '2px';
     return true;
+  }
+
+  function clickYesNoForQuestion(questionPhrases, answer) {
+    const wanted = questionPhrases.map(normalize);
+    const containers = [...document.querySelectorAll('section, form, div, li')]
+      .filter(visible)
+      .filter((el) => {
+        const value = text(el);
+        return value && value.length < 2200 && wanted.some((phrase) => value.includes(phrase));
+      })
+      .sort((a, b) => text(a).length - text(b).length);
+
+    const desired = answer ? 'yes' : 'no';
+    for (const container of containers) {
+      const options = [...container.querySelectorAll('label, button, [role="radio"], mat-radio-button')].filter(visible);
+      const option = options.find((el) => {
+        const value = text(el);
+        return value === desired || value.startsWith(`${desired} `);
+      });
+      if (!option) continue;
+      const target = option.closest('label,button,[role="radio"],mat-radio-button') || option;
+      target.click();
+      target.style.outline = '2px solid #1769e0';
+      target.style.outlineOffset = '2px';
+      return true;
+    }
+    return false;
   }
 
   function editableInputs(root = document) {
@@ -64,23 +92,19 @@
     const phrases = labelPhrases.map(normalize);
     let input = null;
 
-    // First prefer an input whose own accessibility metadata names the field.
     input = editableInputs().find((candidate) => {
       const metadata = inputMetadata(candidate);
       return phrases.some((phrase) => metadata.includes(phrase));
     });
 
-    // Current Play Console uses Material wrappers where the visible field title
-    // can be several DOM levels away from the actual input. Search short visible
-    // text nodes and walk up to the nearest input instead of assuming <label>.
     if (!input) {
       const labelNodes = [...document.querySelectorAll(
         'label, mat-label, [aria-label], [data-placeholder], h1, h2, h3, h4, p, span, div'
       )]
         .filter(visible)
         .filter((el) => {
-          const value = text(el);
-          return value && value.length <= 220 && phrases.some((phrase) => value.includes(phrase));
+          const valueText = text(el);
+          return valueText && valueText.length <= 220 && phrases.some((phrase) => valueText.includes(phrase));
         })
         .sort((a, b) => text(a).length - text(b).length);
 
@@ -96,8 +120,6 @@
       if (match) input = match;
     }
 
-    // Safe page-specific fallback: declaration pages such as Privacy Policy can
-    // expose a single editable field without usable labels or ARIA metadata.
     if (!input && options.singleFieldFallback) {
       const main = document.querySelector('main, [role="main"]') || document;
       const fields = editableInputs(main).filter((candidate) => {
@@ -156,18 +178,56 @@
     )) actions.push('Privacy policy URL');
   }
 
-  function fillAppAccess(payload, actions) {
+  async function fillAppAccess(payload, actions) {
     const body = normalize(document.body.innerText);
-    if (!body.includes('app access')) return;
+    const onSignInPage = location.pathname.includes('/app-content/testing-credentials');
+    if (!body.includes('app access') && !body.includes('sign in details') && !onSignInPage) return;
+
     const access = payload.app_access || {};
-    if (access.mode === 'unrestricted') {
-      if (clickText(['all functionality in your app is available without any access restrictions', 'all functionality is available'])) actions.push('Unrestricted access');
-    } else {
-      if (clickText(['all or some functionality in your app is restricted', 'some functionality is restricted'])) actions.push('Restricted access');
-      if (setInputByLabel(['instructions', 'provide instructions', 'any other information'], access.instructions)) actions.push('Reviewer instructions');
-      if (setInputByLabel(['username', 'email address', 'login'], access.username)) actions.push('Reviewer username');
-      if (setInputByLabel(['password'], access.password, {selectors: ['input[type="password"]']})) actions.push('Reviewer password');
+    const restricted = access.mode !== 'unrestricted';
+
+    const choseRestriction = clickYesNoForQuestion(
+      ['is any part of your app restricted', 'any part of your app restricted'],
+      restricted
+    );
+
+    if (choseRestriction) {
+      actions.push(restricted ? 'Restricted sign-in access' : 'Unrestricted sign-in access');
+      await sleep(450);
+    } else if (restricted) {
+      if (clickText(['all or some functionality in your app is restricted', 'some functionality is restricted'])) {
+        actions.push('Restricted sign-in access');
+        await sleep(450);
+      }
+    } else if (clickText(['all functionality in your app is available without any access restrictions', 'all functionality is available'])) {
+      actions.push('Unrestricted sign-in access');
+      await sleep(450);
     }
+
+    if (!restricted) return;
+
+    // Current Play Console may hide credential fields behind an Add instructions action.
+    if (!editableInputs().length && clickText(['add instructions', 'add instruction', 'add sign-in instructions'])) {
+      actions.push('Opened sign-in instructions');
+      await sleep(500);
+    }
+
+    if (setInputByLabel(
+      ['instructions', 'provide instructions', 'access instructions', 'any other information'],
+      access.instructions
+    )) actions.push('Reviewer instructions');
+
+    if (setInputByLabel(
+      ['username', 'email address', 'email', 'login'],
+      access.username,
+      {selectors: ['input[autocomplete="username"]', 'input[type="email"]']}
+    )) actions.push('Reviewer username');
+
+    if (setInputByLabel(
+      ['password'],
+      access.password,
+      {selectors: ['input[type="password"]', 'input[autocomplete="current-password"]']}
+    )) actions.push('Reviewer password');
   }
 
   function fillAds(payload, actions) {
@@ -229,23 +289,25 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type !== 'APLUS_FILL') return;
-    const actions = [];
-    try {
-      fillPrivacy(message.payload, actions);
-      fillAppAccess(message.payload, actions);
-      fillAds(message.payload, actions);
-      fillAudience(message.payload, actions);
-      fillContentRating(message.payload, actions);
-      fillDataSafety(message.payload, actions);
-      sendResponse({
-        ok: true,
-        message: actions.length
-          ? `Filled/highlighted ${actions.length} answers:\n${actions.join('\n')}\n\nReview the highlighted fields, then click Save/Next in Play Console.`
-          : 'No supported fields were detected on this page. Open one App content declaration page and keep Play Console in English.'
-      });
-    } catch (error) {
-      sendResponse({ok: false, message: error.message || String(error)});
-    }
+    (async () => {
+      const actions = [];
+      try {
+        fillPrivacy(message.payload, actions);
+        await fillAppAccess(message.payload, actions);
+        fillAds(message.payload, actions);
+        fillAudience(message.payload, actions);
+        fillContentRating(message.payload, actions);
+        fillDataSafety(message.payload, actions);
+        sendResponse({
+          ok: true,
+          message: actions.length
+            ? `Filled/highlighted ${actions.length} answers:\n${actions.join('\n')}\n\nReview the highlighted fields, then click Save/Next in Play Console.`
+            : 'No supported fields were detected on this page. Open one App content declaration page and keep Play Console in English.'
+        });
+      } catch (error) {
+        sendResponse({ok: false, message: error.message || String(error)});
+      }
+    })();
     return true;
   });
 })();

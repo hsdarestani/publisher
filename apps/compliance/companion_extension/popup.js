@@ -27,9 +27,6 @@ async function sendFillMessage(tabId, payload) {
       message.includes('message port closed');
     if (!missingReceiver) throw error;
 
-    // Reloading/updating an unpacked extension disconnects content scripts that
-    // were injected into already-open Play Console tabs. Recover automatically
-    // instead of forcing the user to remember a refresh/reload order.
     await chrome.scripting.executeScript({
       target: {tabId},
       files: ['content.js'],
@@ -118,6 +115,78 @@ async function fillRequiredSignInDetailsName(tabId, appName) {
   }
 }
 
+async function fillCurrentIarcQuestionnaire(tabId, rating) {
+  try {
+    const [{result}] = await chrome.scripting.executeScript({
+      target: {tabId},
+      func: (answers) => {
+        const normalize = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const visible = (el) => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+        const body = normalize(document.body.innerText || document.body.textContent);
+        if (!body.includes('content ratings') && !body.includes('all other app types')) {
+          return {handled: false, actions: []};
+        }
+
+        function answerExactQuestion(questionPhrases, answer, label) {
+          const phrases = questionPhrases.map(normalize);
+          const containers = [...document.querySelectorAll('section, form, div, li')]
+            .filter(visible)
+            .filter((el) => {
+              const value = normalize(el.innerText || el.textContent);
+              if (!value || value.length > 1800) return false;
+              const hasQuestion = phrases.some((phrase) => value.includes(phrase));
+              const hasYes = /(^|\s)yes(\s|$)/.test(value);
+              const hasNo = /(^|\s)no(\s|$)/.test(value);
+              return hasQuestion && hasYes && hasNo;
+            })
+            .sort((a, b) => normalize(a.innerText || a.textContent).length - normalize(b.innerText || b.textContent).length);
+
+          const desired = answer ? 'yes' : 'no';
+          for (const container of containers) {
+            const options = [...container.querySelectorAll('label, button, [role="radio"], mat-radio-button')].filter(visible);
+            const option = options.find((el) => {
+              const value = normalize(el.innerText || el.textContent || el.getAttribute?.('aria-label'));
+              return value === desired || value.startsWith(`${desired} `);
+            });
+            if (!option) continue;
+            const target = option.closest('label,button,[role="radio"],mat-radio-button') || option;
+            target.click();
+            target.style.outline = '2px solid #1769e0';
+            target.style.outlineOffset = '2px';
+            return label;
+          }
+          return null;
+        }
+
+        const actions = [];
+        const downloadedKeys = ['violence', 'sexual_content', 'language', 'controlled_substances', 'gambling'];
+        const knownDownloadedKeys = downloadedKeys.filter((key) => Object.prototype.hasOwnProperty.call(answers || {}, key));
+        if (knownDownloadedKeys.length) {
+          const containsRatingsRelevantDownloadedContent = knownDownloadedKeys.some((key) => answers[key] === true);
+          const action = answerExactQuestion(
+            ['does the app contain any ratings-relevant content'],
+            containsRatingsRelevantDownloadedContent,
+            `Downloaded App: ${containsRatingsRelevantDownloadedContent ? 'Yes' : 'No'}`
+          );
+          if (action) actions.push(action);
+        }
+
+        return {
+          handled: true,
+          actions,
+          message: actions.length
+            ? `Filled/highlighted ${actions.length} safe IARC answer(s):\n${actions.join('\n')}\n\nOther IARC sections were intentionally left untouched because the current Publisher payload does not map to them exactly. Review them before Save/Next.`
+            : 'Current IARC questionnaire detected, but no safe exact-match answer was available. Nothing was changed.'
+        };
+      },
+      args: [rating || {}],
+    });
+    return result || {handled: false, actions: []};
+  } catch (_) {
+    return {handled: false, actions: []};
+  }
+}
+
 document.getElementById('fill').addEventListener('click', async () => {
   const payloadUrl = urlInput.value.trim();
   if (!payloadUrl.startsWith('https://publisher.smarbiz.sbs/compliance/companion/')) {
@@ -133,7 +202,19 @@ document.getElementById('fill').addEventListener('click', async () => {
     if (!tab || !tab.url || !tab.url.startsWith('https://play.google.com/console/')) {
       throw new Error('Open the relevant Google Play Console form first.');
     }
-    const result = await sendFillMessage(tab.id, payload);
+
+    let result;
+    if (tab.url.includes('/app-content/content-rating-iarc-questionnaire')) {
+      const iarc = await fillCurrentIarcQuestionnaire(tab.id, payload.content_rating || {});
+      if (iarc.handled) {
+        result = {message: iarc.message};
+      } else {
+        result = await sendFillMessage(tab.id, payload);
+      }
+    } else {
+      result = await sendFillMessage(tab.id, payload);
+    }
+
     const filledName = await fillRequiredSignInDetailsName(tab.id, payload.app?.name);
     let message = result?.message || 'Form scan completed. Review highlighted answers and save the page.';
     if (filledName && !message.includes('Sign-in details name')) {

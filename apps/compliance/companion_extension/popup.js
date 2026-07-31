@@ -39,6 +39,85 @@ async function sendFillMessage(tabId, payload) {
   }
 }
 
+async function fillRequiredSignInDetailsName(tabId, appName) {
+  try {
+    const [{result}] = await chrome.scripting.executeScript({
+      target: {tabId},
+      func: async (name) => {
+        if (!location.pathname.includes('/app-content/testing-credentials')) return false;
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const visible = (el) => !!(el && el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+        const normalized = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const targetValue = `${name || 'App'} reviewer access`.slice(0, 60);
+
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          const dialogs = [...document.querySelectorAll('[role="dialog"], mat-dialog-container, .cdk-overlay-pane')].filter(visible);
+          const dialog = dialogs.find((el) => normalized(el.innerText || el.textContent).includes('add sign in details'));
+          const scope = dialog || document;
+          if (!normalized(scope.innerText || scope.textContent).includes('add sign in details')) {
+            await sleep(150);
+            continue;
+          }
+
+          let input = null;
+          const labels = [...scope.querySelectorAll('label, mat-label, [aria-label], span, div')]
+            .filter(visible)
+            .filter((el) => normalized(el.innerText || el.textContent || el.getAttribute?.('aria-label')).replace(/\s*\*\s*$/, '') === 'name')
+            .sort((a, b) => normalized(a.innerText || a.textContent).length - normalized(b.innerText || b.textContent).length);
+
+          for (const label of labels) {
+            const forId = label.getAttribute?.('for');
+            if (forId) {
+              const linked = document.getElementById(forId);
+              if (linked && visible(linked)) {
+                input = linked;
+                break;
+              }
+            }
+            let node = label;
+            for (let depth = 0; node && depth < 6 && !input; depth += 1, node = node.parentElement) {
+              const candidate = node.querySelector?.('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])');
+              if (candidate && visible(candidate)) input = candidate;
+            }
+            if (input) break;
+          }
+
+          if (!input) {
+            const fields = [...scope.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])')]
+              .filter((el) => visible(el) && !['checkbox', 'radio', 'password'].includes(el.type));
+            input = fields.find((el) => {
+              const metadata = normalized([
+                el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('id')
+              ].filter(Boolean).join(' '));
+              return metadata === 'name' || metadata.startsWith('name ');
+            }) || fields[0] || null;
+          }
+
+          if (input) {
+            if (!String(input.value || '').trim()) {
+              const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+              input.focus();
+              setter ? setter.call(input, targetValue) : (input.value = targetValue);
+              input.dispatchEvent(new Event('input', {bubbles: true}));
+              input.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+            input.style.outline = '2px solid #1769e0';
+            input.style.outlineOffset = '2px';
+            return true;
+          }
+          await sleep(150);
+        }
+        return false;
+      },
+      args: [appName || 'App'],
+    });
+    return !!result;
+  } catch (_) {
+    return false;
+  }
+}
+
 document.getElementById('fill').addEventListener('click', async () => {
   const payloadUrl = urlInput.value.trim();
   if (!payloadUrl.startsWith('https://publisher.smarbiz.sbs/compliance/companion/')) {
@@ -55,7 +134,12 @@ document.getElementById('fill').addEventListener('click', async () => {
       throw new Error('Open the relevant Google Play Console form first.');
     }
     const result = await sendFillMessage(tab.id, payload);
-    show(result?.message || 'Form scan completed. Review highlighted answers and save the page.', true);
+    const filledName = await fillRequiredSignInDetailsName(tab.id, payload.app?.name);
+    let message = result?.message || 'Form scan completed. Review highlighted answers and save the page.';
+    if (filledName && !message.includes('Sign-in details name')) {
+      message += '\nSign-in details name';
+    }
+    show(message, true);
   } catch (error) {
     show(error.message || String(error), false);
   }

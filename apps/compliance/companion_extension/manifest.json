@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "A+ Play Console Companion",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Fills Google Play Console policy forms from an A+ Publisher compliance profile.",
   "permissions": ["activeTab", "storage", "scripting"],
   "host_permissions": [

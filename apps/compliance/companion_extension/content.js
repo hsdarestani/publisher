@@ -22,26 +22,100 @@
     return true;
   }
 
+  function editableInputs(root = document) {
+    return [...root.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])')]
+      .filter((el) => visible(el) && el.type !== 'checkbox' && el.type !== 'radio');
+  }
+
+  function inputMetadata(input) {
+    return normalize([
+      input.getAttribute('aria-label'),
+      input.getAttribute('placeholder'),
+      input.getAttribute('name'),
+      input.getAttribute('id'),
+      input.getAttribute('data-placeholder'),
+    ].filter(Boolean).join(' '));
+  }
+
+  function nearestInput(label) {
+    if (!label) return null;
+    const forId = label.getAttribute?.('for');
+    if (forId) {
+      const linked = document.getElementById(forId);
+      if (linked && visible(linked)) return linked;
+    }
+
+    const local = label.querySelector?.('input,textarea');
+    if (local && visible(local)) return local;
+
+    let node = label;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const input = node.querySelector?.('input:not([type="hidden"]),textarea');
+      if (input && visible(input)) return input;
+    }
+
+    const sibling = label.nextElementSibling?.querySelector?.('input,textarea');
+    if (sibling && visible(sibling)) return sibling;
+    return null;
+  }
+
   function setInputByLabel(labelPhrases, value, options = {}) {
     if (!value) return false;
     const phrases = labelPhrases.map(normalize);
-    const labels = [...document.querySelectorAll('label, [aria-label], h1, h2, h3, h4, p, span')].filter(visible);
-    const label = labels.find((el) => phrases.some((phrase) => text(el).includes(phrase)));
     let input = null;
-    if (label) {
-      const forId = label.getAttribute?.('for');
-      if (forId) input = document.getElementById(forId);
-      input ||= label.querySelector?.('input,textarea');
-      input ||= label.parentElement?.querySelector?.('input,textarea');
-      input ||= label.closest?.('div')?.querySelector?.('input,textarea');
+
+    // First prefer an input whose own accessibility metadata names the field.
+    input = editableInputs().find((candidate) => {
+      const metadata = inputMetadata(candidate);
+      return phrases.some((phrase) => metadata.includes(phrase));
+    });
+
+    // Current Play Console uses Material wrappers where the visible field title
+    // can be several DOM levels away from the actual input. Search short visible
+    // text nodes and walk up to the nearest input instead of assuming <label>.
+    if (!input) {
+      const labelNodes = [...document.querySelectorAll(
+        'label, mat-label, [aria-label], [data-placeholder], h1, h2, h3, h4, p, span, div'
+      )]
+        .filter(visible)
+        .filter((el) => {
+          const value = text(el);
+          return value && value.length <= 220 && phrases.some((phrase) => value.includes(phrase));
+        })
+        .sort((a, b) => text(a).length - text(b).length);
+
+      for (const label of labelNodes) {
+        input = nearestInput(label);
+        if (input) break;
+      }
     }
-    if (!input && options.type) input = document.querySelector(options.type);
+
+    for (const selector of options.selectors || []) {
+      if (input) break;
+      const match = [...document.querySelectorAll(selector)].find(visible);
+      if (match) input = match;
+    }
+
+    // Safe page-specific fallback: declaration pages such as Privacy Policy can
+    // expose a single editable field without usable labels or ARIA metadata.
+    if (!input && options.singleFieldFallback) {
+      const main = document.querySelector('main, [role="main"]') || document;
+      const fields = editableInputs(main).filter((candidate) => {
+        const type = normalize(candidate.getAttribute('type') || 'text');
+        return !['search', 'button', 'submit'].includes(type);
+      });
+      if (fields.length === 1) input = fields[0];
+    }
+
     if (!input || !visible(input)) return false;
-    const setter = Object.getOwnPropertyDescriptor(input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set;
+    const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    input.focus();
     setter ? setter.call(input, value) : (input.value = value);
     input.dispatchEvent(new Event('input', {bubbles: true}));
     input.dispatchEvent(new Event('change', {bubbles: true}));
     input.style.outline = '2px solid #1769e0';
+    input.style.outlineOffset = '2px';
     return true;
   }
 
@@ -64,8 +138,22 @@
   }
 
   function fillPrivacy(payload, actions) {
-    if (!document.body.innerText.toLowerCase().includes('privacy policy')) return;
-    if (setInputByLabel(['privacy policy url', 'privacy policy'], payload.privacy_policy?.url, {type: 'input[type="url"]'})) actions.push('Privacy policy URL');
+    const body = normalize(document.body.innerText);
+    if (!body.includes('privacy policy')) return;
+    const onPrivacyPage = location.pathname.includes('/app-content/privacy-policy');
+    if (setInputByLabel(
+      ['privacy policy url', 'privacy policy'],
+      payload.privacy_policy?.url,
+      {
+        selectors: [
+          'input[type="url"]',
+          'input[aria-label*="privacy" i]',
+          'input[placeholder*="privacy" i]',
+          'input[name*="privacy" i]',
+        ],
+        singleFieldFallback: onPrivacyPage,
+      }
+    )) actions.push('Privacy policy URL');
   }
 
   function fillAppAccess(payload, actions) {
@@ -78,7 +166,7 @@
       if (clickText(['all or some functionality in your app is restricted', 'some functionality is restricted'])) actions.push('Restricted access');
       if (setInputByLabel(['instructions', 'provide instructions', 'any other information'], access.instructions)) actions.push('Reviewer instructions');
       if (setInputByLabel(['username', 'email address', 'login'], access.username)) actions.push('Reviewer username');
-      if (setInputByLabel(['password'], access.password, {type: 'input[type="password"]'})) actions.push('Reviewer password');
+      if (setInputByLabel(['password'], access.password, {selectors: ['input[type="password"]']})) actions.push('Reviewer password');
     }
   }
 

@@ -17,6 +17,28 @@ document.getElementById('clear').addEventListener('click', () => {
   show('Companion session cleared.');
 });
 
+async function sendFillMessage(tabId, payload) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, {type: 'APLUS_FILL', payload});
+  } catch (error) {
+    const message = String(error?.message || error || '').toLowerCase();
+    const missingReceiver = message.includes('receiving end does not exist') ||
+      message.includes('could not establish connection') ||
+      message.includes('message port closed');
+    if (!missingReceiver) throw error;
+
+    // Reloading/updating an unpacked extension disconnects content scripts that
+    // were injected into already-open Play Console tabs. Recover automatically
+    // instead of forcing the user to remember a refresh/reload order.
+    await chrome.scripting.executeScript({
+      target: {tabId},
+      files: ['content.js'],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    return await chrome.tabs.sendMessage(tabId, {type: 'APLUS_FILL', payload});
+  }
+}
+
 document.getElementById('fill').addEventListener('click', async () => {
   const payloadUrl = urlInput.value.trim();
   if (!payloadUrl.startsWith('https://publisher.smarbiz.sbs/compliance/companion/')) {
@@ -32,7 +54,7 @@ document.getElementById('fill').addEventListener('click', async () => {
     if (!tab || !tab.url || !tab.url.startsWith('https://play.google.com/console/')) {
       throw new Error('Open the relevant Google Play Console form first.');
     }
-    const result = await chrome.tabs.sendMessage(tab.id, {type: 'APLUS_FILL', payload});
+    const result = await sendFillMessage(tab.id, payload);
     show(result?.message || 'Form scan completed. Review highlighted answers and save the page.', true);
   } catch (error) {
     show(error.message || String(error), false);

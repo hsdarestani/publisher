@@ -12,6 +12,7 @@ import base64
 import os
 import secrets
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -30,14 +31,38 @@ class CustomBuildMacAgent(CloudMacAgent):
         return response.json()
 
     @staticmethod
-    def _run_local(command, *, input_text=None):
-        return subprocess.run(
-            command,
-            input=input_text,
-            text=True,
-            check=True,
-            capture_output=True,
-        )
+    def _run_local(command, *, input_text=None, label=None):
+        """Run a local signing command without ever echoing secret arguments.
+
+        subprocess.CalledProcessError includes the whole argv, which may contain
+        temporary keychain/P12 passwords. Convert failures to a sanitized error
+        that contains only stdout/stderr from the command.
+        """
+        try:
+            return subprocess.run(
+                command,
+                input=input_text,
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "unknown error").strip()
+            if len(detail) > 4000:
+                detail = detail[-4000:]
+            raise RuntimeError(f"{label or Path(command[0]).name} failed: {detail}") from None
+
+    @staticmethod
+    def _openssl3():
+        candidates = [
+            "/opt/homebrew/opt/openssl@3/bin/openssl",
+            "/usr/local/opt/openssl@3/bin/openssl",
+            shutil.which("openssl"),
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        raise RuntimeError("OpenSSL is not available on Cloud Mac.")
 
     def _install_distribution_signing(self, job_id, workspace):
         signing = self._fetch_ios_signing(job_id)
@@ -62,42 +87,102 @@ class CustomBuildMacAgent(CloudMacAgent):
 
         keychain_password = secrets.token_urlsafe(32)
         p12_password = secrets.token_urlsafe(32)
-        self._run_local(["openssl", "x509", "-inform", "DER", "-in", str(cert_der), "-out", str(cert_pem)])
+        openssl = self._openssl3()
         self._run_local(
-            [
-                "openssl", "pkcs12", "-export",
-                "-inkey", str(key_pem), "-in", str(cert_pem),
-                "-out", str(p12_path), "-passout", f"pass:{p12_password}",
-                "-name", "A+ Publisher Apple Distribution",
-            ]
+            [openssl, "x509", "-inform", "DER", "-in", str(cert_der), "-out", str(cert_pem)],
+            label="Apple certificate conversion",
         )
-        self._run_local(["security", "create-keychain", "-p", keychain_password, str(keychain_path)])
-        self._run_local(["security", "set-keychain-settings", "-lut", "21600", str(keychain_path)])
-        self._run_local(["security", "unlock-keychain", "-p", keychain_password, str(keychain_path)])
+        self._run_local(
+            ["security", "create-keychain", "-p", keychain_password, str(keychain_path)],
+            label="Temporary keychain creation",
+        )
+        self._run_local(
+            ["security", "set-keychain-settings", "-lut", "21600", str(keychain_path)],
+            label="Temporary keychain settings",
+        )
+        self._run_local(
+            ["security", "unlock-keychain", "-p", keychain_password, str(keychain_path)],
+            label="Temporary keychain unlock",
+        )
 
-        existing_raw = self._run_local(["security", "list-keychains", "-d", "user"]).stdout
+        existing_raw = self._run_local(
+            ["security", "list-keychains", "-d", "user"],
+            label="Keychain list",
+        ).stdout
         existing = []
         for line in existing_raw.splitlines():
             existing.extend(shlex.split(line.strip()))
         keychains = [str(keychain_path)] + [item for item in existing if item != str(keychain_path)]
-        self._run_local(["security", "list-keychains", "-d", "user", "-s", *keychains])
         self._run_local(
-            [
-                "security", "import", str(p12_path), "-k", str(keychain_path),
-                "-P", p12_password, "-T", "/usr/bin/codesign", "-T", "/usr/bin/security",
-            ]
+            ["security", "list-keychains", "-d", "user", "-s", *keychains],
+            label="Keychain search-list update",
         )
+
+        # macOS Security can import an X.509 certificate and its matching
+        # unencrypted PKCS#8/OpenSSL private key directly. Prefer this path so
+        # we do not depend on PKCS#12 cipher compatibility between OpenSSL and
+        # the macOS Security framework.
+        direct_import_error = None
+        try:
+            self._run_local(
+                ["security", "import", str(cert_der), "-k", str(keychain_path), "-t", "cert", "-f", "x509"],
+                label="Apple Distribution certificate import",
+            )
+            self._run_local(
+                [
+                    "security", "import", str(key_pem), "-k", str(keychain_path),
+                    "-t", "priv", "-f", "openssl",
+                    "-T", "/usr/bin/codesign", "-T", "/usr/bin/security",
+                ],
+                label="Apple Distribution private-key import",
+            )
+        except RuntimeError as exc:
+            direct_import_error = str(exc)
+
+        identities = self._run_local(
+            ["security", "find-identity", "-v", "-p", "codesigning", str(keychain_path)],
+            label="Code-signing identity verification",
+        ).stdout
+
+        if "Apple Distribution" not in identities:
+            # Fallback: OpenSSL 3's default PKCS#12 uses PBES2/AES, which some
+            # macOS Security versions reject. -legacy emits the long-supported
+            # 3DES/SHA-1 compatibility envelope while the contained RSA key and
+            # Apple certificate themselves remain unchanged.
+            self._run_local(
+                [
+                    openssl, "pkcs12", "-export", "-legacy",
+                    "-inkey", str(key_pem), "-in", str(cert_pem),
+                    "-out", str(p12_path), "-passout", f"pass:{p12_password}",
+                    "-name", "A+ Publisher Apple Distribution",
+                ],
+                label="Legacy-compatible PKCS12 creation",
+            )
+            self._run_local(
+                [
+                    "security", "import", str(p12_path), "-k", str(keychain_path),
+                    "-f", "pkcs12", "-P", p12_password,
+                    "-T", "/usr/bin/codesign", "-T", "/usr/bin/security",
+                ],
+                label="Apple Distribution PKCS12 import",
+            )
+            identities = self._run_local(
+                ["security", "find-identity", "-v", "-p", "codesigning", str(keychain_path)],
+                label="Code-signing identity verification",
+            ).stdout
+
+        if "Apple Distribution" not in identities:
+            suffix = f" Direct import detail: {direct_import_error}" if direct_import_error else ""
+            raise RuntimeError("Apple Distribution signing identity is not available in the temporary keychain." + suffix)
+
         self._run_local(
             [
                 "security", "set-key-partition-list",
                 "-S", "apple-tool:,apple:", "-s", "-k", keychain_password,
                 str(keychain_path),
-            ]
+            ],
+            label="Apple key partition configuration",
         )
-        # Verify that macOS can see the signing identity before invoking Xcode.
-        identities = self._run_local(["security", "find-identity", "-v", "-p", "codesigning", str(keychain_path)]).stdout
-        if "Apple Distribution" not in identities:
-            raise RuntimeError("Apple Distribution signing identity was not importable on Cloud Mac.")
 
         return {
             "profile_path": profile_path,

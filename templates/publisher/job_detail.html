@@ -6,6 +6,11 @@
 {% if job.status == 'failed' %}
 <form method="post" action="{% url 'job_retry' job.pk %}">{% csrf_token %}<button class="btn btn-primary">Retry job</button></form>
 {% endif %}
+{% if job.status == 'succeeded' and job.build and job.build.artifact %}
+<a class="btn btn-primary" href="{{ job.build.artifact.url }}" download>
+  Download {% if job.build.platform == 'android' %}AAB{% elif job.build.platform == 'ios' %}IPA{% else %}artifact{% endif %}
+</a>
+{% endif %}
 {% endblock %}
 {% block content %}
 <div class="stats-grid mini-stats">
@@ -43,6 +48,14 @@ This page refreshes automatically.</pre>
       <span><i>Required platform</i><strong>{{ job.required_platform|default:'Server' }}</strong></span>
       <span><i>Finished</i><strong>{{ job.finished_at|date:'M j, H:i:s'|default:'—' }}</strong></span>
     </div>
+    {% if job.status == 'succeeded' and job.build and job.build.artifact %}
+      <div class="alert alert-success" style="margin-top:16px;">
+        <strong>Build artifact ready.</strong><br>
+        {% if job.build.artifact_size %}{{ job.build.artifact_size|filesizeformat }} · {% endif %}
+        {% if job.build.platform == 'android' %}Android App Bundle (.aab){% elif job.build.platform == 'ios' %}iOS App Archive (.ipa){% else %}Build artifact{% endif %}
+        <div style="margin-top:10px;"><a class="btn btn-primary" href="{{ job.build.artifact.url }}" download>Download {% if job.build.platform == 'android' %}AAB{% elif job.build.platform == 'ios' %}IPA{% else %}artifact{% endif %}</a></div>
+      </div>
+    {% endif %}
     <details><summary>Payload</summary><pre>{{ job.payload }}</pre></details>
     <details><summary>Result</summary><pre>{{ job.result }}</pre></details>
   </aside>

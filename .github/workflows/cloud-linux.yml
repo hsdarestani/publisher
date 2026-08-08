@@ -33,6 +33,11 @@ jobs:
       - name: Checkout A+ Publisher agent
         uses: actions/checkout@v4
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -56,6 +61,8 @@ jobs:
 
       - name: Show Android build environment
         run: |
+          node --version
+          npm --version
           java -version
           flutter --version
           flutter doctor -v
@@ -78,7 +85,7 @@ jobs:
           PUBLISHER_WATCH_SECONDS: '240'
         run: |
           set +e
-          python agents/cloud_linux.py 2>&1 | tee /tmp/cloud-linux.log
+          python agents/custom_cloud_linux.py 2>&1 | tee /tmp/cloud-linux.log
           AGENT_EXIT=${PIPESTATUS[0]}
           exit "$AGENT_EXIT"
 

@@ -26,6 +26,11 @@ jobs:
       - name: Checkout A+ Publisher agent
         uses: actions/checkout@v4
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -37,6 +42,8 @@ jobs:
 
       - name: Show Apple build environment
         run: |
+          node --version
+          npm --version
           sw_vers
           xcodebuild -version
           xcrun --find iTMSTransporter
@@ -57,7 +64,7 @@ jobs:
           PUBLISHER_MAX_JOBS: '3'
         run: |
           set +e
-          python agents/cloud_macos.py 2>&1 | tee /tmp/cloud-mac.log
+          python agents/custom_cloud_macos.py 2>&1 | tee /tmp/cloud-mac.log
           AGENT_EXIT=${PIPESTATUS[0]}
           if [ "$AGENT_EXIT" -ne 0 ]; then
             echo "--- Publisher diagnostic response ---" | tee -a /tmp/cloud-mac.log

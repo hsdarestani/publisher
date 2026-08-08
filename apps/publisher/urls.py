@@ -1,5 +1,5 @@
 from django.urls import path
-from . import views
+from . import views, artifact_views
 urlpatterns = [
     path("", views.app_list, name="app_list"),
     path("new/", views.app_create, name="app_create"),
@@ -15,6 +15,7 @@ urlpatterns = [
     path("releases/<int:pk>/action/<str:action>/", views.release_action, name="release_action"),
     path("jobs/", views.jobs, name="jobs"),
     path("jobs/<int:pk>/", views.job_detail, name="job_detail"),
+    path("jobs/<int:pk>/artifact/", artifact_views.job_artifact_download, name="job_artifact_download"),
     path("jobs/<int:pk>/retry/", views.job_retry, name="job_retry"),
     path("agents/", views.agent_list, name="agents"),
     path("agents/new/", views.agent_create, name="agent_create"),

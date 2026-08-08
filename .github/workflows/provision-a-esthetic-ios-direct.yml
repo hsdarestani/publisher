@@ -1,0 +1,87 @@
+name: Provision A+ Esthetic iOS directly
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/provision-a-esthetic-ios-direct.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Wait for signing vault deployment and provision A+ Esthetic
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          echo 'Waiting for production container to expose the iOS signing vault...'
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python -c 'from apps.signing.models import IOSDistributionCredential, IOSProvisioningProfile; from apps.signing.services import ensure_ios_signing; print(\"ios_signing_code=yes\")'"; then
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              echo 'Signing vault code never became importable on production.' >&2
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py showmigrations signing || true; docker compose exec -T web python -c 'import apps.signing.services' || true"
+              exit 2
+            fi
+            sleep 5
+          done
+
+          CODE=$(cat <<'PY'
+from apps.publisher.models import MobileApp, Release, Build, Job
+from apps.signing.services import ensure_ios_signing
+
+app = MobileApp.objects.select_related('apple_account').get(slug='a-esthetic')
+assert app.apple_account_id and app.apple_account.configured, 'Apple account is not configured'
+profile = ensure_ios_signing(app)
+dist = profile.distribution_credential
+print('ios_signing_ready=yes')
+print('apple_certificate_id=' + dist.apple_certificate_id)
+print('profile_id=' + profile.apple_profile_id)
+print('profile_uuid=' + profile.profile_uuid)
+print('profile_name=' + profile.profile_name)
+
+release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
+build, _ = Build.objects.get_or_create(release=release, platform='ios')
+if build.status == 'succeeded':
+    print('ios_build_queue=already_succeeded')
+elif Job.objects.filter(app=app, release=release, build=build, type='build_ios', status__in=['queued','running','succeeded']).exists():
+    print('ios_build_queue=already_live')
+else:
+    build.status = 'queued'
+    build.logs = ''
+    build.save(update_fields=['status','logs','updated_at'])
+    release.status = 'building'
+    release.save(update_fields=['status','updated_at'])
+    Job.objects.create(type='build_ios', app=app, release=release, build=build, payload={'source':'direct-ios-signing-provision'}, available_to_agents=True, required_platform='macos')
+    print('ios_build_queue=queued')
+PY
+          )
+          ENCODED=$(printf '%s' "$CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

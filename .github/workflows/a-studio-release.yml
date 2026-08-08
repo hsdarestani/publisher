@@ -1,0 +1,126 @@
+name: Release A+ Studio to Apple and Google
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/a-studio-release.yml'
+      - 'apps/signing/management/commands/bootstrap_a_studio.py'
+      - 'apps/integrations/apple_assets.py'
+      - 'apps/publisher/tasks.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-release.yml'
+      - 'apps/signing/management/commands/bootstrap_a_studio.py'
+      - 'apps/integrations/apple_assets.py'
+      - 'apps/publisher/tasks.py'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate Django and release modules
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help bootstrap_a_studio >/dev/null
+          python -m py_compile \
+            apps/signing/management/commands/bootstrap_a_studio.py \
+            apps/integrations/apple_assets.py \
+            apps/publisher/tasks.py
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Bootstrap A+ Studio in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/signing/management/commands/bootstrap_a_studio.py"; then
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              echo 'A+ Studio bootstrap command never appeared in production.' >&2
+              exit 2
+            fi
+            sleep 5
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --queue --publish"
+
+      - name: Verify A+ Studio production endpoints
+        run: |
+          set -euo pipefail
+          for url in \
+            https://studio.aplus-solution.de/health/ \
+            https://studio.aplus-solution.de/privacy/ \
+            https://studio.aplus-solution.de/support/ \
+            https://studio.aplus-solution.de/account-deletion/ \
+            https://studio.aplus-solution.de/api/mobile/config/; do
+            curl --fail --silent --show-error --location --max-time 30 "$url" >/dev/null
+          done
+
+      - name: Wake Publisher build agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Advance release as build results arrive
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 40); do
+            echo "=== Publisher release pass $i ==="
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish")"
+            printf '%s\n' "$OUTPUT"
+
+            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=succeeded' && \
+               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=succeeded'; then
+              break
+            fi
+            sleep 30
+          done
+
+      - name: Final release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"

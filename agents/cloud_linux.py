@@ -19,6 +19,8 @@ import shlex
 import subprocess
 import time
 
+import requests
+
 from cloud_macos import CloudMacAgent
 from runner import Agent
 
@@ -42,6 +44,14 @@ class CloudLinuxAgent(CloudMacAgent):
             super().__init__(server, max_jobs=max_jobs)
         self.session.headers["X-Agent-Platform"] = "linux"
 
+    @staticmethod
+    def _transient_poll_error(exc: Exception) -> bool:
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            return exc.response.status_code in {408, 425, 429} or exc.response.status_code >= 500
+        return False
+
     def run(self):
         mode = "persistent" if self.continuous else "ephemeral"
         deadline = time.monotonic() + self.watch_seconds if self.watch_seconds else None
@@ -50,10 +60,13 @@ class CloudLinuxAgent(CloudMacAgent):
             print(f"Watching the Android queue for {self.watch_seconds} seconds.", flush=True)
         processed = 0
         had_failures = False
+        consecutive_poll_errors = 0
+        max_ephemeral_poll_errors = 5
         while self.continuous or processed < self.max_jobs:
             try:
                 response = self.session.post(f"{self.server}/apps/agent-api/claim/", timeout=45)
                 response.raise_for_status()
+                consecutive_poll_errors = 0
                 job = response.json().get("job")
                 if not job:
                     should_wait = self.continuous or (deadline is not None and time.monotonic() < deadline)
@@ -93,10 +106,26 @@ class CloudLinuxAgent(CloudMacAgent):
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
-                if not self.continuous:
+                if not self._transient_poll_error(exc):
+                    if not self.continuous:
+                        raise
+                    print(f"persistent agent poll error: {exc}", flush=True)
+                    time.sleep(min(self.interval * 2, 60))
+                    continue
+
+                consecutive_poll_errors += 1
+                within_watch = deadline is None or time.monotonic() < deadline
+                may_retry = self.continuous or (
+                    within_watch and consecutive_poll_errors < max_ephemeral_poll_errors
+                )
+                print(
+                    f"Transient Publisher poll error ({consecutive_poll_errors}/"
+                    f"{max_ephemeral_poll_errors}): {exc}",
+                    flush=True,
+                )
+                if not may_retry:
                     raise
-                print(f"persistent agent poll error: {exc}", flush=True)
-                time.sleep(min(self.interval * 2, 60))
+                time.sleep(min(self.interval * max(2, consecutive_poll_errors), 30))
 
         if had_failures and not self.continuous:
             raise RuntimeError("One or more Android jobs failed. See the Publisher execution log.")

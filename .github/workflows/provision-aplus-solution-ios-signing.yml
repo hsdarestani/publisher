@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Wait for Publisher deploy and provision signing
+      - name: Recover A+ Solution iOS pipeline
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -26,8 +26,6 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
 
-          # Re-provision if needed and queue the failed build again. The app
-          # build script now consumes Publisher's manual App Store profile.
           for i in $(seq 1 60); do
             if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_ios_signing >/dev/null 2>&1"; then
@@ -42,6 +40,54 @@ jobs:
 
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --app-version 1.0.0 --build-number 1"
+
+          STATE_SCRIPT=$(cat <<'PY'
+from apps.publisher.models import MobileApp, Release, Build, Job
+from apps.publisher.tasks import enqueue_job
+
+app = MobileApp.objects.get(slug='a-plus-solution')
+release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
+build = release.builds.filter(platform='ios').first()
+if build is None:
+    build = Build.objects.create(release=release, platform='ios')
+
+print('APP', app.slug, app.bundle_id)
+print('RELEASE', release.id, release.status, release.version_name, release.build_number)
+print('BUILD_BEFORE', build.id, build.status, bool(build.artifact), build.external_build_id or '-')
+for job in Job.objects.filter(release=release, type__in=['build_ios','upload_apple']).order_by('-id')[:10]:
+    print('JOB', job.id, job.type, job.status, job.progress, (job.error or '')[:500])
+
+active_build = Job.objects.filter(build=build, type='build_ios', status__in=['queued','running']).exists()
+active_upload = Job.objects.filter(build=build, type='upload_apple', status__in=['queued','running']).exists()
+
+if build.status == 'succeeded' and build.artifact:
+    if build.external_build_id:
+        print('ACTION none: build already has App Store external_build_id', build.external_build_id)
+    elif not active_upload:
+        job = enqueue_job('upload_apple', app=app, release=release, build=build, agent=True, platform='macos')
+        print('ACTION queued upload_apple', job.id)
+    else:
+        print('ACTION upload_apple already active')
+else:
+    if not active_build:
+        build.status = 'queued'
+        build.logs = ''
+        build.finished_at = None
+        build.save(update_fields=['status','logs','finished_at','updated_at'])
+        job = enqueue_job('build_ios', app=app, release=release, build=build, agent=True, platform='macos')
+        release.status = 'building'
+        release.save(update_fields=['status','updated_at'])
+        print('ACTION queued build_ios', job.id)
+    else:
+        print('ACTION build_ios already active')
+
+build.refresh_from_db()
+print('BUILD_AFTER', build.id, build.status, bool(build.artifact), build.external_build_id or '-')
+PY
+          )
+          ENCODED=$(printf '%s' "$STATE_SCRIPT" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
 
       - name: Wake Cloud Mac
         uses: actions/github-script@v7

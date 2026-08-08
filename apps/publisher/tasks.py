@@ -90,6 +90,7 @@ def handle_submit_google(job):
 
 
 def handle_submit_apple(job):
+    from apps.integrations.apple_assets import sync_app_store_screenshots
     from apps.integrations.apple_store import AppleStoreClient
     release, app = job.release, job.release.app
     if not app.apple_account or not app.apple_account.configured:
@@ -100,10 +101,18 @@ def handle_submit_apple(job):
     client = AppleStoreClient(app.apple_account)
     record = client.find_app(app.bundle_id)
     version = client.ensure_version(record["id"], release.version_name)
-    for loc in app.localizations.all(): client.set_localization(version["id"], loc)
+    for loc in app.localizations.all():
+        client.set_localization(version["id"], loc)
+    screenshot_result = sync_app_store_screenshots(
+        client,
+        version["id"],
+        app.localizations.all(),
+        app.assets.filter(kind="screenshot", platform="ios"),
+    )
     client.attach_build(version["id"], build.external_build_id)
     client.set_review_details(version["id"], app)
     result = client.submit_version(record["id"], version["id"])
+    result["screenshots"] = screenshot_result
     Submission.objects.update_or_create(app=app, release=release, platform="ios", defaults={"state": "in_review", "external_id": result["submission"]["id"], "submitted_at": timezone.now(), "raw": result})
     release.status = "in_review"; release.readiness_snapshot = evaluate_release(release); release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
     return result

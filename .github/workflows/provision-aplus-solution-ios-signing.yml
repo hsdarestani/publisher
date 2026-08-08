@@ -26,6 +26,8 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
 
+          # Re-provision if needed and queue the failed build again. The app
+          # build script now consumes Publisher's manual App Store profile.
           for i in $(seq 1 60); do
             if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_ios_signing >/dev/null 2>&1"; then

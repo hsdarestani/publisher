@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from django.core.management import BaseCommand, CommandError, call_command
+from django.core.management import call_command
+from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from apps.integrations.apple_store import AppleStoreClient

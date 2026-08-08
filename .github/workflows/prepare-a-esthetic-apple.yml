@@ -1,0 +1,39 @@
+name: Prepare A+ Esthetic App Store version
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/prepare-a-esthetic-apple.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Wait for deployment and prepare App Store version
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/signing/management/commands/prepare_a_esthetic_apple.py"; then
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              echo 'Prepare command never appeared in production.' >&2
+              exit 2
+            fi
+            sleep 5
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py prepare_a_esthetic_apple"

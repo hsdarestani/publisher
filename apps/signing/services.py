@@ -14,7 +14,6 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from dateutil.parser import isoparse
-from django.db import transaction
 from django.utils import timezone
 
 from apps.integrations.apple_store import AppleStoreClient
@@ -172,6 +171,9 @@ def ensure_ios_distribution_signing(store_account) -> IOSDistributionCredential:
             "created_at": timezone.now().isoformat(),
         }
     )
+    # Persist immediately after Apple creates the certificate. A later profile
+    # error must never make Publisher forget this private key and consume a
+    # second Apple certificate on retry.
     credential.save()
     return credential
 
@@ -246,5 +248,4 @@ def ensure_ios_app_store_profile(app) -> IOSProvisioningProfile:
 def ensure_ios_signing(app):
     """Idempotently provision both the team certificate and app profile."""
 
-    with transaction.atomic():
-        return ensure_ios_app_store_profile(app)
+    return ensure_ios_app_store_profile(app)

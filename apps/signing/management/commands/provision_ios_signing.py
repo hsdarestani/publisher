@@ -9,7 +9,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("slug")
-        parser.add_argument("--version", default="1.0.0")
+        parser.add_argument("--app-version", default="1.0.0")
         parser.add_argument("--build-number", type=int, default=1)
         parser.add_argument("--no-queue", action="store_true")
 
@@ -33,7 +33,7 @@ class Command(BaseCommand):
 
         release = Release.objects.filter(
             app=app,
-            version_name=options["version"],
+            version_name=options["app_version"],
             build_number=options["build_number"],
         ).first()
         if not release:

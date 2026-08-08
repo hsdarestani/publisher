@@ -1,0 +1,45 @@
+name: Rebuild A+ Solution iOS opaque icon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rebuild-aplus-solution-ios-icon-opaque.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Queue A+ Solution 1.0.0 build 4
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          REBUILD_B64='ZnJvbSBhcHBzLnB1Ymxpc2hlci5tb2RlbHMgaW1wb3J0IE1vYmlsZUFwcCwgUmVsZWFzZSwgQnVpbGQsIEpvYgpmcm9tIGFwcHMucHVibGlzaGVyLnRhc2tzIGltcG9ydCBlbnF1ZXVlX2pvYgoKYXBwID0gTW9iaWxlQXBwLm9iamVjdHMuZ2V0KHNsdWc9J2EtcGx1cy1zb2x1dGlvbicpCmNmZyA9IGRpY3QoYXBwLmJ1aWxkX2NvbmZpZyBvciB7fSkKY2ZnWydpb3NfY29tbWFuZCddID0gJ2Jhc2ggZnJvbnRlbmQvc2NyaXB0cy9idWlsZC1wdWJsaXNoZXItaW9zLW9wYXF1ZS5zaCcKY2ZnWydpb3NfYXJ0aWZhY3QnXSA9ICdmcm9udGVuZC9pb3MvYnVpbGQvZXhwb3J0LyouaXBhJwphcHAuYnVpbGRfY29uZmlnID0gY2ZnCmFwcC5zYXZlKHVwZGF0ZV9maWVsZHM9WydidWlsZF9jb25maWcnLCd1cGRhdGVkX2F0J10pCgpwcmV2aW91cyA9IFJlbGVhc2Uub2JqZWN0cy5maWx0ZXIoYXBwPWFwcCwgdmVyc2lvbl9uYW1lPScxLjAuMCcpLm9yZGVyX2J5KCctYnVpbGRfbnVtYmVyJykuZmlyc3QoKQpkZWZhdWx0cyA9IHsKICAgICdzdGF0dXMnOiAnYnVpbGRpbmcnLAogICAgJ3NvdXJjZV9icmFuY2gnOiAnbWFpbicsCiAgICAnc291cmNlX2NvbW1pdCc6ICdhMzU5M2MyYzJjMjE4YmEwOTBiMTY1NmVlYjcyYTU1YTI2MmY1M2Y0JywKICAgICdhbmRyb2lkX3RyYWNrJzogcHJldmlvdXMuYW5kcm9pZF90cmFjayBpZiBwcmV2aW91cyBlbHNlICdpbnRlcm5hbCcsCiAgICAnYW5kcm9pZF9yb2xsb3V0JzogcHJldmlvdXMuYW5kcm9pZF9yb2xsb3V0IGlmIHByZXZpb3VzIGVsc2UgMSwKICAgICdpb3NfcmVsZWFzZV90eXBlJzogcHJldmlvdXMuaW9zX3JlbGVhc2VfdHlwZSBpZiBwcmV2aW91cyBlbHNlICdtYW51YWwnLAogICAgJ2F1dG9fc3VibWl0JzogRmFsc2UsCiAgICAncmVsZWFzZV9ub3Rlcyc6IHByZXZpb3VzLnJlbGVhc2Vfbm90ZXMgaWYgcHJldmlvdXMgZWxzZSAnJywKfQpyZWxlYXNlLCBjcmVhdGVkID0gUmVsZWFzZS5vYmplY3RzLmdldF9vcl9jcmVhdGUoCiAgICBhcHA9YXBwLAogICAgdmVyc2lvbl9uYW1lPScxLjAuMCcsCiAgICBidWlsZF9udW1iZXI9NCwKICAgIGRlZmF1bHRzPWRlZmF1bHRzLAopCnJlbGVhc2Uuc291cmNlX2JyYW5jaCA9ICdtYWluJwpyZWxlYXNlLnNvdXJjZV9jb21taXQgPSAnYTM1OTNjMmMyYzIxOGJhMDkwYjE2NTZlZWI3MmE1NWEyNjJmNTNmNCcKcmVsZWFzZS5zdGF0dXMgPSAnYnVpbGRpbmcnCnJlbGVhc2UuYXV0b19zdWJtaXQgPSBGYWxzZQpyZWxlYXNlLnNhdmUodXBkYXRlX2ZpZWxkcz1bJ3NvdXJjZV9icmFuY2gnLCdzb3VyY2VfY29tbWl0Jywnc3RhdHVzJywnYXV0b19zdWJtaXQnLCd1cGRhdGVkX2F0J10pCgpidWlsZCwgXyA9IEJ1aWxkLm9iamVjdHMuZ2V0X29yX2NyZWF0ZShyZWxlYXNlPXJlbGVhc2UsIHBsYXRmb3JtPSdpb3MnKQphY3RpdmUgPSBKb2Iub2JqZWN0cy5maWx0ZXIoYnVpbGQ9YnVpbGQsIHR5cGU9J2J1aWxkX2lvcycsIHN0YXR1c19faW49WydxdWV1ZWQnLCdydW5uaW5nJ10pLmV4aXN0cygpCmlmIG5vdCBhY3RpdmU6CiAgICBidWlsZC5zdGF0dXMgPSAncXVldWVkJwogICAgYnVpbGQubG9ncyA9ICcnCiAgICBidWlsZC5leHRlcm5hbF9idWlsZF9pZCA9ICcnCiAgICBidWlsZC5maW5pc2hlZF9hdCA9IE5vbmUKICAgIGJ1aWxkLnNhdmUodXBkYXRlX2ZpZWxkcz1bJ3N0YXR1cycsJ2xvZ3MnLCdleHRlcm5hbF9idWlsZF9pZCcsJ2ZpbmlzaGVkX2F0JywndXBkYXRlZF9hdCddKQogICAgam9iID0gZW5xdWV1ZV9qb2IoCiAgICAgICAgJ2J1aWxkX2lvcycsCiAgICAgICAgYXBwPWFwcCwKICAgICAgICByZWxlYXNlPXJlbGVhc2UsCiAgICAgICAgYnVpbGQ9YnVpbGQsCiAgICAgICAgcGF5bG9hZD17J3NvdXJjZSc6J2ljb24tcmVidWlsZC1vcGFxdWUnfSwKICAgICAgICBhZ2VudD1UcnVlLAogICAgICAgIHBsYXRmb3JtPSdtYWNvcycsCiAgICApCiAgICBwcmludCgnUVVFVUVEJywgam9iLmlkLCByZWxlYXNlLmlkLCBidWlsZC5pZCwgY2ZnWydpb3NfY29tbWFuZCddKQplbHNlOgogICAgcHJpbnQoJ0FMUkVBRFlfQUNUSVZFJywgcmVsZWFzZS5pZCwgYnVpbGQuaWQpCg=='
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$REBUILD_B64' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

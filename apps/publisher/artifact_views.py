@@ -16,8 +16,12 @@ def job_artifact_download(request, pk):
 
     original_name = Path(build.artifact.name).name
     if build.platform == "android":
-        filename = original_name[:-4] + ".aab" if original_name.lower().endswith(".zip") else original_name
-        if not filename.lower().endswith(".aab"):
+        lower_name = original_name.lower()
+        if lower_name.endswith(".aab.zip"):
+            filename = original_name[:-4]
+        elif lower_name.endswith(".aab"):
+            filename = original_name
+        else:
             filename = "app-release.aab"
     elif build.platform == "ios":
         filename = original_name if original_name.lower().endswith(".ipa") else "app-release.ipa"

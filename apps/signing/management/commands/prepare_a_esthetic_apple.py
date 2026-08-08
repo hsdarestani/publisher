@@ -15,14 +15,36 @@ EDITABLE_STATES = {
 
 
 class Command(BaseCommand):
-    help = 'Prepare A+ Esthetic App Store metadata and attach its processed build, without submitting for review.'
+    help = 'Prepare A+ Esthetic App Store metadata and attach a processed build, without submitting for review.'
+
+    def add_arguments(self, parser):
+        parser.add_argument('--app-version', default='1.0.0')
+        parser.add_argument('--build-number', type=int, default=None)
 
     def handle(self, *args, **options):
         app = MobileApp.objects.select_related('apple_account').get(slug='a-esthetic')
-        release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
-        build = release.builds.filter(platform='ios', status='succeeded').first()
+        version_name = options['app_version']
+        build_number = options['build_number']
+
+        releases = Release.objects.filter(app=app, version_name=version_name)
+        if build_number is not None:
+            releases = releases.filter(build_number=build_number)
+        release = releases.order_by('-build_number').first()
+        if not release:
+            requested = f' build {build_number}' if build_number is not None else ''
+            raise CommandError(f'Release {version_name}{requested} does not exist.')
+
+        build = (
+            release.builds
+            .filter(platform='ios', status='succeeded')
+            .exclude(external_build_id='')
+            .order_by('-finished_at', '-created_at')
+            .first()
+        )
         if not build or not build.external_build_id:
-            raise CommandError('Processed iOS build is not available yet.')
+            raise CommandError(
+                f'Processed iOS build is not available for {version_name} ({release.build_number}).'
+            )
         if not app.apple_account_id or not app.apple_account.configured:
             raise CommandError('Apple account is not configured.')
 
@@ -121,3 +143,4 @@ class Command(BaseCommand):
         self.stdout.write(f"version_id={version['id']}")
         self.stdout.write(f"build_id={build.external_build_id}")
         self.stdout.write(f"version_string={release.version_name}")
+        self.stdout.write(f"build_number={release.build_number}")

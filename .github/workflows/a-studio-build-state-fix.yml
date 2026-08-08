@@ -1,0 +1,88 @@
+name: Normalize A+ Studio build state
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/a-studio-build-state-fix.yml'
+      - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/urls.py'
+      - 'apps/publisher/test_agent_completion.py'
+      - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build-state-fix.yml'
+      - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/urls.py'
+      - 'apps/publisher/test_agent_completion.py'
+      - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate completion-state fix
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py test apps.publisher.test_agent_completion
+          python manage.py help normalize_a_studio_artifacts >/dev/null
+          python -m py_compile apps/publisher/agent_completion.py apps/signing/management/commands/normalize_a_studio_artifacts.py
+
+  normalize:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Wait for exact Publisher revision to be live
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            STATE="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy.yml --branch main --limit 30 \
+              --json headSha,status,conclusion \
+              --jq ".[] | select(.headSha == \"$GITHUB_SHA\") | [.status, (.conclusion // \"\")] | @tsv" | head -n 1)"
+            if [ "$STATE" = $'completed\tsuccess' ]; then
+              exit 0
+            fi
+            if printf '%s' "$STATE" | grep -q $'^completed\t'; then
+              echo "Publisher deploy failed for $GITHUB_SHA: $STATE" >&2
+              exit 2
+            fi
+            sleep 5
+          done
+          echo "Publisher deploy was not confirmed for $GITHUB_SHA." >&2
+          exit 3
+
+      - name: Restore successful A+ Studio build state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py normalize_a_studio_artifacts --app-version 1.0.0 --build-number 1"
+          echo '--- final production diagnosis ---'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --diagnose-only"

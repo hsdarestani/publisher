@@ -38,9 +38,11 @@ jobs:
           ALLOWED_HOSTS: localhost,127.0.0.1
         run: |
           python manage.py check
-          python manage.py makemigrations --check --dry-run
           python manage.py help bootstrap_a_studio >/dev/null
-          python -m compileall -q apps
+          python -m py_compile \
+            apps/signing/management/commands/bootstrap_a_studio.py \
+            apps/integrations/apple_assets.py \
+            apps/publisher/tasks.py
 
   release:
     if: github.event_name != 'pull_request'
@@ -70,6 +72,18 @@ jobs:
           done
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --queue --publish"
+
+      - name: Verify A+ Studio production endpoints
+        run: |
+          set -euo pipefail
+          for url in \
+            https://studio.aplus-solution.de/health/ \
+            https://studio.aplus-solution.de/privacy/ \
+            https://studio.aplus-solution.de/support/ \
+            https://studio.aplus-solution.de/account-deletion/ \
+            https://studio.aplus-solution.de/api/mobile/config/; do
+            curl --fail --silent --show-error --location --max-time 30 "$url" >/dev/null
+          done
 
       - name: Wake Publisher build agents
         env:

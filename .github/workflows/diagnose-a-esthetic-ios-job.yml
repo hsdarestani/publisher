@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Read non-secret iOS job state
+      - name: Read non-secret iOS job state and latest failure
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -24,4 +24,4 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Job,BuildAgent; a=MobileApp.objects.get(slug='a-esthetic'); js=Job.objects.filter(app=a,type='build_ios').order_by('-created_at')[:6]; print('IOS_JOB_STATE'); [print('job',j.id,j.status,'started',j.started_at,'finished',j.finished_at,'build',getattr(j.build,'status',None)) for j in js]; [print('agent',x.id,x.name,'current_job',x.current_job_id,'last_seen',x.last_seen_at) for x in BuildAgent.objects.filter(platform__in=['macos','universal'])]\""
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Job,BuildAgent; a=MobileApp.objects.get(slug='a-esthetic'); js=Job.objects.filter(app=a,type='build_ios').order_by('-created_at')[:6]; print('IOS_JOB_STATE'); [print('job',j.id,j.status,'started',j.started_at,'finished',j.finished_at,'build',getattr(j.build,'status',None)) for j in js]; j=Job.objects.filter(app=a,type='build_ios').order_by('-created_at').first(); print('LATEST_ERROR'); print((j.error or '')[-4000:]); print('LATEST_LOGS'); print((j.logs or '')[-12000:]); [print('agent',x.id,x.name,'current_job',x.current_job_id,'last_seen',x.last_seen_at) for x in BuildAgent.objects.filter(platform__in=['macos','universal'])]\""

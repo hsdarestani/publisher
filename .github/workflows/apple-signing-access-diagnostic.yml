@@ -1,0 +1,30 @@
+name: Check Apple signing API access
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apple-signing-access-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check Apple certificate/profile API permissions without exposing credentials
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          CODE="from apps.publisher.models import MobileApp; from apps.integrations.apple_store import AppleStoreClient; a=MobileApp.objects.get(slug='a-esthetic'); c=AppleStoreClient(a.apple_account); \ntry:\n d=c.request('GET','/certificates?filter[certificateType]=DISTRIBUTION&limit=1'); print('apple_certificates_access=yes'); print('distribution_certificates_visible='+str(len(d.get('data',[]))))\nexcept Exception as e:\n m=str(e); print('apple_certificates_access=no'); print('apple_certificates_error=' + ('forbidden' if '403' in m else ('unauthorized' if '401' in m else 'other')))"
+          CHECK=$(printf '%b' "$CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$CHECK' | base64 -d | docker compose exec -T web python manage.py shell"

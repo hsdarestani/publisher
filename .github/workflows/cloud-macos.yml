@@ -46,7 +46,8 @@ jobs:
           npm --version
           sw_vers
           xcodebuild -version
-          xcrun --find iTMSTransporter
+          xcrun --find altool
+          xcrun altool --help >/dev/null
 
       - name: Wait for Publisher health
         run: |
@@ -64,7 +65,7 @@ jobs:
           PUBLISHER_MAX_JOBS: '3'
         run: |
           set +e
-          python agents/custom_cloud_macos.py 2>&1 | tee /tmp/cloud-mac.log
+          python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/cloud-mac.log
           AGENT_EXIT=${PIPESTATUS[0]}
           if [ "$AGENT_EXIT" -ne 0 ]; then
             echo "--- Publisher diagnostic response ---" | tee -a /tmp/cloud-mac.log
@@ -101,7 +102,7 @@ jobs:
               title: ok ? 'A+ Cloud Mac healthy' : 'A+ Cloud Mac failed',
               state: ok ? 'closed' : 'open',
               body: (ok
-                ? '✅ GitHub provisioned a real macOS runner, Xcode and Transporter were available, OIDC authentication to Publisher succeeded, and the agent checked the iOS queue.'
+                ? '✅ GitHub provisioned a real macOS runner, Xcode and altool were available, OIDC authentication to Publisher succeeded, and the agent checked the iOS queue.'
                 : '### Cloud Mac failure\n\n```text\n' + log + '\n```')
                 + '\n\nWorkflow run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
             });

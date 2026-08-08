@@ -29,16 +29,3 @@ jobs:
           CHECK=$(printf '%s' "$CODE" | base64 -w0)
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && printf '%s' '$CHECK' | base64 -d | docker compose exec -T web python manage.py shell"
-
-      - name: Check production demo login without exposing credentials
-        env:
-          HOST: ${{ secrets.HOST }}
-          PASS: ${{ secrets.PASS }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        run: |
-          set -euo pipefail
-          PORT="${SSH_PORT:-22}"
-          CODE="from django.contrib.auth import authenticate; u=authenticate(username='demo@a-esthetic.de', password='Aplus-Demo-2026!'); print('default_demo_login='+('yes' if u is not None else 'no'))"
-          CHECK=$(printf '%s' "$CODE" | base64 -w0)
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/a-esthetic && printf '%s' '$CHECK' | base64 -d | docker compose exec -T web python manage.py shell"

@@ -1,0 +1,46 @@
+name: Rebuild A+ Solution iOS icon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rebuild-aplus-solution-ios-icon.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Queue A+ Solution 1.0.0 build 2
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          # Ensure the existing Apple Distribution certificate/profile are ready.
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          REBUILD_B64='ZnJvbSBhcHBzLnB1Ymxpc2hlci5tb2RlbHMgaW1wb3J0IE1vYmlsZUFwcCwgUmVsZWFzZSwgQnVpbGQsIEpvYgpmcm9tIGFwcHMucHVibGlzaGVyLnRhc2tzIGltcG9ydCBlbnF1ZXVlX2pvYgoKYXBwID0gTW9iaWxlQXBwLm9iamVjdHMuZ2V0KHNsdWc9J2EtcGx1cy1zb2x1dGlvbicpCnByZXZpb3VzID0gUmVsZWFzZS5vYmplY3RzLmZpbHRlcihhcHA9YXBwLCB2ZXJzaW9uX25hbWU9JzEuMC4wJykub3JkZXJfYnkoJy1idWlsZF9udW1iZXInKS5maXJzdCgpCmRlZmF1bHRzID0gewogICAgJ3N0YXR1cyc6ICdidWlsZGluZycsCiAgICAnc291cmNlX2JyYW5jaCc6ICdtYWluJywKICAgICdzb3VyY2VfY29tbWl0JzogJ2VjZjJlZGE3Y2E4Nzg0ZGIwNzQ1YWJhOTIyOTE1NTRlYjdkNDc1MjYnLAogICAgJ2FuZHJvaWRfdHJhY2snOiBwcmV2aW91cy5hbmRyb2lkX3RyYWNrIGlmIHByZXZpb3VzIGVsc2UgJ2ludGVybmFsJywKICAgICdhbmRyb2lkX3JvbGxvdXQnOiBwcmV2aW91cy5hbmRyb2lkX3JvbGxvdXQgaWYgcHJldmlvdXMgZWxzZSAxLAogICAgJ2lvc19yZWxlYXNlX3R5cGUnOiBwcmV2aW91cy5pb3NfcmVsZWFzZV90eXBlIGlmIHByZXZpb3VzIGVsc2UgJ21hbnVhbCcsCiAgICAnYXV0b19zdWJtaXQnOiBGYWxzZSwKICAgICdyZWxlYXNlX25vdGVzJzogcHJldmlvdXMucmVsZWFzZV9ub3RlcyBpZiBwcmV2aW91cyBlbHNlICcnLAp9CnJlbGVhc2UsIGNyZWF0ZWQgPSBSZWxlYXNlLm9iamVjdHMuZ2V0X29yX2NyZWF0ZSgKICAgIGFwcD1hcHAsCiAgICB2ZXJzaW9uX25hbWU9JzEuMC4wJywKICAgIGJ1aWxkX251bWJlcj0yLAogICAgZGVmYXVsdHM9ZGVmYXVsdHMsCikKcmVsZWFzZS5zb3VyY2VfYnJhbmNoID0gJ21haW4nCnJlbGVhc2Uuc291cmNlX2NvbW1pdCA9ICdlY2YyZWRhN2NhODc4NGRiMDc0NWFiYTkyMjkxNTU0ZWI3ZDQ3NTI2JwpyZWxlYXNlLnN0YXR1cyA9ICdidWlsZGluZycKcmVsZWFzZS5hdXRvX3N1Ym1pdCA9IEZhbHNlCnJlbGVhc2Uuc2F2ZSh1cGRhdGVfZmllbGRzPVsnc291cmNlX2JyYW5jaCcsJ3NvdXJjZV9jb21taXQnLCdzdGF0dXMnLCdhdXRvX3N1Ym1pdCcsJ3VwZGF0ZWRfYXQnXSkKCmJ1aWxkLCBfID0gQnVpbGQub2JqZWN0cy5nZXRfb3JfY3JlYXRlKHJlbGVhc2U9cmVsZWFzZSwgcGxhdGZvcm09J2lvcycpCmFjdGl2ZSA9IEpvYi5vYmplY3RzLmZpbHRlcihidWlsZD1idWlsZCwgdHlwZT0nYnVpbGRfaW9zJywgc3RhdHVzX19pbj1bJ3F1ZXVlZCcsJ3J1bm5pbmcnXSkuZXhpc3RzKCkKaWYgbm90IGFjdGl2ZToKICAgIGJ1aWxkLnN0YXR1cyA9ICdxdWV1ZWQnCiAgICBidWlsZC5sb2dzID0gJycKICAgIGJ1aWxkLmV4dGVybmFsX2J1aWxkX2lkID0gJycKICAgIGJ1aWxkLmZpbmlzaGVkX2F0ID0gTm9uZQogICAgYnVpbGQuc2F2ZSh1cGRhdGVfZmllbGRzPVsnc3RhdHVzJywnbG9ncycsJ2V4dGVybmFsX2J1aWxkX2lkJywnZmluaXNoZWRfYXQnLCd1cGRhdGVkX2F0J10pCiAgICBqb2IgPSBlbnF1ZXVlX2pvYigKICAgICAgICAnYnVpbGRfaW9zJywKICAgICAgICBhcHA9YXBwLAogICAgICAgIHJlbGVhc2U9cmVsZWFzZSwKICAgICAgICBidWlsZD1idWlsZCwKICAgICAgICBwYXlsb2FkPXsnc291cmNlJzonaWNvbi1yZWJ1aWxkJ30sCiAgICAgICAgYWdlbnQ9VHJ1ZSwKICAgICAgICBwbGF0Zm9ybT0nbWFjb3MnLAogICAgKQogICAgcHJpbnQoJ1FVRVVFRCcsIGpvYi5pZCwgcmVsZWFzZS5pZCwgYnVpbGQuaWQpCmVsc2U6CiAgICBwcmludCgnQUxSRUFEWV9BQ1RJVkUnLCByZWxlYXNlLmlkLCBidWlsZC5pZCkK'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$REBUILD_B64' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

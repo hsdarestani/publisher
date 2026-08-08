@@ -1,0 +1,42 @@
+name: Retry A+ Esthetic App Store upload
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/retry-a-esthetic-apple-upload.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Requeue failed A+ Esthetic Apple upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          CODE="from apps.publisher.models import MobileApp,Job; a=MobileApp.objects.get(slug='a-esthetic'); j=Job.objects.filter(app=a,type='upload_apple',status='failed').order_by('-created_at').first(); assert j is not None, 'No failed A+ Esthetic upload_apple job'; assert j.build_id and bool(j.build.artifact), 'Successful IPA artifact is missing'; j.status='queued'; j.error=''; j.logs=''; j.progress=0; j.started_at=None; j.finished_at=None; j.available_to_agents=True; j.required_platform='macos'; j.save(update_fields=['status','error','logs','progress','started_at','finished_at','available_to_agents','required_platform','updated_at']); print('apple_upload_requeued=yes'); print('job_id='+str(j.id)); print('build_status='+j.build.status)"
+          ENCODED=$(printf '%s' "$CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake altool Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

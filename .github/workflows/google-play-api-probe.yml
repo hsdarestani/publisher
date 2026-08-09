@@ -43,11 +43,10 @@ jobs:
           print('project_id=', info.get('project_id'))
           session = AuthorizedSession(creds)
           failed = False
-          for package in ['de.aplussolution.workforce', 'de.aesthetic.club']:
+          for package in ['de.aplussolution.workforce', 'de.aplusesthetic.app']:
               url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{quote(package, safe='._-')}/edits"
               r = session.post(url, json={}, timeout=60)
               ctype = r.headers.get('content-type', '')
-              detail = ''
               try:
                   detail = json.dumps(r.json(), ensure_ascii=False)[:1600]
               except Exception:

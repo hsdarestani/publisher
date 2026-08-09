@@ -1,0 +1,63 @@
+name: Probe Android Publisher API
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/google-play-api-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe edits.insert for both apps
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+          python -m pip install --disable-pip-version-check google-auth requests
+          python - <<'PY'
+          import json, os
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          raw = os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON']
+          info = json.loads(raw)
+          creds = service_account.Credentials.from_service_account_info(
+              info,
+              scopes=['https://www.googleapis.com/auth/androidpublisher'],
+          )
+          creds.refresh(Request())
+          print('identity=', info.get('client_email'))
+          print('project_id=', info.get('project_id'))
+          session = AuthorizedSession(creds)
+          failed = False
+          for package in ['de.aplussolution.workforce', 'de.aesthetic.club']:
+              url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{quote(package, safe='._-')}/edits"
+              r = session.post(url, json={}, timeout=60)
+              ctype = r.headers.get('content-type', '')
+              detail = ''
+              try:
+                  detail = json.dumps(r.json(), ensure_ascii=False)[:1600]
+              except Exception:
+                  detail = ' '.join(r.text.split())[:1600]
+              print(f'{package}: HTTP {r.status_code} content-type={ctype} detail={detail}')
+              if r.ok:
+                  edit_id = r.json()['id']
+                  d = session.delete(f'{url}/{edit_id}', timeout=30)
+                  print(f'{package}: cleanup HTTP {d.status_code}')
+              else:
+                  failed = True
+          raise SystemExit(1 if failed else 0)
+          PY

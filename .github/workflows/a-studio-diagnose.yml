@@ -30,3 +30,14 @@ jobs:
           echo '--- diagnosis after repair attempt ---'
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --diagnose-only"
+
+      - name: Print latest full App Store submission error
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(app__slug='a-studio', type='submit_apple').order_by('-created_at').first(); print('submit_status=' + (j.status if j else 'missing')); print('submit_error_begin'); print(j.error if j else ''); print('submit_error_end'); print('submit_result=' + repr(j.result if j else {}))\""

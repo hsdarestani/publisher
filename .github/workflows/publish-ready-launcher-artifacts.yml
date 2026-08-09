@@ -1,0 +1,172 @@
+name: Publish ready launcher icon Android builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-ready-launcher-artifacts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: |
+          python -m pip install --disable-pip-version-check google-auth requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Wait for both Publisher Android builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 80); do
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Release; targets=[('solution','1d49500db4b8a02b2a0f1ac01ea314eb82984e00'),('esthetic','c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298')]; [print(n, (r.builds.filter(platform='android').first().status if r and r.builds.filter(platform='android').first() else 'missing')) for n,s in targets for r in [Release.objects.filter(source_commit=s).order_by('-created_at').first()]]\"" 2>&1)"
+            printf '%s\n' "$OUTPUT"
+            if printf '%s\n' "$OUTPUT" | grep -q '^solution succeeded$' && \
+               printf '%s\n' "$OUTPUT" | grep -q '^esthetic succeeded$'; then
+              exit 0
+            fi
+            if printf '%s\n' "$OUTPUT" | grep -Eq '^(solution|esthetic) failed$'; then
+              echo 'A launcher build failed in Publisher.' >&2
+              exit 2
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for both Publisher builds.' >&2
+          exit 3
+
+      - name: Export and verify signed AABs
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Release; import shutil; targets=[('solution','1d49500db4b8a02b2a0f1ac01ea314eb82984e00'),('esthetic','c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298')]; [(lambda r,b,n: (b.status == 'succeeded' or (_ for _ in ()).throw(RuntimeError(f'{n} build status={b.status}')), shutil.copyfile(b.artifact.path, f'/tmp/{n}.aab'), print(f'{n}: release={r.pk} build={r.build_number} artifact={b.artifact.name}')))(r,r.builds.filter(platform='android').first(),n) for n,s in targets for r in [Release.objects.filter(source_commit=s).order_by('-created_at').first()] if r]\" && docker compose cp web:/tmp/solution.aab /tmp/solution.aab >/dev/null && docker compose cp web:/tmp/esthetic.aab /tmp/esthetic.aab >/dev/null"
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/solution.aab /tmp/solution.aab
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/esthetic.aab /tmp/esthetic.aab
+          test -s /tmp/solution.aab
+          test -s /tmp/esthetic.aab
+          jarsigner -verify /tmp/solution.aab >/dev/null
+          jarsigner -verify /tmp/esthetic.aab >/dev/null
+          sha256sum /tmp/solution.aab /tmp/esthetic.aab
+
+      - name: Upload both bundles and commit Google Play Production
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          API = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          UPLOAD = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+          SCOPE = 'https://www.googleapis.com/auth/androidpublisher'
+          apps = [
+              ('A+ Solution', 'de.aplussolution.workforce', '/tmp/solution.aab', '5', '1.0.0'),
+              ('A+ Esthetic', 'de.aplusesthetic.app', '/tmp/esthetic.aab', '4', '1.0.0'),
+          ]
+
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds = service_account.Credentials.from_service_account_info(info, scopes=[SCOPE])
+          creds.refresh(Request())
+          session = AuthorizedSession(creds)
+
+          def require(resp, label):
+              if resp.ok:
+                  return resp.json() if resp.content else {}
+              try:
+                  detail = json.dumps(resp.json(), ensure_ascii=False)
+              except Exception:
+                  detail = ' '.join(resp.text.split())[:3000]
+              raise RuntimeError(f'{label}: HTTP {resp.status_code}: {detail}')
+
+          for name, package, aab, expected_vc, version_name in apps:
+              pkg = quote(package, safe='._-')
+              edit = require(session.post(f'{API}/applications/{pkg}/edits', json={}, timeout=60), f'{name} create edit')
+              edit_id = edit['id']
+              try:
+                  bundle = require(
+                      session.post(
+                          f'{UPLOAD}/applications/{pkg}/edits/{edit_id}/bundles',
+                          params={'uploadType': 'media'},
+                          data=Path(aab).read_bytes(),
+                          headers={'Content-Type': 'application/octet-stream'},
+                          timeout=600,
+                      ),
+                      f'{name} upload bundle',
+                  )
+                  vc = str(bundle['versionCode'])
+                  if vc != expected_vc:
+                      raise RuntimeError(f'{name}: uploaded versionCode={vc}, expected={expected_vc}')
+
+                  require(
+                      session.put(
+                          f'{API}/applications/{pkg}/edits/{edit_id}/tracks/production',
+                          json={
+                              'track': 'production',
+                              'releases': [{
+                                  'name': version_name,
+                                  'versionCodes': [vc],
+                                  'status': 'completed',
+                              }],
+                          },
+                          timeout=60,
+                      ),
+                      f'{name} update production track',
+                  )
+                  require(
+                      session.post(f'{API}/applications/{pkg}/edits/{edit_id}:validate', json={}, timeout=60),
+                      f'{name} validate edit',
+                  )
+                  commit = require(
+                      session.post(
+                          f'{API}/applications/{pkg}/edits/{edit_id}:commit',
+                          params={'changesInReviewBehavior': 'ERROR_IF_IN_REVIEW'},
+                          json={},
+                          timeout=60,
+                      ),
+                      f'{name} commit edit',
+                  )
+                  print(f'SUCCESS {name}: versionCode={vc} committed to Production; edit={commit.get("id", edit_id)}')
+              except Exception:
+                  try:
+                      session.delete(f'{API}/applications/{pkg}/edits/{edit_id}', timeout=30)
+                  except Exception:
+                      pass
+                  raise
+          PY
+
+      - name: Reconcile successful cloud uploads in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from django.utils import timezone; from apps.publisher.models import Release,Job,Submission; targets=[('1d49500db4b8a02b2a0f1ac01ea314eb82984e00','5'),('c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298','4')]; [(lambda r,b,vc: (Job.objects.filter(release=r,type='upload_google',status='failed').update(status='cancelled',error='Superseded by successful Google Play cloud upload.'), Job.objects.create(app=r.app,release=r,build=b,type='upload_google',status='succeeded',progress=100,result={'executor':'github-actions','version_code':vc},logs='Google Play Production update committed successfully from GitHub cloud edge.',started_at=timezone.now(),finished_at=timezone.now()), Submission.objects.update_or_create(app=r.app,release=r,platform='android',defaults={'state':'in_review','submitted_at':timezone.now(),'raw':{'executor':'github-actions','version_code':vc}}), setattr(r,'status','in_review'), r.save(update_fields=['status','updated_at']), print(f'{r.app.slug}: release={r.pk} build={r.build_number} marked in_review')))(r,r.builds.filter(platform='android',status='succeeded').first(),vc) for s,vc in targets for r in [Release.objects.filter(source_commit=s).order_by('-created_at').first()] if r]\""

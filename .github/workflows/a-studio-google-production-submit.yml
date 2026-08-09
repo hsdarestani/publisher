@@ -1,0 +1,227 @@
+name: Submit A+ Studio to Google Play production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-google-production-submit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-studio-google-production-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      PACKAGE_NAME: de.aplussolution.studio
+      VERSION_NAME: 1.0.0
+      BUILD_NUMBER: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install --disable-pip-version-check 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Fetch the signed AAB from A+ Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+
+          META="$(${SSH[@]} 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug=\"a-studio\"); r=Release.objects.get(app=a,version_name=\"1.0.0\",build_number=1); b=r.builds.get(platform=\"android\"); print(\"META|\"+b.status+\"|\"+str(b.artifact.path)+\"|\"+str(b.artifact_checksum or \"\"))"' | grep '^META|' | tail -1)"
+          IFS='|' read -r _ STATUS ARTIFACT_PATH EXPECTED_SHA <<< "$META"
+          test "$STATUS" = succeeded || { echo "::error::Publisher Android build is not succeeded: $STATUS"; exit 2; }
+          test -n "$ARTIFACT_PATH" || { echo "::error::Publisher AAB artifact path is empty"; exit 2; }
+
+          echo "Publisher artifact: $ARTIFACT_PATH"
+          ${SSH[@]} "cd /opt/aplus-publisher && docker compose exec -T web cat '$ARTIFACT_PATH'" > a-studio-release.aab
+          test -s a-studio-release.aab || { echo "::error::Downloaded AAB is empty"; exit 2; }
+
+          ACTUAL_SHA="$(sha256sum a-studio-release.aab | awk '{print $1}')"
+          echo "AAB bytes: $(stat -c%s a-studio-release.aab)"
+          echo "AAB sha256: $ACTUAL_SHA"
+          if [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            echo "::error::AAB checksum mismatch (Publisher=$EXPECTED_SHA runner=$ACTUAL_SHA)"
+            exit 2
+          fi
+          echo "AAB_SHA256=$ACTUAL_SHA" >> "$GITHUB_ENV"
+
+      - name: Upload AAB and submit Production release for review
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" || { echo "::error::GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing"; exit 2; }
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import quote
+
+          import requests
+          from google.auth.transport.requests import AuthorizedSession, Request
+          from google.oauth2 import service_account
+
+          package = os.environ['PACKAGE_NAME']
+          version_name = os.environ['VERSION_NAME']
+          expected_version_code = os.environ['BUILD_NUMBER']
+          raw = os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON']
+          info = json.loads(raw)
+          creds = service_account.Credentials.from_service_account_info(
+              info,
+              scopes=['https://www.googleapis.com/auth/androidpublisher'],
+          )
+          creds.refresh(Request())
+          session = AuthorizedSession(creds)
+          api = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          upload = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+          q = lambda value: quote(str(value), safe='._-')
+
+          def require(resp, label):
+              if not resp.ok:
+                  try:
+                      detail = json.dumps(resp.json(), ensure_ascii=False)
+                  except Exception:
+                      detail = ' '.join(resp.text.replace('\n', ' ').split())[:4000]
+                  raise RuntimeError(f'{label}: HTTP {resp.status_code} {detail}')
+              return resp.json() if resp.content else {}
+
+          edit = require(
+              session.post(f'{api}/applications/{q(package)}/edits', json={}, timeout=60),
+              'Create edit',
+          )
+          edit_id = edit['id']
+          print('edit_id=' + edit_id)
+
+          try:
+              bundles = require(
+                  session.get(
+                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}/bundles',
+                      timeout=60,
+                  ),
+                  'List existing bundles',
+              ).get('bundles', [])
+
+              bundle = next(
+                  (item for item in bundles if str(item.get('versionCode')) == str(expected_version_code)),
+                  None,
+              )
+              if bundle:
+                  print(f'bundle_reused=true version_code={bundle["versionCode"]}')
+              else:
+                  data = Path('a-studio-release.aab').read_bytes()
+                  resp = session.post(
+                      f'{upload}/applications/{q(package)}/edits/{q(edit_id)}/bundles',
+                      params={'uploadType': 'media'},
+                      data=data,
+                      headers={'Content-Type': 'application/octet-stream'},
+                      timeout=600,
+                  )
+                  bundle = require(resp, 'Upload AAB')
+                  print(f'bundle_uploaded=true version_code={bundle["versionCode"]}')
+
+              version_code = str(bundle['versionCode'])
+              if version_code != str(expected_version_code):
+                  raise RuntimeError(
+                      f'Unexpected Android versionCode {version_code}; expected {expected_version_code}.'
+                  )
+
+              track_body = {
+                  'track': 'production',
+                  'releases': [{
+                      'name': version_name,
+                      'versionCodes': [version_code],
+                      'status': 'completed',
+                      'releaseNotes': [{
+                          'language': 'de-DE',
+                          'text': 'Erste Version von A+ Studio mit AI Builder, Projektverwaltung, Preview, Publishing und Store-Anfragen.',
+                      }],
+                  }],
+              }
+              require(
+                  session.put(
+                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}/tracks/production',
+                      json=track_body,
+                      timeout=60,
+                  ),
+                  'Update Production track',
+              )
+              require(
+                  session.post(
+                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}:validate',
+                      json={},
+                      timeout=60,
+                  ),
+                  'Validate production edit',
+              )
+              committed = require(
+                  session.post(
+                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}:commit',
+                      json={},
+                      timeout=60,
+                  ),
+                  'Commit production edit / send for review',
+              )
+              Path('google-production-result.json').write_text(
+                  json.dumps({
+                      'success': True,
+                      'package_name': package,
+                      'track': 'production',
+                      'version_name': version_name,
+                      'version_code': version_code,
+                      'bundle': bundle,
+                      'edit': committed,
+                      'aab_sha256': os.environ.get('AAB_SHA256', ''),
+                  }, indent=2, ensure_ascii=False),
+                  encoding='utf-8',
+              )
+              print('GOOGLE_PRODUCTION_SUBMITTED=true')
+              print('version_code=' + version_code)
+          except Exception:
+              try:
+                  session.delete(
+                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}',
+                      timeout=30,
+                  )
+              except Exception:
+                  pass
+              raise
+          PY
+
+      - name: Sync successful Google submission back into Publisher
+        if: success()
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          RESULT="$(tr -d '\n' < google-production-result.json | sed "s/'/'\\''/g")"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import json; from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=1); raw=json.loads('$RESULT'); Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review','external_id':str(raw.get('version_code','')),'submitted_at':timezone.now(),'raw':raw}); r.status='in_review'; r.save(update_fields=['status','updated_at']); print('publisher_google_submission_synced=true')\""
+
+      - name: Upload sanitized production result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-studio-google-production-result
+          path: google-production-result.json
+          if-no-files-found: ignore
+          retention-days: 14

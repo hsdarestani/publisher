@@ -125,4 +125,4 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"
 
-# Release resume trigger: Store records created in App Store Connect and Google Play Console on 2026-08-09.
+# Release resume trigger: Apple binary is VALID and Publisher now aligns the editable App Store version with 1.0.0.

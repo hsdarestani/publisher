@@ -30,6 +30,7 @@ class Command(BaseCommand):
         parser.add_argument("--queue", action="store_true", help="Create/reuse releases and queue Android builds.")
         parser.add_argument("--recover", action="store_true", help="Cancel interrupted build jobs and queue clean replacements.")
         parser.add_argument("--publish", action="store_true", help="Queue Google Play upload once the Android build succeeds.")
+        parser.add_argument("--retry-upload", action="store_true", help="Cancel prior failed Google upload jobs so a clean retry can be queued.")
         parser.add_argument("--diagnose", action="store_true", help="Print the latest Android build/upload errors and log tails.")
         parser.add_argument(
             "--target",
@@ -39,7 +40,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if not any(options[name] for name in ("queue", "recover", "publish", "diagnose")):
+        if not any(options[name] for name in ("queue", "recover", "publish", "retry_upload", "diagnose")):
             options["queue"] = True
 
         selected = set(options.get("target") or [item["key"] for item in TARGETS])
@@ -62,6 +63,9 @@ class Command(BaseCommand):
                 elif options["queue"]:
                     self._queue_build(app, release)
 
+                if options["retry_upload"]:
+                    self._recover_upload(release)
+
                 if options["publish"]:
                     self._queue_publish(app, release)
 
@@ -71,7 +75,7 @@ class Command(BaseCommand):
                 if options["diagnose"]:
                     self._diagnose(target["key"], release)
 
-                if not options["diagnose"] and not options["recover"] and (
+                if not options["diagnose"] and not options["recover"] and not options["retry_upload"] and (
                     "build_android=failed" in line or "upload_google=failed" in line
                 ):
                     failures.append(line)
@@ -160,23 +164,44 @@ class Command(BaseCommand):
 
         build.status = "queued"
         build.logs = ""
-        build.error = ""
         build.started_at = None
         build.finished_at = None
+        build.agent = None
+        build.commit_sha = ""
         build.artifact = ""
-        build.artifact_sha256 = ""
+        build.artifact_size = 0
+        build.artifact_checksum = ""
+        build.external_build_id = ""
+        build.metadata = {}
         build.save(
             update_fields=[
                 "status",
                 "logs",
-                "error",
                 "started_at",
                 "finished_at",
+                "agent",
+                "commit_sha",
                 "artifact",
-                "artifact_sha256",
+                "artifact_size",
+                "artifact_checksum",
+                "external_build_id",
+                "metadata",
                 "updated_at",
             ]
         )
+
+    def _recover_upload(self, release):
+        failed = Job.objects.filter(
+            release=release,
+            type="upload_google",
+            status="failed",
+        )
+        count = failed.update(
+            status="cancelled",
+            error="Superseded by clean Google Play upload retry.",
+        )
+        if count:
+            self.stdout.write(f"Recovered release {release.pk}: cancelled {count} failed Google upload job(s).")
 
     def _queue_build(self, app, release):
         build = release.builds.filter(platform="android").first()
@@ -195,16 +220,16 @@ class Command(BaseCommand):
         if build.status in {"failed", "cancelled"}:
             build.status = "queued"
             build.logs = ""
-            build.error = ""
             build.started_at = None
             build.finished_at = None
+            build.agent = None
             build.save(
                 update_fields=[
                     "status",
                     "logs",
-                    "error",
                     "started_at",
                     "finished_at",
+                    "agent",
                     "updated_at",
                 ]
             )

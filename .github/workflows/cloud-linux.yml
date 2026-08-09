@@ -22,7 +22,9 @@ permissions:
 
 concurrency:
   group: aplus-cloud-linux
-  cancel-in-progress: true
+  # A build can take longer than the five-minute scheduler cadence. Queue the
+  # next agent instead of killing an Android bundle halfway through signing.
+  cancel-in-progress: false
 
 jobs:
   cloud-linux-agent:

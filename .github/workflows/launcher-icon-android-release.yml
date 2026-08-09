@@ -1,0 +1,83 @@
+name: Release fixed Android launcher icons
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/launcher-icon-android-release.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+    steps:
+      - name: Wait for Publisher command in production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/signing/management/commands/release_launcher_icon_updates.py"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Launcher icon release command did not appear in Publisher production.' >&2
+          exit 2
+
+      - name: Queue Solution and Esthetic Android builds in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --queue"
+
+      - name: Wake A+ Cloud Linux
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Build and publish both updates to Google Play production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 70); do
+            echo "=== Publisher pass $i ==="
+            set +e
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --publish" 2>&1)"
+            RC=$?
+            set -e
+            printf '%s\n' "$OUTPUT"
+            if [ "$RC" -ne 0 ]; then
+              echo 'Publisher reported a failed Android build or Google Play upload.' >&2
+              exit "$RC"
+            fi
+            SUCCEEDED="$(printf '%s\n' "$OUTPUT" | grep -c 'upload_google=succeeded' || true)"
+            if [ "$SUCCEEDED" -ge 2 ]; then
+              echo 'Both launcher-icon updates were uploaded and committed to Google Play production.'
+              exit 0
+            fi
+            sleep 20
+          done
+          echo 'Timed out waiting for both Google Play production updates.' >&2
+          exit 3

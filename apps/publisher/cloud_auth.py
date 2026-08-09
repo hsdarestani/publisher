@@ -18,13 +18,16 @@ _GITHUB_JWKS = PyJWKClient(f"{_GITHUB_OIDC_ISSUER}/.well-known/jwks")
 _AGENT_CONFIG = {
     "macos": {
         "name": "A+ Cloud Mac · GitHub Actions",
-        "workflow": ".github/workflows/cloud-macos.yml@",
+        "workflows": [".github/workflows/cloud-macos.yml@"],
         "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},
     },
     "linux": {
         "name": "A+ Cloud Linux · GitHub Actions",
-        "workflow": ".github/workflows/cloud-linux.yml@",
+        "workflows": [
+            ".github/workflows/cloud-linux.yml@",
+            ".github/workflows/publish-launcher-fixes-via-cloud.yml@",
+        ],
         "labels": ["github-hosted", "ephemeral", "flutter", "android", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "android": True},
     },
@@ -123,7 +126,10 @@ def github_cloud_agent(request):
         return None
 
     workflow_ref = claims.get("workflow_ref", "")
-    if workflow_ref and config["workflow"] not in workflow_ref:
+    allowed_workflows = config.get("workflows", [])
+    if workflow_ref and allowed_workflows and not any(
+        workflow in workflow_ref for workflow in allowed_workflows
+    ):
         return None
 
     token_hash = hashlib.sha256(

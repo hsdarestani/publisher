@@ -57,9 +57,12 @@ class AppleStoreClient:
         return next(iter(data.get("data", [])), None)
 
     def list_versions(self, app_id: str, platform="IOS", limit=50):
+        # Apple supports platform filtering and limit on this relationship, but no
+        # sort query parameter. Preserve the API's returned order and select an
+        # editable draft explicitly in ensure_version().
         return self.request(
             "GET",
-            f"/apps/{app_id}/appStoreVersions?filter[platform]={platform}&limit={limit}&sort=-createdDate",
+            f"/apps/{app_id}/appStoreVersions?filter[platform]={platform}&limit={limit}",
         ).get("data", [])
 
     def update_version_string(self, version_id: str, version: str):

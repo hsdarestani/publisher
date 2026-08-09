@@ -1,0 +1,166 @@
+name: Recover and publish launcher icon updates
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/launcher-icon-recover-and-publish.yml'
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+jobs:
+  recover-release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stop stale Android agents and old launcher orchestrator
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const oldOrchestrator = 31305487096;
+            try {
+              await github.rest.actions.cancelWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: oldOrchestrator,
+              });
+            } catch (e) {
+              core.info(`Old orchestrator already stopped: ${e.message}`);
+            }
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              per_page: 30,
+            });
+            for (const run of runs.data.workflow_runs) {
+              if (run.status !== 'completed') {
+                core.info(`Cancelling stale Cloud Linux run ${run.id} (${run.status})`);
+                try {
+                  await github.rest.actions.cancelWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: run.id,
+                  });
+                } catch (e) {
+                  core.info(`Could not cancel ${run.id}: ${e.message}`);
+                }
+              }
+            }
+
+      - name: Set up build tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install agent and SSH dependencies
+        run: |
+          pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Deploy recovery-aware Publisher source
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          PUBLISHER_GITHUB_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_COMPLIANCE_MODEL: ${{ vars.OPENAI_COMPLIANCE_MODEL }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          tar --exclude=.git --exclude=.env -czf /tmp/aplus-publisher.tar.gz .
+          : > /tmp/aplus-publisher-overrides.env
+          [ -n "$ADMIN_EMAIL" ] && printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$PUBLISHER_GITHUB_TOKEN" ] && printf 'PUBLISHER_GITHUB_TOKEN=%s\n' "$PUBLISHER_GITHUB_TOKEN" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$OPENAI_API_KEY" ] && printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$OPENAI_COMPLIANCE_MODEL" ] && printf 'OPENAI_COMPLIANCE_MODEL=%s\n' "$OPENAI_COMPLIANCE_MODEL" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no \
+            /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh \
+            root@"$HOST":/tmp/
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+          curl --fail --silent --show-error \
+            --retry 18 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/
+
+      - name: Reset interrupted launcher builds and queue clean jobs
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --recover --queue"
+
+      - name: Build signed AABs on this runner
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '6'
+          PUBLISHER_POLL_INTERVAL: '5'
+          PUBLISHER_WATCH_SECONDS: '45'
+        run: python agents/custom_cloud_linux.py
+
+      - name: Publish both releases to Google Play production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            set +e
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --publish" 2>&1)"
+            RC=$?
+            set -e
+            printf '%s\n' "$OUTPUT"
+            if [ "$RC" -ne 0 ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --diagnose" || true
+              exit "$RC"
+            fi
+            SUCCEEDED="$(printf '%s\n' "$OUTPUT" | grep -c 'upload_google=succeeded' || true)"
+            if [ "$SUCCEEDED" -ge 2 ]; then
+              echo 'SUCCESS: A+ Solution and A+ Esthetic launcher-icon updates were committed to Google Play production.'
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'Timed out waiting for Google Play uploads.' >&2
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --diagnose" || true
+          exit 3

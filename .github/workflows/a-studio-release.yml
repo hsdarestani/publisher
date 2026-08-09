@@ -124,3 +124,5 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"
+
+# Release resume trigger: Store records created in App Store Connect and Google Play Console on 2026-08-09.

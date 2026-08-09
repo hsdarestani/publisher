@@ -41,3 +41,34 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(app__slug='a-studio', type='submit_apple').order_by('-created_at').first(); print('submit_status=' + (j.status if j else 'missing')); print('submit_error_begin'); print(j.error if j else ''); print('submit_error_end'); print('submit_result=' + repr(j.result if j else {}))\""
+
+      - name: Inspect App Store app info and age-rating declaration
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app = MobileApp.objects.get(slug="a-studio")
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          fresh_app = client.request("GET", f"/apps/{record['id']}?fields[apps]=name,bundleId,contentRightsDeclaration,primaryLocale")
+          print("app_info_begin")
+          print(json.dumps(fresh_app, indent=2, sort_keys=True))
+          print("app_info_end")
+
+          infos = client.request(
+              "GET",
+              f"/apps/{record['id']}/appInfos?limit=10&include=ageRatingDeclaration",
+          )
+          print("age_rating_info_begin")
+          print(json.dumps(infos, indent=2, sort_keys=True))
+          print("age_rating_info_end")
+          PY

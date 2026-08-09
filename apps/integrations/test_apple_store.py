@@ -51,7 +51,7 @@ class AppleStoreVersionAlignmentTests(SimpleTestCase):
         def request(method, path, **kwargs):
             if path == "/apps/app-1/appStoreVersions?filter[versionString]=1.0.0&limit=10":
                 return {"data": []}
-            if path == "/apps/app-1/appStoreVersions?filter[platform]=IOS&limit=50&sort=-createdDate":
+            if path == "/apps/app-1/appStoreVersions?filter[platform]=IOS&limit=50":
                 return {"data": [draft]}
             if method == "PATCH" and path == "/appStoreVersions/version-draft":
                 body = json.loads(kwargs["data"])
@@ -76,7 +76,7 @@ class AppleStoreVersionAlignmentTests(SimpleTestCase):
         def request(method, path, **kwargs):
             if path == "/apps/app-1/appStoreVersions?filter[versionString]=1.0.0&limit=10":
                 return {"data": []}
-            if path == "/apps/app-1/appStoreVersions?filter[platform]=IOS&limit=50&sort=-createdDate":
+            if path == "/apps/app-1/appStoreVersions?filter[platform]=IOS&limit=50":
                 return {
                     "data": [
                         {

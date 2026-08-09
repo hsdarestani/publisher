@@ -1,0 +1,109 @@
+name: Apply A+ Studio Google Play compliance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/a-studio-google-compliance.yml'
+      - 'apps/signing/management/commands/apply_a_studio_google_compliance.py'
+      - 'apps/compliance/**'
+      - 'apps/integrations/google_play.py'
+      - 'apps/integrations/google_play_cloud.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-google-compliance.yml'
+      - 'apps/signing/management/commands/apply_a_studio_google_compliance.py'
+      - 'apps/compliance/**'
+      - 'apps/integrations/google_play.py'
+      - 'apps/integrations/google_play_cloud.py'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate Google compliance command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help apply_a_studio_google_compliance >/dev/null
+          python -m py_compile \
+            apps/signing/management/commands/apply_a_studio_google_compliance.py \
+            apps/compliance/services.py \
+            apps/compliance/tasks.py \
+            apps/integrations/google_play.py \
+            apps/integrations/google_play_cloud.py
+
+  apply:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Wait for command to reach Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 120); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/signing/management/commands/apply_a_studio_google_compliance.py"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'A+ Studio Google compliance command never appeared in production.' >&2
+          exit 2
+
+      - name: Apply API-managed Google Play sections through Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py apply_a_studio_google_compliance"
+
+      - name: Wait for direct or cloud Google Play result
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          terminal=''
+          for i in $(seq 1 60); do
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-studio'); r=a.compliance.runs.filter(action='apply').order_by('-created_at').first(); print('run_id='+str(r.pk)); print('status='+r.status); print('progress='+str(r.progress)); print('error='+((r.error or '').replace(chr(10),' ')[:1200])); print('result='+__import__('json').dumps(r.result or {}, ensure_ascii=False, sort_keys=True)[:5000])\"")"
+            printf '%s\n' "$OUTPUT"
+            terminal="$(printf '%s\n' "$OUTPUT" | sed -n 's/^status=//p' | tail -n 1)"
+            case "$terminal" in
+              succeeded|partial|failed) break ;;
+            esac
+            sleep 10
+          done
+          if [ "$terminal" = failed ] || [ -z "$terminal" ] || [ "$terminal" = running ] || [ "$terminal" = queued ]; then
+            echo "Google compliance operation did not finish successfully: status=$terminal" >&2
+            exit 2
+          fi

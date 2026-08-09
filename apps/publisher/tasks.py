@@ -7,7 +7,11 @@ from django.utils import timezone
 from .models import Job, MobileApp, Release, Build, Submission
 from .readiness import evaluate_release
 from .review_contacts import apple_review_contact
-from .store_compliance import apple_uses_non_exempt_encryption
+from .store_compliance import (
+    apple_age_rating_profile,
+    apple_content_rights_declaration,
+    apple_uses_non_exempt_encryption,
+)
 
 
 def enqueue_job(job_type, *, app=None, release=None, build=None, payload=None, agent=False, platform=""):
@@ -93,16 +97,20 @@ def handle_submit_google(job):
 
 def handle_submit_apple(job):
     from apps.integrations.apple_assets import sync_app_store_screenshots
+    from apps.integrations.apple_compliance import apply_app_store_compliance
     from apps.integrations.apple_store import AppleStoreClient
+
     release, app = job.release, job.release.app
     if not app.apple_account or not app.apple_account.configured:
         raise RuntimeError("Apple account is not configured.")
     build = job.build or release.builds.filter(platform="ios", status="succeeded").first()
     if not build or not build.external_build_id:
         raise RuntimeError("A processed App Store build ID is required. Run the macOS upload job first.")
+
     client = AppleStoreClient(app.apple_account)
     record = client.find_app(app.bundle_id)
     version = client.ensure_version(record["id"], release.version_name)
+
     for loc in app.localizations.all():
         client.set_localization(version["id"], loc)
     screenshot_result = sync_app_store_screenshots(
@@ -111,18 +119,41 @@ def handle_submit_apple(job):
         app.localizations.all(),
         app.assets.filter(kind="screenshot", platform="ios"),
     )
+
+    app_compliance = apply_app_store_compliance(
+        client,
+        record["id"],
+        content_rights=apple_content_rights_declaration(app),
+        age_rating=apple_age_rating_profile(app),
+    )
+
     encryption_answer = apple_uses_non_exempt_encryption(app)
     if encryption_answer is not None:
         client.set_build_uses_non_exempt_encryption(build.external_build_id, encryption_answer)
+
     client.attach_build(version["id"], build.external_build_id)
     contact = apple_review_contact(app)
     client.set_review_details(version["id"], app, contact=contact or None)
     result = client.submit_version(record["id"], version["id"])
     result["screenshots"] = screenshot_result
+    result["app_compliance"] = app_compliance
     if encryption_answer is not None:
         result["uses_non_exempt_encryption"] = encryption_answer
-    Submission.objects.update_or_create(app=app, release=release, platform="ios", defaults={"state": "in_review", "external_id": result["submission"]["id"], "submitted_at": timezone.now(), "raw": result})
-    release.status = "in_review"; release.readiness_snapshot = evaluate_release(release); release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
+
+    Submission.objects.update_or_create(
+        app=app,
+        release=release,
+        platform="ios",
+        defaults={
+            "state": "in_review",
+            "external_id": result["submission"]["id"],
+            "submitted_at": timezone.now(),
+            "raw": result,
+        },
+    )
+    release.status = "in_review"
+    release.readiness_snapshot = evaluate_release(release)
+    release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
     return result
 
 @shared_task

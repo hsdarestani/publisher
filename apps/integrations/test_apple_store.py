@@ -21,9 +21,7 @@ class AppleStoreVersionAlignmentTests(SimpleTestCase):
                 "appStoreState": "PREPARE_FOR_SUBMISSION",
             },
         }
-        client.request = Mock(
-            return_value={"data": [exact]},
-        )
+        client.request = Mock(return_value={"data": [exact]})
 
         result = client.ensure_version("app-1", "1.0.0")
 
@@ -142,3 +140,27 @@ class AppleStoreVersionAlignmentTests(SimpleTestCase):
         self.assertEqual(first_attrs["whatsNew"], "Erste Version")
         self.assertNotIn("whatsNew", retry_attrs)
         self.assertEqual(retry_attrs["description"], "Beschreibung")
+
+    def test_build_encryption_setting_uses_build_update_request(self):
+        client = self._client()
+        client.request = Mock(
+            return_value={
+                "data": {
+                    "type": "builds",
+                    "id": "build-1",
+                    "attributes": {"usesNonExemptEncryption": False},
+                }
+            }
+        )
+
+        result = client.set_build_uses_non_exempt_encryption("build-1", False)
+
+        self.assertFalse(result["attributes"]["usesNonExemptEncryption"])
+        method, path = client.request.call_args.args
+        kwargs = client.request.call_args.kwargs
+        self.assertEqual(method, "PATCH")
+        self.assertEqual(path, "/builds/build-1")
+        body = json.loads(kwargs["data"])
+        self.assertEqual(body["data"]["type"], "builds")
+        self.assertEqual(body["data"]["id"], "build-1")
+        self.assertIs(body["data"]["attributes"]["usesNonExemptEncryption"], False)

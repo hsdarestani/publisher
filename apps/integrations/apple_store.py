@@ -158,6 +158,22 @@ class AppleStoreClient:
         body = {"data": {"type": "builds", "id": str(build_id)}}
         return self.request("PATCH", f"/appStoreVersions/{version_id}/relationships/build", data=json.dumps(body))
 
+    def set_build_uses_non_exempt_encryption(self, build_id, uses_non_exempt_encryption: bool):
+        body = {
+            "data": {
+                "type": "builds",
+                "id": str(build_id),
+                "attributes": {
+                    "usesNonExemptEncryption": bool(uses_non_exempt_encryption),
+                },
+            }
+        }
+        return self.request(
+            "PATCH",
+            f"/builds/{build_id}",
+            data=json.dumps(body),
+        )["data"]
+
     def list_builds(self, app_id, build_number=None, limit=50):
         query = f"filter[app]={app_id}&limit={limit}&sort=-uploadedDate"
         if build_number:

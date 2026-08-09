@@ -94,15 +94,16 @@ jobs:
           PUBLISHER_MAX_JOBS: '1'
           PUBLISHER_POLL_INTERVAL: '5'
           PUBLISHER_WATCH_SECONDS: '10'
+          PUBLISHER_PRESERVE_ARTIFACT_DIR: /tmp/preserved-launcher-aabs
         run: python agents/custom_cloud_linux.py
 
       - name: Preserve signed Esthetic AAB from ephemeral runner
         run: |
           set -euo pipefail
-          AAB="$(find /tmp/aplus-publisher-agent -type f -name 'a-esthetic-release.aab' -print | tail -n 1)"
+          AAB="$(find /tmp/preserved-launcher-aabs -type f -name '*.aab' -print 2>/dev/null | tail -n 1)"
           if [ -z "$AAB" ]; then
-            echo 'The Esthetic build did not produce its signed AAB.' >&2
-            find /tmp/aplus-publisher-agent -maxdepth 5 -type f -print || true
+            echo 'The Esthetic build did not preserve its signed AAB.' >&2
+            find /tmp/preserved-launcher-aabs -maxdepth 2 -type f -print 2>/dev/null || true
             exit 2
           fi
           cp "$AAB" /tmp/esthetic.aab

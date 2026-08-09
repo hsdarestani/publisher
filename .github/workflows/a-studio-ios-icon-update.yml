@@ -1,0 +1,256 @@
+name: Ship A+ Studio iOS icon update
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-icon-update.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-studio-ios-icon-update
+  cancel-in-progress: false
+
+jobs:
+  ship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      HOST: ${{ secrets.HOST }}
+      SSHPASS: ${{ secrets.PASS }}
+      SOURCE_COMMIT: '27226e1d6bfb7b30b7aafd21aa971b09cc00fc7e'
+      VERSION_NAME: '1.0.0'
+      BUILD_NUMBER: '2'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+      - name: Wait for Publisher production
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS --connect-timeout 8 --max-time 15 https://publisher.smarbiz.sbs/healthz/ >/dev/null; then
+              if sshpass -e ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+                'cd /opt/aplus-publisher && docker compose exec -T web python manage.py check >/dev/null'; then
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo 'Publisher production did not become ready.' >&2
+          exit 2
+
+      - name: Queue iOS Build 2 only
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          from apps.publisher.models import MobileApp, Release, Build, Job
+
+          app = MobileApp.objects.get(slug='a-studio')
+          release, _ = Release.objects.update_or_create(
+              app=app,
+              version_name='1.0.0',
+              build_number=2,
+              defaults={
+                  'source_branch': 'main',
+                  'source_commit': '27226e1d6bfb7b30b7aafd21aa971b09cc00fc7e',
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'release_notes': 'App icon update.',
+                  'status': 'building',
+              },
+          )
+          build, _ = Build.objects.get_or_create(release=release, platform='ios')
+          if build.status != 'succeeded' or build.commit_sha != release.source_commit:
+              Job.objects.filter(
+                  app=app, release=release, build=build, type='build_ios', status__in=['queued', 'running']
+              ).update(status='cancelled')
+              build.status = 'queued'
+              build.commit_sha = ''
+              build.external_build_id = ''
+              build.logs = ''
+              build.metadata = {}
+              build.started_at = None
+              build.finished_at = None
+              build.save()
+              job = Job.objects.create(
+                  type='build_ios', app=app, release=release, build=build,
+                  payload={'source': 'a-studio-ios-icon-update'},
+                  available_to_agents=True, required_platform='macos',
+              )
+              print(f'queued_build_job={job.pk}')
+          else:
+              print('build_already_succeeded=true')
+          print(f'release_id={release.pk} build_id={build.pk}')
+          PY
+
+      - name: Wake Cloud Mac for build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/hsdarestani/publisher/actions/workflows/cloud-macos.yml/dispatches \
+            -d '{"ref":"main"}'
+
+      - name: Wait for signed iOS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 100); do
+            OUT="$(sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='ios'); j=r.jobs.filter(type='build_ios').order_by('-created_at').first(); print('build='+b.status); print('job='+(j.status if j else 'missing')); print('error='+((j.error or '').replace(chr(10),' ')[:1200] if j else ''))\"")"
+            printf '%s\n' "$OUT"
+            BUILD_STATUS="$(printf '%s\n' "$OUT" | sed -n 's/^build=//p' | tail -1)"
+            JOB_STATUS="$(printf '%s\n' "$OUT" | sed -n 's/^job=//p' | tail -1)"
+            if [ "$BUILD_STATUS" = succeeded ]; then exit 0; fi
+            if [ "$BUILD_STATUS" = failed ] || [ "$JOB_STATUS" = failed ]; then exit 3; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for iOS Build 2.' >&2
+          exit 4
+
+      - name: Queue App Store upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          from apps.publisher.models import MobileApp, Release, Job
+
+          app = MobileApp.objects.get(slug='a-studio')
+          release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
+          build = release.builds.get(platform='ios')
+          if build.status != 'succeeded':
+              raise RuntimeError('iOS Build 2 is not successful')
+          if not build.external_build_id:
+              active = release.jobs.filter(type='upload_apple', build=build, status__in=['queued','running','succeeded']).order_by('-created_at').first()
+              if not active or active.status != 'succeeded':
+                  job = Job.objects.create(
+                      type='upload_apple', app=app, release=release, build=build,
+                      payload={'source': 'a-studio-ios-icon-update'},
+                      available_to_agents=True, required_platform='macos',
+                  )
+                  print(f'queued_upload_job={job.pk}')
+              else:
+                  print(f'upload_job={active.pk}:{active.status}')
+          else:
+              print(f'apple_build_already_processed={build.external_build_id}')
+          PY
+
+      - name: Wake Cloud Mac for upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            https://api.github.com/repos/hsdarestani/publisher/actions/workflows/cloud-macos.yml/dispatches \
+            -d '{"ref":"main"}'
+
+      - name: Wait for App Store processing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 100); do
+            OUT="$(sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='ios'); j=r.jobs.filter(type='upload_apple').order_by('-created_at').first(); print('upload='+(j.status if j else 'missing')); print('external='+str(b.external_build_id or '')); print('error='+((j.error or '').replace(chr(10),' ')[:1200] if j else ''))\"")"
+            printf '%s\n' "$OUT"
+            UPLOAD_STATUS="$(printf '%s\n' "$OUT" | sed -n 's/^upload=//p' | tail -1)"
+            EXTERNAL="$(printf '%s\n' "$OUT" | sed -n 's/^external=//p' | tail -1)"
+            if [ "$UPLOAD_STATUS" = succeeded ] && [ -n "$EXTERNAL" ]; then exit 0; fi
+            if [ "$UPLOAD_STATUS" = failed ]; then exit 5; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for App Store processing.' >&2
+          exit 6
+
+      - name: Cancel Build 1 review submission only after Build 2 is valid
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import time
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.select_related('apple_account').get(slug='a-studio')
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              raise RuntimeError('App Store version 1.0.0 not found')
+          version_id = version['id']
+
+          canceled = []
+          for submission in client.list_review_submissions(record['id'], 'WAITING_FOR_REVIEW'):
+              item, _ = client._review_submission_matches(submission, version_id)
+              if item:
+                  client.cancel_review_submission(submission['id'])
+                  canceled.append(submission['id'])
+          print('canceled_waiting_submissions=' + ','.join(canceled))
+
+          editable = {'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
+          state = ''
+          for _ in range(30):
+              current = client.find_editable_version(record['id'], '1.0.0')
+              attrs = (current or {}).get('attributes', {})
+              state = attrs.get('appStoreState') or attrs.get('appVersionState') or ''
+              print('version_state=' + state)
+              if state in editable:
+                  break
+              time.sleep(5)
+          if state not in editable:
+              raise RuntimeError('Version did not return to an editable state after cancellation: ' + state)
+          PY
+
+      - name: Queue Build 2 for Apple review
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          from apps.publisher.models import MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-studio')
+          release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
+          build = release.builds.get(platform='ios')
+          old = release.jobs.filter(type='submit_apple', status__in=['queued','running']).order_by('-created_at').first()
+          if old:
+              print(f'submit_already_active={old.pk}:{old.status}')
+          else:
+              job = enqueue_job('submit_apple', app=app, release=release, build=build)
+              print(f'queued_submit_job={job.pk}')
+          PY
+
+      - name: Wait for Apple review submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 80); do
+            OUT="$(sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); j=r.jobs.filter(type='submit_apple').order_by('-created_at').first(); b=r.builds.get(platform='ios'); print('submit='+(j.status if j else 'missing')); print('apple_build='+str(b.external_build_id or '')); print('error='+((j.error or '').replace(chr(10),' ')[:1800] if j else ''))\"")"
+            printf '%s\n' "$OUT"
+            STATUS="$(printf '%s\n' "$OUT" | sed -n 's/^submit=//p' | tail -1)"
+            if [ "$STATUS" = succeeded ]; then exit 0; fi
+            if [ "$STATUS" = failed ]; then exit 7; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for Apple review submission.' >&2
+          exit 8

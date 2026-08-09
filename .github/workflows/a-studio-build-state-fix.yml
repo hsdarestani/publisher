@@ -6,16 +6,22 @@ on:
     paths:
       - '.github/workflows/a-studio-build-state-fix.yml'
       - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/agent_lifecycle.py'
       - 'apps/publisher/urls.py'
       - 'apps/publisher/test_agent_completion.py'
+      - 'apps/integrations/apple_store.py'
+      - 'apps/integrations/test_apple_store.py'
       - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/a-studio-build-state-fix.yml'
       - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/agent_lifecycle.py'
       - 'apps/publisher/urls.py'
       - 'apps/publisher/test_agent_completion.py'
+      - 'apps/integrations/apple_store.py'
+      - 'apps/integrations/test_apple_store.py'
       - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
 
 permissions:
@@ -33,16 +39,22 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Validate completion-state fix
+      - name: Validate release-state and App Store fixes
         env:
           DEBUG: '1'
           DJANGO_SECRET_KEY: ci-secret
           ALLOWED_HOSTS: localhost,127.0.0.1
         run: |
           python manage.py check
-          python manage.py test apps.publisher.test_agent_completion
+          python manage.py test \
+            apps.publisher.test_agent_completion \
+            apps.integrations.test_apple_store
           python manage.py help normalize_a_studio_artifacts >/dev/null
-          python -m py_compile apps/publisher/agent_completion.py apps/signing/management/commands/normalize_a_studio_artifacts.py
+          python -m py_compile \
+            apps/publisher/agent_completion.py \
+            apps/publisher/agent_lifecycle.py \
+            apps/integrations/apple_store.py \
+            apps/signing/management/commands/normalize_a_studio_artifacts.py
 
   normalize:
     if: github.event_name != 'pull_request'

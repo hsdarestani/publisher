@@ -56,8 +56,50 @@ class AppleStoreClient:
         data = self.request("GET", f"/apps/{app_id}/appStoreVersions?filter[versionString]={version}&limit=10")
         return next(iter(data.get("data", [])), None)
 
+    def list_versions(self, app_id: str, platform="IOS", limit=50):
+        return self.request(
+            "GET",
+            f"/apps/{app_id}/appStoreVersions?filter[platform]={platform}&limit={limit}&sort=-createdDate",
+        ).get("data", [])
+
+    def update_version_string(self, version_id: str, version: str):
+        body = {
+            "data": {
+                "type": "appStoreVersions",
+                "id": version_id,
+                "attributes": {"versionString": version},
+            }
+        }
+        return self.request(
+            "PATCH",
+            f"/appStoreVersions/{version_id}",
+            data=json.dumps(body),
+        )["data"]
+
     def ensure_version(self, app_id, version):
-        return self.find_editable_version(app_id, version) or self.create_version(app_id, version)
+        exact = self.find_editable_version(app_id, version)
+        if exact:
+            return exact
+
+        # The first App Store Connect record is sometimes created manually before
+        # Publisher runs (for example 1.0 while the signed binary is 1.0.0).
+        # Apple only permits one editable version per platform at this stage, and
+        # versionString is writable. Align that existing draft to the binary's
+        # CFBundleShortVersionString instead of trying to create a second version.
+        editable_states = {
+            "PREPARE_FOR_SUBMISSION",
+            "READY_FOR_REVIEW",
+            "DEVELOPER_REJECTED",
+            "METADATA_REJECTED",
+            "REJECTED",
+        }
+        for item in self.list_versions(app_id):
+            attrs = item.get("attributes", {})
+            state = attrs.get("appStoreState") or attrs.get("appVersionState")
+            if state in editable_states:
+                return self.update_version_string(item["id"], version)
+
+        return self.create_version(app_id, version)
 
     def set_localization(self, version_id, loc):
         existing = self.request("GET", f"/appStoreVersions/{version_id}/appStoreVersionLocalizations?filter[locale]={loc.locale}&limit=1").get("data", [])
@@ -172,8 +214,6 @@ class AppleStoreClient:
             return list(csv.DictReader(io.StringIO(text), dialect=dialect))
 
     def upload_screenshot(self, localization_id, screenshot_set_id, file_path, asset_type="appScreenshots"):
-        # App Store Connect uploads are a reserve/upload/commit workflow. This helper follows
-        # the API-provided uploadOperations and does not rely on a third-party publishing service.
         path = Path(file_path)
         body = {"data": {"type": "appScreenshots", "attributes": {"fileName": path.name, "fileSize": path.stat().st_size}, "relationships": {"appScreenshotSet": {"data": {"type": "appScreenshotSets", "id": screenshot_set_id}}}}}
         reserved = self.request("POST", "/appScreenshots", data=json.dumps(body))["data"]
@@ -191,8 +231,7 @@ class AppleStoreClient:
     @staticmethod
     def _md5(path):
         import hashlib
-        value = hashlib.md5()
+        digest = hashlib.md5()
         with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                value.update(chunk)
-        return value.hexdigest()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""): digest.update(chunk)
+        return digest.hexdigest()

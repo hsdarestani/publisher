@@ -49,9 +49,9 @@ def _refresh_release_state(job, status):
         else:
             release.status = "building"
     elif job.type == "upload_apple":
-        # A failed store upload must not turn a successfully compiled/signed IPA
-        # into a failed build. Keep the release ready so the upload can be retried
-        # after App Store Connect setup or a transient store issue is resolved.
+        # Store delivery is independent from native compilation. A failed upload
+        # must never downgrade a valid signed IPA; a successful upload means the
+        # binary is now available in App Store Connect.
         if status == "succeeded":
             release.status = "uploaded"
         elif builds and all(build.status == "succeeded" for build in builds):
@@ -59,15 +59,27 @@ def _refresh_release_state(job, status):
     release.save(update_fields=["status", "updated_at"])
 
 
+def _restore_native_ios_state(job, build):
+    """Repair legacy claim/log mutations for an already-successful signed IPA."""
+
+    if not build or not build.artifact:
+        return False
+    succeeded = Job.objects.filter(
+        release=job.release,
+        build=build,
+        type="build_ios",
+        status="succeeded",
+    ).exists()
+    if succeeded and build.status != "succeeded":
+        build.status = "succeeded"
+        return True
+    return False
+
+
 @csrf_exempt
 @require_POST
 def agent_complete(request, job_pk):
-    """Complete a build-agent job without conflating build and store-upload state.
-
-    Build jobs own Build.status/artifact/checksum. Store upload jobs may attach an
-    external App Store build id, but never downgrade a previously successful IPA
-    simply because App Store Connect rejected or could not accept an upload.
-    """
+    """Complete an agent job without conflating native builds and store delivery."""
 
     agent = _agent_from_request(request)
     job = get_object_or_404(
@@ -101,17 +113,27 @@ def agent_complete(request, job_pk):
         build.finished_at = timezone.now()
         build.logs = job.logs + ("\n" + error if error else "")
         build.save()
-    elif build and job.type == "upload_apple" and succeeded:
-        # Preserve build metadata from the compilation/signing job and record the
-        # store-upload result separately inside the JSON metadata.
-        current_metadata = dict(build.metadata or {})
-        current_metadata["apple_upload"] = metadata
-        build.metadata = current_metadata
-        build.external_build_id = metadata.get(
-            "external_build_id",
-            build.external_build_id,
-        )
-        build.save(update_fields=["metadata", "external_build_id", "updated_at"])
+    elif build and job.type == "upload_apple":
+        # Older claim/log handlers briefly changed a successful IPA to
+        # claimed/running. Restore that native state from the successful iOS
+        # build job before recording the independent App Store upload result.
+        update_fields = []
+        if _restore_native_ios_state(job, build):
+            update_fields.append("status")
+
+        if succeeded:
+            current_metadata = dict(build.metadata or {})
+            current_metadata["apple_upload"] = metadata
+            build.metadata = current_metadata
+            build.external_build_id = metadata.get(
+                "external_build_id",
+                build.external_build_id,
+            )
+            update_fields.extend(["metadata", "external_build_id"])
+
+        if update_fields:
+            update_fields.append("updated_at")
+            build.save(update_fields=list(dict.fromkeys(update_fields)))
 
     job.status = "succeeded" if succeeded else "failed"
     job.progress = 100 if succeeded else job.progress

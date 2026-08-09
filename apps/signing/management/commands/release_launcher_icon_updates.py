@@ -24,10 +24,11 @@ TARGETS = (
 
 
 class Command(BaseCommand):
-    help = "Queue, diagnose and publish the Android launcher-icon update for A+ Solution and A+ Esthetic."
+    help = "Queue, recover, diagnose and publish Android launcher-icon updates for A+ Solution and A+ Esthetic."
 
     def add_arguments(self, parser):
         parser.add_argument("--queue", action="store_true", help="Create/reuse releases and queue Android builds.")
+        parser.add_argument("--recover", action="store_true", help="Cancel interrupted build jobs and queue clean replacements.")
         parser.add_argument("--publish", action="store_true", help="Queue Google Play upload once the Android build succeeds.")
         parser.add_argument("--diagnose", action="store_true", help="Print the latest Android build/upload errors and log tails.")
         parser.add_argument(
@@ -38,7 +39,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if not options["queue"] and not options["publish"] and not options["diagnose"]:
+        if not any(options[name] for name in ("queue", "recover", "publish", "diagnose")):
             options["queue"] = True
 
         selected = set(options.get("target") or [item["key"] for item in TARGETS])
@@ -49,12 +50,16 @@ class Command(BaseCommand):
                 continue
             try:
                 app = self._find_app(target)
-                release = self._release_for_target(app, target, create=options["queue"])
+                create = options["queue"] or options["recover"]
+                release = self._release_for_target(app, target, create=create)
                 if not release:
                     self.stdout.write(f"{target['key']}: release=missing")
                     continue
 
-                if options["queue"]:
+                if options["recover"]:
+                    self._recover_build(release)
+                    self._queue_build(app, release)
+                elif options["queue"]:
                     self._queue_build(app, release)
 
                 if options["publish"]:
@@ -66,7 +71,7 @@ class Command(BaseCommand):
                 if options["diagnose"]:
                     self._diagnose(target["key"], release)
 
-                if not options["diagnose"] and (
+                if not options["diagnose"] and not options["recover"] and (
                     "build_android=failed" in line or "upload_google=failed" in line
                 ):
                     failures.append(line)
@@ -133,6 +138,46 @@ class Command(BaseCommand):
         )
         return release
 
+    def _recover_build(self, release):
+        build = release.builds.filter(platform="android").first()
+        if not build:
+            build = Build.objects.create(release=release, platform="android")
+        if build.status == "succeeded":
+            return
+
+        interrupted = Job.objects.filter(
+            release=release,
+            build=build,
+            type="build_android",
+            status__in=["queued", "running"],
+        )
+        count = interrupted.update(
+            status="cancelled",
+            error="Superseded by clean launcher-icon recovery build.",
+        )
+        if count:
+            self.stdout.write(f"Recovered release {release.pk}: cancelled {count} interrupted Android build job(s).")
+
+        build.status = "queued"
+        build.logs = ""
+        build.error = ""
+        build.started_at = None
+        build.finished_at = None
+        build.artifact = ""
+        build.artifact_sha256 = ""
+        build.save(
+            update_fields=[
+                "status",
+                "logs",
+                "error",
+                "started_at",
+                "finished_at",
+                "artifact",
+                "artifact_sha256",
+                "updated_at",
+            ]
+        )
+
     def _queue_build(self, app, release):
         build = release.builds.filter(platform="android").first()
         if not build:
@@ -150,12 +195,14 @@ class Command(BaseCommand):
         if build.status in {"failed", "cancelled"}:
             build.status = "queued"
             build.logs = ""
+            build.error = ""
             build.started_at = None
             build.finished_at = None
             build.save(
                 update_fields=[
                     "status",
                     "logs",
+                    "error",
                     "started_at",
                     "finished_at",
                     "updated_at",

@@ -6,11 +6,16 @@ CloudLinuxAgent injects that key for its own build flow; this wrapper additional
 passes safe, job-scoped environment variables to a custom ``android_command`` so
 Capacitor and other non-Flutter projects can sign their AAB without persisting
 credentials in the source repository or application build_config.
+
+For release-recovery workflows we can also preserve a successfully signed Android
+artifact *before* the Publisher completion callback. This matters when the build
+itself succeeds but the reverse artifact upload endpoint is temporarily unhealthy.
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 
 from cloud_linux import CloudLinuxAgent
 
@@ -43,7 +48,17 @@ class CustomBuildLinuxAgent(CloudLinuxAgent):
             config["env"] = custom_env
             payload["build_config"] = config
 
-        return super().build(job_id, job_type, payload, workspace)
+        artifact, metadata = super().build(job_id, job_type, payload, workspace)
+
+        preserve_dir = os.getenv("PUBLISHER_PRESERVE_ARTIFACT_DIR", "").strip()
+        if job_type == "build_android" and preserve_dir and artifact:
+            target_dir = Path(preserve_dir)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"job-{job_id}-{artifact.name}"
+            shutil.copy2(artifact, target)
+            print(f"Preserved signed Android artifact before callback: {target}", flush=True)
+
+        return artifact, metadata
 
 
 def main():

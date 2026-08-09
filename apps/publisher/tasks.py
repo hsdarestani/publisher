@@ -97,7 +97,10 @@ def handle_submit_google(job):
 
 def handle_submit_apple(job):
     from apps.integrations.apple_assets import sync_app_store_screenshots
-    from apps.integrations.apple_compliance import apply_app_store_compliance
+    from apps.integrations.apple_compliance import (
+        apply_app_store_compliance,
+        ensure_build_encryption_declaration,
+    )
     from apps.integrations.apple_store import AppleStoreClient
 
     release, app = job.release, job.release.app
@@ -129,7 +132,11 @@ def handle_submit_apple(job):
 
     encryption_answer = apple_uses_non_exempt_encryption(app)
     if encryption_answer is not None:
-        client.set_build_uses_non_exempt_encryption(build.external_build_id, encryption_answer)
+        ensure_build_encryption_declaration(
+            client,
+            build.external_build_id,
+            encryption_answer,
+        )
 
     client.attach_build(version["id"], build.external_build_id)
     contact = apple_review_contact(app)

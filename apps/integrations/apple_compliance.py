@@ -81,6 +81,33 @@ def set_age_rating_declaration(client, declaration_id: str, attributes: dict):
     )["data"]
 
 
+def ensure_build_encryption_declaration(client, build_id: str, desired: bool):
+    """Set export compliance once and safely reuse Apple's immutable answer.
+
+    App Store Connect lets `usesNonExemptEncryption` be answered when it is null,
+    but rejects later writes after the value has been set. Read the build first so
+    retries are idempotent. A conflicting existing answer is surfaced rather than
+    silently overwritten or guessed.
+    """
+
+    build = client.request(
+        "GET",
+        f"/builds/{build_id}?fields[builds]=usesNonExemptEncryption",
+    )["data"]
+    current = build.get("attributes", {}).get("usesNonExemptEncryption")
+    desired = bool(desired)
+
+    if current is None:
+        return client.set_build_uses_non_exempt_encryption(build_id, desired)
+    if bool(current) == desired:
+        return build
+    raise IntegrationError(
+        "App Store Connect already has usesNonExemptEncryption="
+        f"{str(bool(current)).lower()} for build {build_id}, but Publisher expects "
+        f"{str(desired).lower()}. Apple does not allow changing this answer once set."
+    )
+
+
 def apply_app_store_compliance(client, app_id: str, *, content_rights=None, age_rating=None):
     """Apply app-level declarations needed before a review submission."""
 

@@ -5,6 +5,7 @@ from django.test import SimpleTestCase
 
 from .apple_compliance import (
     apply_app_store_compliance,
+    ensure_build_encryption_declaration,
     find_editable_app_info,
     set_age_rating_declaration,
     set_content_rights,
@@ -112,6 +113,64 @@ class AppleAppComplianceTests(SimpleTestCase):
         self.assertEqual(path, "/ageRatingDeclarations/rating-1")
         self.assertEqual(body["data"]["type"], "ageRatingDeclarations")
         self.assertEqual(body["data"]["attributes"], attrs)
+
+    def test_build_encryption_sets_answer_only_when_unset(self):
+        client = Mock()
+        client.request.return_value = {
+            "data": {
+                "type": "builds",
+                "id": "build-1",
+                "attributes": {"usesNonExemptEncryption": None},
+            }
+        }
+        client.set_build_uses_non_exempt_encryption.return_value = {
+            "type": "builds",
+            "id": "build-1",
+            "attributes": {"usesNonExemptEncryption": False},
+        }
+
+        result = ensure_build_encryption_declaration(client, "build-1", False)
+
+        client.request.assert_called_once_with(
+            "GET",
+            "/builds/build-1?fields[builds]=usesNonExemptEncryption",
+        )
+        client.set_build_uses_non_exempt_encryption.assert_called_once_with(
+            "build-1", False
+        )
+        self.assertIs(result["attributes"]["usesNonExemptEncryption"], False)
+
+    def test_build_encryption_reuses_matching_existing_answer(self):
+        client = Mock()
+        existing = {
+            "type": "builds",
+            "id": "build-1",
+            "attributes": {"usesNonExemptEncryption": False},
+        }
+        client.request.return_value = {"data": existing}
+
+        result = ensure_build_encryption_declaration(client, "build-1", False)
+
+        self.assertEqual(result, existing)
+        client.set_build_uses_non_exempt_encryption.assert_not_called()
+
+    def test_build_encryption_rejects_conflicting_immutable_answer(self):
+        client = Mock()
+        client.request.return_value = {
+            "data": {
+                "type": "builds",
+                "id": "build-1",
+                "attributes": {"usesNonExemptEncryption": True},
+            }
+        }
+
+        with self.assertRaisesMessage(
+            IntegrationError,
+            "already has usesNonExemptEncryption=true",
+        ):
+            ensure_build_encryption_declaration(client, "build-1", False)
+
+        client.set_build_uses_non_exempt_encryption.assert_not_called()
 
     def test_apply_compliance_updates_content_rights_and_age_rating(self):
         client = Mock()

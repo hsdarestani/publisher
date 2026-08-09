@@ -79,14 +79,13 @@ def handle_upload_google(job):
     from apps.integrations.google_play import GooglePlayClient
     release = job.release
     check = evaluate_release(release)
-    # Store credentials are warnings in readiness, but this job requires them.
     if not release.app.google_account or not release.app.google_account.configured:
         raise RuntimeError("Google Play account is not configured.")
     build = job.build or release.builds.filter(platform="android", status="succeeded").first()
     if not build: raise RuntimeError("No successful Android build found.")
     client = GooglePlayClient(release.app.google_account)
     result = client.publish_release(release.app, release, build, release.app.localizations.all(), release.app.assets.all(), submit=True)
-    submission, _ = Submission.objects.update_or_create(app=release.app, release=release, platform="android", defaults={"state": "in_review", "submitted_at": timezone.now(), "raw": result})
+    Submission.objects.update_or_create(app=release.app, release=release, platform="android", defaults={"state": "in_review", "submitted_at": timezone.now(), "raw": result})
     release.status = "in_review"; release.readiness_snapshot = check; release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
     return result
 
@@ -114,15 +113,9 @@ def handle_submit_apple(job):
     record = client.find_app(app.bundle_id)
     version = client.ensure_version(record["id"], release.version_name)
 
-    for loc in app.localizations.all():
-        client.set_localization(version["id"], loc)
-    screenshot_result = sync_app_store_screenshots(
-        client,
-        version["id"],
-        app.localizations.all(),
-        app.assets.filter(kind="screenshot", platform="ios"),
-    )
-
+    # App-level declarations are cheap, deterministic API writes and are required
+    # for review eligibility. Apply them before asynchronous media processing so
+    # a slow screenshot never hides or delays compliance progress.
     app_compliance = apply_app_store_compliance(
         client,
         record["id"],
@@ -137,6 +130,15 @@ def handle_submit_apple(job):
             build.external_build_id,
             encryption_answer,
         )
+
+    for loc in app.localizations.all():
+        client.set_localization(version["id"], loc)
+    screenshot_result = sync_app_store_screenshots(
+        client,
+        version["id"],
+        app.localizations.all(),
+        app.assets.filter(kind="screenshot", platform="ios"),
+    )
 
     client.attach_build(version["id"], build.external_build_id)
     contact = apple_review_contact(app)

@@ -1,0 +1,120 @@
+name: Direct launcher icon Publisher release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/launcher-icon-publisher-direct.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Deploy current Publisher source directly
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          PUBLISHER_GITHUB_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_COMPLIANCE_MODEL: ${{ vars.OPENAI_COMPLIANCE_MODEL }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          tar --exclude=.git --exclude=.env -czf /tmp/aplus-publisher.tar.gz .
+          : > /tmp/aplus-publisher-overrides.env
+          [ -n "$ADMIN_EMAIL" ] && printf 'ADMIN_EMAIL=%s\n' "$ADMIN_EMAIL" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$ADMIN_PASSWORD" ] && printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$PUBLISHER_GITHUB_TOKEN" ] && printf 'PUBLISHER_GITHUB_TOKEN=%s\n' "$PUBLISHER_GITHUB_TOKEN" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$OPENAI_API_KEY" ] && printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$OPENAI_COMPLIANCE_MODEL" ] && printf 'OPENAI_COMPLIANCE_MODEL=%s\n' "$OPENAI_COMPLIANCE_MODEL" >> /tmp/aplus-publisher-overrides.env || true
+          [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no \
+            /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh \
+            root@"$HOST":/tmp/
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+          curl --fail --silent --show-error \
+            --retry 18 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/
+
+      - name: Queue fixed launcher releases
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --queue"
+
+      - name: Wake Linux build agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for builds and publish to Google Play production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          FAILURES=0
+          for i in $(seq 1 100); do
+            echo "=== Publisher pass $i ==="
+            set +e
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --publish" 2>&1)"
+            RC=$?
+            set -e
+            printf '%s\n' "$OUTPUT"
+
+            SUCCEEDED="$(printf '%s\n' "$OUTPUT" | grep -c 'upload_google=succeeded' || true)"
+            if [ "$SUCCEEDED" -ge 2 ]; then
+              echo 'SUCCESS: both A+ Solution and A+ Esthetic updates are committed to Google Play production.'
+              exit 0
+            fi
+
+            if [ "$RC" -ne 0 ]; then
+              FAILURES=$((FAILURES + 1))
+              if [ "$FAILURES" -ge 4 ]; then
+                echo 'Publisher repeatedly reported a failure; printing full diagnostics.' >&2
+                sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                  "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_launcher_icon_updates --diagnose" || true
+                exit "$RC"
+              fi
+            else
+              FAILURES=0
+            fi
+            sleep 20
+          done
+          echo 'Timed out waiting for both Google Play production uploads.' >&2
+          exit 3

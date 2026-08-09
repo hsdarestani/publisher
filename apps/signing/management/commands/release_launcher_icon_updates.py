@@ -18,7 +18,7 @@ TARGETS = (
         "key": "esthetic",
         "repo_match": "a_esthetic",
         "name_match": "A+ Esthetic",
-        "source_commit": "7200135711da910cd742c55dac1fc9ca5f26a51d",
+        "source_commit": "c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298",
     },
 )
 

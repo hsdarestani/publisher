@@ -53,9 +53,10 @@ APPLE_AGE_RATING_PROFILES = {
         "contests": "NONE",
         "gambling": False,
         "lootBox": False,
-        # Not a Kids-category app and no manual rating override.
+        # Not a Kids-category app and no manual rating override. Apple exposes
+        # both the legacy V1 override and the current V2 override, but rejects a
+        # single update that includes both. Send only the current V2 field.
         "kidsAgeBand": None,
-        "ageRatingOverride": "NONE",
         "ageRatingOverrideV2": "NONE",
         "koreaAgeRatingOverride": "NONE",
     },

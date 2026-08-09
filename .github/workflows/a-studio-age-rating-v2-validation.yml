@@ -1,0 +1,47 @@
+name: Validate A+ Studio age-rating V2 profile
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/a-studio-age-rating-v2-validation.yml'
+      - 'apps/publisher/store_compliance.py'
+      - 'apps/publisher/test_store_compliance.py'
+  push:
+    branches:
+      - 'agent/a-studio-age-rating-v2-only'
+    paths:
+      - '.github/workflows/a-studio-age-rating-v2-validation.yml'
+      - 'apps/publisher/store_compliance.py'
+      - 'apps/publisher/test_store_compliance.py'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate A+ Studio store compliance profile
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py test apps.publisher.test_store_compliance
+          python - <<'PY'
+          from types import SimpleNamespace
+          from apps.publisher.store_compliance import apple_age_rating_profile
+          profile = apple_age_rating_profile(SimpleNamespace(slug='a-studio'))
+          assert 'ageRatingOverride' not in profile, profile
+          assert profile['ageRatingOverrideV2'] == 'NONE', profile
+          assert profile['koreaAgeRatingOverride'] == 'NONE', profile
+          print('A+ Studio age-rating V2 profile is valid.')
+          PY

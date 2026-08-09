@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand, CommandError
-from django.db.models import Max, Q
+from django.db.models import Max
 
 from apps.publisher.models import Build, Job, MobileApp, Release
 from apps.publisher.tasks import enqueue_job
@@ -24,11 +24,12 @@ TARGETS = (
 
 
 class Command(BaseCommand):
-    help = "Queue and publish the Android launcher-icon update for A+ Solution and A+ Esthetic."
+    help = "Queue, diagnose and publish the Android launcher-icon update for A+ Solution and A+ Esthetic."
 
     def add_arguments(self, parser):
         parser.add_argument("--queue", action="store_true", help="Create/reuse releases and queue Android builds.")
         parser.add_argument("--publish", action="store_true", help="Queue Google Play upload once the Android build succeeds.")
+        parser.add_argument("--diagnose", action="store_true", help="Print the latest Android build/upload errors and log tails.")
         parser.add_argument(
             "--target",
             action="append",
@@ -37,7 +38,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if not options["queue"] and not options["publish"]:
+        if not options["queue"] and not options["publish"] and not options["diagnose"]:
             options["queue"] = True
 
         selected = set(options.get("target") or [item["key"] for item in TARGETS])
@@ -61,7 +62,13 @@ class Command(BaseCommand):
 
                 line = self._status_line(target["key"], app, release)
                 self.stdout.write(line)
-                if "build_android=failed" in line or "upload_google=failed" in line:
+
+                if options["diagnose"]:
+                    self._diagnose(target["key"], release)
+
+                if not options["diagnose"] and (
+                    "build_android=failed" in line or "upload_google=failed" in line
+                ):
                     failures.append(line)
             except Exception as exc:
                 failures.append(f"{target['key']}: {exc}")
@@ -139,6 +146,7 @@ class Command(BaseCommand):
         ).exists()
         if active:
             return
+
         if build.status in {"failed", "cancelled"}:
             build.status = "queued"
             build.logs = ""
@@ -153,6 +161,7 @@ class Command(BaseCommand):
                     "updated_at",
                 ]
             )
+
         enqueue_job(
             "build_android",
             app=app,
@@ -174,14 +183,40 @@ class Command(BaseCommand):
             type="upload_google",
             status__in=["queued", "running", "succeeded"],
         ).exists()
+        if active:
+            return
+
         failed = Job.objects.filter(
             release=release,
             type="upload_google",
             status="failed",
         ).exists()
-        if active or failed:
+        if failed:
             return
+
         enqueue_job("upload_google", app=app, release=release, build=build)
+
+    def _diagnose(self, key, release):
+        build = release.builds.filter(platform="android").first()
+        if build:
+            self.stdout.write(f"--- {key} build metadata ---")
+            self.stdout.write(f"status={build.status} commit={build.commit_sha or '-'}")
+            if build.logs:
+                self.stdout.write(build.logs[-16000:])
+
+        for job_type in ("build_android", "upload_google"):
+            job = (
+                Job.objects.filter(release=release, type=job_type)
+                .order_by("-created_at")
+                .first()
+            )
+            if not job:
+                continue
+            self.stdout.write(f"--- {key} {job_type} job={job.pk} status={job.status} ---")
+            if job.error:
+                self.stdout.write(f"ERROR: {job.error}")
+            if job.logs:
+                self.stdout.write(job.logs[-16000:])
 
     def _status_line(self, key, app, release):
         build = release.builds.filter(platform="android").first()

@@ -8,7 +8,11 @@ on:
       - 'apps/signing/management/commands/bootstrap_a_studio.py'
       - 'apps/publisher/job_recovery.py'
       - 'apps/publisher/management/commands/recover_a_studio_jobs.py'
+      - 'apps/publisher/store_compliance.py'
+      - 'apps/publisher/review_contacts.py'
       - 'apps/integrations/apple_assets.py'
+      - 'apps/integrations/apple_compliance.py'
+      - 'apps/integrations/apple_store.py'
       - 'apps/publisher/tasks.py'
   push:
     branches: [main]
@@ -17,7 +21,11 @@ on:
       - 'apps/signing/management/commands/bootstrap_a_studio.py'
       - 'apps/publisher/job_recovery.py'
       - 'apps/publisher/management/commands/recover_a_studio_jobs.py'
+      - 'apps/publisher/store_compliance.py'
+      - 'apps/publisher/review_contacts.py'
       - 'apps/integrations/apple_assets.py'
+      - 'apps/integrations/apple_compliance.py'
+      - 'apps/integrations/apple_store.py'
       - 'apps/publisher/tasks.py'
 
 permissions:
@@ -50,6 +58,8 @@ jobs:
             apps/publisher/job_recovery.py \
             apps/publisher/management/commands/recover_a_studio_jobs.py \
             apps/integrations/apple_assets.py \
+            apps/integrations/apple_compliance.py \
+            apps/integrations/apple_store.py \
             apps/publisher/tasks.py
 
   release:
@@ -135,4 +145,4 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"
 
-# Release recovery: stale internal store jobs are failed only after a safe timeout so retries can proceed idempotently.
+# A+ Studio release orchestration is intentionally triggered by its compliance and App Store integration changes as well as build/recovery changes.

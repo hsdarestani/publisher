@@ -254,13 +254,12 @@ class AppleStoreClient:
         return item, items
 
     def submit_version(self, app_id, version_id):
-        """Submit a version idempotently without leaking review-submission slots.
+        """Submit a version idempotently without allocating another Apple slot.
 
-        App Store Connect keeps a READY_FOR_REVIEW submission when final review
-        eligibility fails. Repeatedly POSTing a new reviewSubmission then leaks
-        Apple's finite concurrent-submission slots. Reuse the draft that already
-        contains this version, cancel only duplicate drafts for the same version,
-        and treat a matching WAITING_FOR_REVIEW/IN_REVIEW submission as success.
+        If final review eligibility fails Apple keeps the review submission in
+        READY_FOR_REVIEW. That draft is not cancellable, but it is reusable. Find
+        the existing draft that contains this App Store version and submit it
+        again. Never create another ReviewSubmission while such a draft exists.
         """
         for state in ("WAITING_FOR_REVIEW", "IN_REVIEW"):
             for submission in self.list_review_submissions(app_id, state):
@@ -273,26 +272,17 @@ class AppleStoreClient:
                         "already_submitted": True,
                     }
 
-        ready_matches = []
-        empty_ready = []
-        for submission in self.list_review_submissions(app_id, "READY_FOR_REVIEW"):
-            item, items = self._review_submission_matches(submission, version_id)
-            if item:
-                ready_matches.append((submission, item))
-            elif not items:
-                # A previous failure between ReviewSubmission creation and item
-                # creation can leave an empty draft consuming concurrency. Empty
-                # READY drafts are safe to cancel; never touch unrelated items.
-                empty_ready.append(submission)
+        submission = None
+        item = None
+        for ready in self.list_review_submissions(app_id, "READY_FOR_REVIEW"):
+            ready_item, _ = self._review_submission_matches(ready, version_id)
+            if ready_item:
+                submission = ready
+                item = ready_item
+                break
 
-        for submission in empty_ready:
-            self.cancel_review_submission(submission["id"])
-
-        if ready_matches:
-            submission, item = ready_matches[0]
-            for duplicate, _ in ready_matches[1:]:
-                self.cancel_review_submission(duplicate["id"])
-        else:
+        reused = submission is not None
+        if not reused:
             body = {"data": {"type": "reviewSubmissions", "attributes": {}, "relationships": {"app": {"data": {"type": "apps", "id": app_id}}}}}
             submission = self.request("POST", "/reviewSubmissions", data=json.dumps(body))["data"]
             item_body = {"data": {"type": "reviewSubmissionItems", "relationships": {
@@ -306,8 +296,7 @@ class AppleStoreClient:
         return {
             "submission": final,
             "item": item,
-            "reused": bool(ready_matches),
-            "cancelled_duplicates": max(0, len(ready_matches) - 1) + len(empty_ready),
+            "reused": reused,
         }
 
     def ensure_analytics_request(self, app_id, access_type="ONGOING"):

@@ -22,14 +22,13 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
     def _client(self):
         return object.__new__(AppleStoreClient)
 
-    def test_reuses_ready_submission_and_cancels_duplicate_for_same_version(self):
+    def test_reuses_first_ready_submission_without_cancelling_other_drafts(self):
         client = self._client()
         submissions = [
             {"id": "sub-1", "attributes": {"state": "READY_FOR_REVIEW"}},
             {"id": "sub-2", "attributes": {"state": "READY_FOR_REVIEW"}},
         ]
         item_1 = version_item("item-1", "version-1")
-        item_2 = version_item("item-2", "version-1")
         calls = []
 
         def request(method, path, **kwargs):
@@ -42,12 +41,6 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
                 return {"data": submissions}
             if path.startswith("/reviewSubmissions/sub-1/items?"):
                 return {"data": [item_1]}
-            if path.startswith("/reviewSubmissions/sub-2/items?"):
-                return {"data": [item_2]}
-            if method == "PATCH" and path == "/reviewSubmissions/sub-2":
-                body = json.loads(kwargs["data"])
-                self.assertIs(body["data"]["attributes"]["canceled"], True)
-                return {"data": {"id": "sub-2", "attributes": {"state": "CANCELING"}}}
             if method == "PATCH" and path == "/reviewSubmissions/sub-1":
                 body = json.loads(kwargs["data"])
                 self.assertIs(body["data"]["attributes"]["submitted"], True)
@@ -60,8 +53,15 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
 
         self.assertEqual(result["submission"]["id"], "sub-1")
         self.assertTrue(result["reused"])
-        self.assertEqual(result["cancelled_duplicates"], 1)
         self.assertFalse(any(method == "POST" for method, _, _ in calls))
+        self.assertFalse(
+            any(
+                method == "PATCH"
+                and json.loads(kwargs["data"])["data"]["attributes"].get("canceled")
+                for method, _, kwargs in calls
+                if "data" in kwargs
+            )
+        )
 
     def test_matching_waiting_submission_is_already_submitted(self):
         client = self._client()
@@ -85,7 +85,7 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
         self.assertTrue(result["already_submitted"])
         self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in calls))
 
-    def test_cancels_empty_ready_draft_before_creating_new_submission(self):
+    def test_creates_new_submission_only_when_no_ready_draft_targets_version(self):
         client = self._client()
         calls = []
 
@@ -99,8 +99,6 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
                 return {"data": [{"id": "empty-sub", "attributes": {"state": "READY_FOR_REVIEW"}}]}
             if path.startswith("/reviewSubmissions/empty-sub/items?"):
                 return {"data": []}
-            if method == "PATCH" and path == "/reviewSubmissions/empty-sub":
-                return {"data": {"id": "empty-sub", "attributes": {"state": "CANCELING"}}}
             if method == "POST" and path == "/reviewSubmissions":
                 return {"data": {"id": "new-sub", "attributes": {"state": "READY_FOR_REVIEW"}}}
             if method == "POST" and path == "/reviewSubmissionItems":
@@ -114,4 +112,10 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
         result = client.submit_version("app-1", "version-1")
 
         self.assertEqual(result["submission"]["id"], "new-sub")
-        self.assertEqual(result["cancelled_duplicates"], 1)
+        self.assertFalse(result["reused"])
+        self.assertFalse(
+            any(
+                method == "PATCH" and path == "/reviewSubmissions/empty-sub"
+                for method, path, _ in calls
+            )
+        )

@@ -6,6 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 from .models import Job, MobileApp, Release, Build, Submission
 from .readiness import evaluate_release
+from .review_contacts import apple_review_contact
 
 
 def enqueue_job(job_type, *, app=None, release=None, build=None, payload=None, agent=False, platform=""):
@@ -110,7 +111,8 @@ def handle_submit_apple(job):
         app.assets.filter(kind="screenshot", platform="ios"),
     )
     client.attach_build(version["id"], build.external_build_id)
-    client.set_review_details(version["id"], app)
+    contact = apple_review_contact(app)
+    client.set_review_details(version["id"], app, contact=contact or None)
     result = client.submit_version(record["id"], version["id"])
     result["screenshots"] = screenshot_result
     Submission.objects.update_or_create(app=app, release=release, platform="ios", defaults={"state": "in_review", "external_id": result["submission"]["id"], "submitted_at": timezone.now(), "raw": result})

@@ -104,6 +104,38 @@ class AppleStoreClient:
 
         return self.create_version(app_id, version)
 
+    def _write_localization(self, method, path, body, *, retry_without_whats_new=True):
+        try:
+            return self.request(method, path, data=json.dumps(body))["data"]
+        except IntegrationError as exc:
+            # App Store Connect exposes `whatsNew` on version localizations, but
+            # some version states (notably a first version being prepared) reject
+            # editing that attribute while allowing the rest of the localization.
+            # Keep all valid metadata and retry only when Apple explicitly names
+            # this field as the state blocker.
+            message = str(exc)
+            if (
+                retry_without_whats_new
+                and "whatsNew" in message
+                and "cannot be edited at this time" in message
+            ):
+                data = body.get("data", {})
+                attributes = dict(data.get("attributes", {}))
+                attributes.pop("whatsNew", None)
+                retry_body = {
+                    "data": {
+                        **data,
+                        "attributes": attributes,
+                    }
+                }
+                return self._write_localization(
+                    method,
+                    path,
+                    retry_body,
+                    retry_without_whats_new=False,
+                )
+            raise
+
     def set_localization(self, version_id, loc):
         existing = self.request("GET", f"/appStoreVersions/{version_id}/appStoreVersionLocalizations?filter[locale]={loc.locale}&limit=1").get("data", [])
         attrs = {
@@ -118,9 +150,9 @@ class AppleStoreClient:
         if existing:
             item_id = existing[0]["id"]
             body = {"data": {"type": "appStoreVersionLocalizations", "id": item_id, "attributes": attrs}}
-            return self.request("PATCH", f"/appStoreVersionLocalizations/{item_id}", data=json.dumps(body))["data"]
+            return self._write_localization("PATCH", f"/appStoreVersionLocalizations/{item_id}", body)
         body = {"data": {"type": "appStoreVersionLocalizations", "attributes": {"locale": loc.locale, **attrs}, "relationships": {"appStoreVersion": {"data": {"type": "appStoreVersions", "id": version_id}}}}}
-        return self.request("POST", "/appStoreVersionLocalizations", data=json.dumps(body))["data"]
+        return self._write_localization("POST", "/appStoreVersionLocalizations", body)
 
     def attach_build(self, version_id, build_id):
         body = {"data": {"type": "builds", "id": str(build_id)}}

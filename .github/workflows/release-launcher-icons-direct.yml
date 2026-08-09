@@ -47,7 +47,7 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell -c "import json; from apps.publisher.models import MobileApp; pkgs=['de.aplussolution.workforce','de.aplusesthetic.app']; out={p:MobileApp.objects.get(package_name=p).android_signing.get_credentials() for p in pkgs}; open('/tmp/launcher-signing.json','w').write(json.dumps(out))"
-          docker compose cp web:/tmp/launcher-signing.json /tmp/launcher-signing.json >/dev/null
+          docker compose exec -T web cat /tmp/launcher-signing.json > /tmp/launcher-signing.json
           chmod 600 /tmp/launcher-signing.json
           REMOTE
           sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/launcher-signing.json /tmp/launcher-signing.json

@@ -324,7 +324,7 @@ class AppleStoreClient:
         return self.request("GET", path).get("data", [])
 
     def download_analytics_instances(self, report_id):
-        instances = self.request("GET", f"/analyticsReports/{request_id}/instances?limit=200").get("data", [])
+        instances = self.request("GET", f"/analyticsReports/{report_id}/instances?limit=200").get("data", [])
         rows = []
         for instance in instances:
             segments = self.request("GET", f"/analyticsReportInstances/{instance['id']}/segments?limit=200").get("data", [])

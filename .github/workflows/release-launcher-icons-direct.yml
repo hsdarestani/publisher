@@ -1,0 +1,190 @@
+name: Release launcher icons direct
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-launcher-icons-direct.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: |
+          python -m pip install --disable-pip-version-check google-auth requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq
+
+      - name: Export Publisher Android signing credentials securely
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell -c "import json; from apps.publisher.models import MobileApp; pkgs=['de.aplussolution.workforce','de.aplusesthetic.app']; out={p:MobileApp.objects.get(package_name=p).android_signing.get_credentials() for p in pkgs}; open('/tmp/launcher-signing.json','w').write(json.dumps(out))"
+          docker compose cp web:/tmp/launcher-signing.json /tmp/launcher-signing.json >/dev/null
+          chmod 600 /tmp/launcher-signing.json
+          REMOTE
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/launcher-signing.json /tmp/launcher-signing.json
+          chmod 600 /tmp/launcher-signing.json
+          python - <<'PY'
+          import base64, json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/launcher-signing.json').read_text())
+          for package, filename in [
+              ('de.aplussolution.workforce','/tmp/solution-upload.jks'),
+              ('de.aplusesthetic.app','/tmp/esthetic-upload.jks'),
+          ]:
+              c=data[package]
+              Path(filename).write_bytes(base64.b64decode(c['keystore_base64']))
+              Path(filename).chmod(0o600)
+              for key in ('key_alias','store_password','key_password'):
+                  if not c.get(key):
+                      raise SystemExit(f'Missing {key} for {package}')
+          PY
+
+      - name: Build signed A+ Solution versionCode 5
+        run: |
+          set -euo pipefail
+          git clone --no-tags https://github.com/hsdarestani/aplussolution.git /tmp/aplussolution
+          cd /tmp/aplussolution
+          git fetch --depth 1 origin 1d49500db4b8a02b2a0f1ac01ea314eb82984e00
+          git checkout 1d49500db4b8a02b2a0f1ac01ea314eb82984e00
+          export ANDROID_KEYSTORE_PATH=/tmp/solution-upload.jks
+          export ANDROID_KEYSTORE_PASSWORD="$(jq -r '."de.aplussolution.workforce".store_password' /tmp/launcher-signing.json)"
+          export ANDROID_KEY_ALIAS="$(jq -r '."de.aplussolution.workforce".key_alias' /tmp/launcher-signing.json)"
+          export ANDROID_KEY_PASSWORD="$(jq -r '."de.aplussolution.workforce".key_password' /tmp/launcher-signing.json)"
+          export APP_VERSION_NAME=1.0.0
+          export APP_BUILD_NUMBER=5
+          bash frontend/scripts/build-publisher-android.sh
+          AAB="$(find frontend/android/app/build/outputs/bundle/release -name '*.aab' -type f | head -n 1)"
+          test -n "$AAB" && test -s "$AAB"
+          cp "$AAB" /tmp/solution.aab
+          jarsigner -verify /tmp/solution.aab >/dev/null
+          sha256sum /tmp/solution.aab
+
+      - name: Build signed A+ Esthetic versionCode 4
+        run: |
+          set -euo pipefail
+          git clone --no-tags https://github.com/hsdarestani/a_esthetic.git /tmp/a_esthetic
+          cd /tmp/a_esthetic
+          git fetch --depth 1 origin c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298
+          git checkout c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298
+          export ANDROID_KEYSTORE_PATH=/tmp/esthetic-upload.jks
+          export ANDROID_KEYSTORE_PASSWORD="$(jq -r '."de.aplusesthetic.app".store_password' /tmp/launcher-signing.json)"
+          export ANDROID_KEY_ALIAS="$(jq -r '."de.aplusesthetic.app".key_alias' /tmp/launcher-signing.json)"
+          export ANDROID_KEY_PASSWORD="$(jq -r '."de.aplusesthetic.app".key_password' /tmp/launcher-signing.json)"
+          export APP_VERSION_NAME=1.0.0
+          export APP_BUILD_NUMBER=4
+          export REQUIRE_ANDROID_SIGNING=1
+          bash scripts/build-android.sh
+          test -s artifacts/a-esthetic-release.aab
+          cp artifacts/a-esthetic-release.aab /tmp/esthetic.aab
+          jarsigner -verify /tmp/esthetic.aab >/dev/null
+          sha256sum /tmp/esthetic.aab
+
+      - name: Upload both signed bundles to Google Play Production
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          test -n "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          API='https://androidpublisher.googleapis.com/androidpublisher/v3'
+          UPLOAD='https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+          SCOPE='https://www.googleapis.com/auth/androidpublisher'
+          apps=[
+              ('A+ Solution','de.aplussolution.workforce','/tmp/solution.aab','5'),
+              ('A+ Esthetic','de.aplusesthetic.app','/tmp/esthetic.aab','4'),
+          ]
+          info=json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds=service_account.Credentials.from_service_account_info(info,scopes=[SCOPE])
+          creds.refresh(Request())
+          session=AuthorizedSession(creds)
+
+          def require(r,label):
+              if r.ok:
+                  return r.json() if r.content else {}
+              try: detail=json.dumps(r.json(),ensure_ascii=False)
+              except Exception: detail=' '.join(r.text.split())[:3000]
+              raise RuntimeError(f'{label}: HTTP {r.status_code}: {detail}')
+
+          for name,package,path,expected_vc in apps:
+              pkg=quote(package,safe='._-')
+              edit=require(session.post(f'{API}/applications/{pkg}/edits',json={},timeout=60),f'{name} create edit')
+              eid=edit['id']
+              try:
+                  bundle=require(session.post(
+                      f'{UPLOAD}/applications/{pkg}/edits/{eid}/bundles',
+                      params={'uploadType':'media'},
+                      data=Path(path).read_bytes(),
+                      headers={'Content-Type':'application/octet-stream'},
+                      timeout=600,
+                  ),f'{name} upload bundle')
+                  vc=str(bundle['versionCode'])
+                  if vc != expected_vc:
+                      raise RuntimeError(f'{name}: uploaded versionCode={vc}, expected={expected_vc}')
+                  require(session.put(
+                      f'{API}/applications/{pkg}/edits/{eid}/tracks/production',
+                      json={'track':'production','releases':[{'name':'1.0.0','versionCodes':[vc],'status':'completed'}]},
+                      timeout=60,
+                  ),f'{name} production track')
+                  require(session.post(f'{API}/applications/{pkg}/edits/{eid}:validate',json={},timeout=60),f'{name} validate')
+                  commit=require(session.post(f'{API}/applications/{pkg}/edits/{eid}:commit',json={},timeout=60),f'{name} commit')
+                  print(f'SUCCESS {name}: versionCode={vc} committed to Production; edit={commit.get("id",eid)}')
+              except Exception:
+                  try: session.delete(f'{API}/applications/{pkg}/edits/{eid}',timeout=30)
+                  except Exception: pass
+                  raise
+          PY
+
+      - name: Reconcile Publisher records
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell -c "from django.utils import timezone; from apps.publisher.models import Release,Job,Submission; targets=[('1d49500db4b8a02b2a0f1ac01ea314eb82984e00','5'),('c8fa10ccb1d44e4c6d747fcf8c3954c1933d9298','4')]; [(lambda r,b,vc: (setattr(b,'status','succeeded'), setattr(b,'finished_at',timezone.now()), b.save(update_fields=['status','finished_at','updated_at']), Job.objects.filter(release=r,type='build_android',status__in=['queued','running','failed']).update(status='succeeded',progress=100,finished_at=timezone.now(),error=''), Job.objects.filter(release=r,type='upload_google',status__in=['failed','queued','running']).update(status='cancelled',error='Superseded by successful direct cloud upload.'), Job.objects.create(app=r.app,release=r,build=b,type='upload_google',status='succeeded',progress=100,result={'executor':'github-actions-direct','version_code':vc},logs='Google Play Production update committed successfully.',started_at=timezone.now(),finished_at=timezone.now()), Submission.objects.update_or_create(app=r.app,release=r,platform='android',defaults={'state':'in_review','submitted_at':timezone.now(),'raw':{'executor':'github-actions-direct','version_code':vc}}), setattr(r,'status','in_review'), r.save(update_fields=['status','updated_at']), print(f'{r.app.slug}: release={r.pk} build={r.build_number} -> in_review')))(r,r.builds.filter(platform='android').first(),vc) for s,vc in targets for r in [Release.objects.filter(source_commit=s).order_by('-created_at').first()] if r]"
+          rm -f /tmp/launcher-signing.json
+          docker compose exec -T web rm -f /tmp/launcher-signing.json || true
+          REMOTE
+
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -f /tmp/launcher-signing.json /tmp/solution-upload.jks /tmp/esthetic-upload.jks

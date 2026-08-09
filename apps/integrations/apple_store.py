@@ -208,17 +208,107 @@ class AppleStoreClient:
         body = {"data": {"type": "appStoreReviewDetails", "attributes": attrs, "relationships": {"appStoreVersion": {"data": {"type": "appStoreVersions", "id": version_id}}}}}
         return self.request("POST", "/appStoreReviewDetails", data=json.dumps(body))["data"]
 
+    def list_review_submissions(self, app_id, state):
+        """List review submissions in one Apple state for safe retry handling."""
+        return self.request(
+            "GET",
+            f"/apps/{app_id}/reviewSubmissions?filter[state]={state}&limit=200",
+        ).get("data", [])
+
+    def list_review_submission_items(self, submission_id):
+        """List submission items with their App Store version relationship."""
+        return self.request(
+            "GET",
+            f"/reviewSubmissions/{submission_id}/items?fields[reviewSubmissionItems]=state,appStoreVersion&include=appStoreVersion&limit=200",
+        ).get("data", [])
+
+    @staticmethod
+    def _item_targets_version(item, version_id):
+        relationship = (
+            item.get("relationships", {})
+            .get("appStoreVersion", {})
+            .get("data")
+        )
+        return bool(relationship) and str(relationship.get("id")) == str(version_id)
+
+    def cancel_review_submission(self, submission_id):
+        body = {
+            "data": {
+                "type": "reviewSubmissions",
+                "id": str(submission_id),
+                "attributes": {"canceled": True},
+            }
+        }
+        return self.request(
+            "PATCH",
+            f"/reviewSubmissions/{submission_id}",
+            data=json.dumps(body),
+        )["data"]
+
+    def _review_submission_matches(self, submission, version_id):
+        items = self.list_review_submission_items(submission["id"])
+        item = next(
+            (item for item in items if self._item_targets_version(item, version_id)),
+            None,
+        )
+        return item, items
+
     def submit_version(self, app_id, version_id):
-        body = {"data": {"type": "reviewSubmissions", "attributes": {}, "relationships": {"app": {"data": {"type": "apps", "id": app_id}}}}}
-        submission = self.request("POST", "/reviewSubmissions", data=json.dumps(body))["data"]
-        item_body = {"data": {"type": "reviewSubmissionItems", "relationships": {
-            "reviewSubmission": {"data": {"type": "reviewSubmissions", "id": submission["id"]}},
-            "appStoreVersion": {"data": {"type": "appStoreVersions", "id": version_id}},
-        }}}
-        item = self.request("POST", "/reviewSubmissionItems", data=json.dumps(item_body))["data"]
+        """Submit a version idempotently without leaking review-submission slots.
+
+        App Store Connect keeps a READY_FOR_REVIEW submission when final review
+        eligibility fails. Repeatedly POSTing a new reviewSubmission then leaks
+        Apple's finite concurrent-submission slots. Reuse the draft that already
+        contains this version, cancel only duplicate drafts for the same version,
+        and treat a matching WAITING_FOR_REVIEW/IN_REVIEW submission as success.
+        """
+        for state in ("WAITING_FOR_REVIEW", "IN_REVIEW"):
+            for submission in self.list_review_submissions(app_id, state):
+                item, _ = self._review_submission_matches(submission, version_id)
+                if item:
+                    return {
+                        "submission": submission,
+                        "item": item,
+                        "reused": True,
+                        "already_submitted": True,
+                    }
+
+        ready_matches = []
+        empty_ready = []
+        for submission in self.list_review_submissions(app_id, "READY_FOR_REVIEW"):
+            item, items = self._review_submission_matches(submission, version_id)
+            if item:
+                ready_matches.append((submission, item))
+            elif not items:
+                # A previous failure between ReviewSubmission creation and item
+                # creation can leave an empty draft consuming concurrency. Empty
+                # READY drafts are safe to cancel; never touch unrelated items.
+                empty_ready.append(submission)
+
+        for submission in empty_ready:
+            self.cancel_review_submission(submission["id"])
+
+        if ready_matches:
+            submission, item = ready_matches[0]
+            for duplicate, _ in ready_matches[1:]:
+                self.cancel_review_submission(duplicate["id"])
+        else:
+            body = {"data": {"type": "reviewSubmissions", "attributes": {}, "relationships": {"app": {"data": {"type": "apps", "id": app_id}}}}}
+            submission = self.request("POST", "/reviewSubmissions", data=json.dumps(body))["data"]
+            item_body = {"data": {"type": "reviewSubmissionItems", "relationships": {
+                "reviewSubmission": {"data": {"type": "reviewSubmissions", "id": submission["id"]}},
+                "appStoreVersion": {"data": {"type": "appStoreVersions", "id": version_id}},
+            }}}
+            item = self.request("POST", "/reviewSubmissionItems", data=json.dumps(item_body))["data"]
+
         submit_body = {"data": {"type": "reviewSubmissions", "id": submission["id"], "attributes": {"submitted": True}}}
         final = self.request("PATCH", f"/reviewSubmissions/{submission['id']}", data=json.dumps(submit_body))["data"]
-        return {"submission": final, "item": item}
+        return {
+            "submission": final,
+            "item": item,
+            "reused": bool(ready_matches),
+            "cancelled_duplicates": max(0, len(ready_matches) - 1) + len(empty_ready),
+        }
 
     def ensure_analytics_request(self, app_id, access_type="ONGOING"):
         existing = self.request("GET", f"/apps/{app_id}/analyticsReportRequests?limit=10").get("data", [])

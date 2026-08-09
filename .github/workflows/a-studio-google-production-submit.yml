@@ -61,7 +61,7 @@ jobs:
           fi
           echo "AAB_SHA256=$ACTUAL_SHA" >> "$GITHUB_ENV"
 
-      - name: Upload AAB and submit Production release for review
+      - name: Register AAB on Production and attempt first rollout
         env:
           GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -73,15 +73,13 @@ jobs:
           from pathlib import Path
           from urllib.parse import quote
 
-          import requests
           from google.auth.transport.requests import AuthorizedSession, Request
           from google.oauth2 import service_account
 
           package = os.environ['PACKAGE_NAME']
           version_name = os.environ['VERSION_NAME']
           expected_version_code = os.environ['BUILD_NUMBER']
-          raw = os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON']
-          info = json.loads(raw)
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
           creds = service_account.Credentials.from_service_account_info(
               info,
               scopes=['https://www.googleapis.com/auth/androidpublisher'],
@@ -92,119 +90,178 @@ jobs:
           upload = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
           q = lambda value: quote(str(value), safe='._-')
 
+          def detail(resp):
+              try:
+                  return json.dumps(resp.json(), ensure_ascii=False)
+              except Exception:
+                  return ' '.join(resp.text.replace('\n', ' ').split())[:5000]
+
           def require(resp, label):
               if not resp.ok:
-                  try:
-                      detail = json.dumps(resp.json(), ensure_ascii=False)
-                  except Exception:
-                      detail = ' '.join(resp.text.replace('\n', ' ').split())[:4000]
-                  raise RuntimeError(f'{label}: HTTP {resp.status_code} {detail}')
+                  raise RuntimeError(f'{label}: HTTP {resp.status_code} {detail(resp)}')
               return resp.json() if resp.content else {}
 
-          edit = require(
-              session.post(f'{api}/applications/{q(package)}/edits', json={}, timeout=60),
-              'Create edit',
-          )
-          edit_id = edit['id']
-          print('edit_id=' + edit_id)
+          def create_edit():
+              return require(
+                  session.post(f'{api}/applications/{q(package)}/edits', json={}, timeout=60),
+                  'Create edit',
+              )['id']
 
-          try:
-              bundles = require(
+          def delete_edit(edit_id):
+              try:
+                  session.delete(f'{api}/applications/{q(package)}/edits/{q(edit_id)}', timeout=30)
+              except Exception:
+                  pass
+
+          def list_bundles(edit_id):
+              return require(
                   session.get(
                       f'{api}/applications/{q(package)}/edits/{q(edit_id)}/bundles',
                       timeout=60,
                   ),
-                  'List existing bundles',
+                  'List bundles',
               ).get('bundles', [])
 
+          def ensure_bundle(edit_id):
+              bundles = list_bundles(edit_id)
               bundle = next(
                   (item for item in bundles if str(item.get('versionCode')) == str(expected_version_code)),
                   None,
               )
               if bundle:
                   print(f'bundle_reused=true version_code={bundle["versionCode"]}')
-              else:
-                  data = Path('a-studio-release.aab').read_bytes()
-                  resp = session.post(
+                  return bundle
+              data = Path('a-studio-release.aab').read_bytes()
+              bundle = require(
+                  session.post(
                       f'{upload}/applications/{q(package)}/edits/{q(edit_id)}/bundles',
                       params={'uploadType': 'media'},
                       data=data,
                       headers={'Content-Type': 'application/octet-stream'},
                       timeout=600,
-                  )
-                  bundle = require(resp, 'Upload AAB')
-                  print(f'bundle_uploaded=true version_code={bundle["versionCode"]}')
+                  ),
+                  'Upload AAB',
+              )
+              print(f'bundle_uploaded=true version_code={bundle["versionCode"]}')
+              return bundle
 
-              version_code = str(bundle['versionCode'])
-              if version_code != str(expected_version_code):
-                  raise RuntimeError(
-                      f'Unexpected Android versionCode {version_code}; expected {expected_version_code}.'
-                  )
-
-              track_body = {
+          def track_body(version_code, status):
+              return {
                   'track': 'production',
                   'releases': [{
                       'name': version_name,
-                      'versionCodes': [version_code],
-                      'status': 'completed',
+                      'versionCodes': [str(version_code)],
+                      'status': status,
                       'releaseNotes': [{
                           'language': 'de-DE',
                           'text': 'Erste Version von A+ Studio mit AI Builder, Projektverwaltung, Preview, Publishing und Store-Anfragen.',
                       }],
                   }],
               }
-              require(
+
+          def set_track(edit_id, version_code, status):
+              return require(
                   session.put(
                       f'{api}/applications/{q(package)}/edits/{q(edit_id)}/tracks/production',
-                      json=track_body,
+                      json=track_body(version_code, status),
                       timeout=60,
                   ),
-                  'Update Production track',
+                  f'Update Production track status={status}',
               )
-              require(
+
+          def validate(edit_id):
+              return require(
                   session.post(
                       f'{api}/applications/{q(package)}/edits/{q(edit_id)}:validate',
                       json={},
                       timeout=60,
                   ),
-                  'Validate production edit',
+                  'Validate edit',
               )
-              committed = require(
+
+          def commit(edit_id):
+              return require(
                   session.post(
                       f'{api}/applications/{q(package)}/edits/{q(edit_id)}:commit',
-                      json={},
+                      params={'changesInReviewBehavior': 'CANCEL_IN_REVIEW_AND_SUBMIT'},
                       timeout=60,
                   ),
-                  'Commit production edit / send for review',
+                  'Commit edit',
               )
-              Path('google-production-result.json').write_text(
-                  json.dumps({
-                      'success': True,
-                      'package_name': package,
-                      'track': 'production',
-                      'version_name': version_name,
-                      'version_code': version_code,
-                      'bundle': bundle,
-                      'edit': committed,
-                      'aab_sha256': os.environ.get('AAB_SHA256', ''),
-                  }, indent=2, ensure_ascii=False),
-                  encoding='utf-8',
-              )
-              print('GOOGLE_PRODUCTION_SUBMITTED=true')
-              print('version_code=' + version_code)
+
+          # Phase 1: first production release on a brand-new Play app must exist as draft.
+          edit1 = create_edit()
+          print('phase1_edit=' + edit1)
+          try:
+              bundle = ensure_bundle(edit1)
+              version_code = str(bundle['versionCode'])
+              if version_code != str(expected_version_code):
+                  raise RuntimeError(f'Unexpected versionCode {version_code}; expected {expected_version_code}.')
+              set_track(edit1, version_code, 'draft')
+              validate(edit1)
+              committed1 = commit(edit1)
+              print('production_draft_committed=true')
           except Exception:
-              try:
-                  session.delete(
-                      f'{api}/applications/{q(package)}/edits/{q(edit_id)}',
-                      timeout=30,
-                  )
-              except Exception:
-                  pass
+              delete_edit(edit1)
               raise
+
+          # Phase 2: now that the Production draft exists, ask Google to transition the
+          # same release to completed and submit it. Some first-launch apps still force
+          # this final transition through Play Console; preserve the committed draft if so.
+          final_submitted = False
+          final_error = ''
+          committed2 = None
+          edit2 = create_edit()
+          print('phase2_edit=' + edit2)
+          try:
+              track = require(
+                  session.get(
+                      f'{api}/applications/{q(package)}/edits/{q(edit2)}/tracks/production',
+                      timeout=60,
+                  ),
+                  'Read Production track',
+              )
+              releases = track.get('releases') or []
+              matched = next(
+                  (release for release in releases if str(version_code) in [str(v) for v in release.get('versionCodes', [])]),
+                  None,
+              )
+              if not matched:
+                  raise RuntimeError('Committed Production draft release is not visible in the follow-up edit.')
+              set_track(edit2, version_code, 'completed')
+              validate(edit2)
+              committed2 = commit(edit2)
+              final_submitted = True
+              print('GOOGLE_PRODUCTION_SUBMITTED=true')
+          except Exception as exc:
+              final_error = str(exc)
+              print('GOOGLE_PRODUCTION_SUBMITTED=false')
+              print('phase2_error=' + final_error)
+              delete_edit(edit2)
+
+          result = {
+              'success': True,
+              'package_name': package,
+              'track': 'production',
+              'version_name': version_name,
+              'version_code': version_code,
+              'bundle': bundle,
+              'draft_edit': committed1,
+              'submitted_for_review': final_submitted,
+              'submission_edit': committed2,
+              'submission_error': final_error,
+              'needs_console_start_rollout': not final_submitted,
+              'aab_sha256': os.environ.get('AAB_SHA256', ''),
+          }
+          Path('google-production-result.json').write_text(
+              json.dumps(result, indent=2, ensure_ascii=False),
+              encoding='utf-8',
+          )
+          print('version_code=' + version_code)
+          print('needs_console_start_rollout=' + str(not final_submitted).lower())
           PY
 
-      - name: Sync successful Google submission back into Publisher
-        if: success()
+      - name: Sync Google production state back into Publisher
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -213,9 +270,9 @@ jobs:
           set -euo pipefail
           export SSHPASS="$PASS"
           PORT="${SSH_PORT:-22}"
-          RESULT="$(tr -d '\n' < google-production-result.json | sed "s/'/'\\''/g")"
+          RESULT_B64="$(base64 -w0 google-production-result.json)"
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import json; from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=1); raw=json.loads('$RESULT'); Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review','external_id':str(raw.get('version_code','')),'submitted_at':timezone.now(),'raw':raw}); r.status='in_review'; r.save(update_fields=['status','updated_at']); print('publisher_google_submission_synced=true')\""
+            "cd /opt/aplus-publisher && docker compose exec -T -e RESULT_B64='$RESULT_B64' web python manage.py shell -c \"import os,base64,json; from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; raw=json.loads(base64.b64decode(os.environ['RESULT_B64'])); a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=1); submitted=bool(raw.get('submitted_for_review')); Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review' if submitted else 'draft','external_id':str(raw.get('version_code','')),'submitted_at':timezone.now() if submitted else None,'raw':raw}); r.status='in_review' if submitted else 'uploaded'; r.save(update_fields=['status','updated_at']); print('publisher_google_submission_synced='+str(submitted).lower())\""
 
       - name: Upload sanitized production result
         if: always()

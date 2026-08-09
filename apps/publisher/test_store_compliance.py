@@ -37,6 +37,9 @@ class AppleStoreComplianceTests(SimpleTestCase):
         self.assertEqual(profile["sexualContentOrNudity"], "NONE")
         self.assertEqual(profile["violenceRealistic"], "NONE")
         self.assertIsNone(profile["kidsAgeBand"])
+        self.assertNotIn("ageRatingOverride", profile)
+        self.assertEqual(profile["ageRatingOverrideV2"], "NONE")
+        self.assertEqual(profile["koreaAgeRatingOverride"], "NONE")
 
     def test_profile_is_returned_as_a_copy(self):
         first = apple_age_rating_profile(self.a_studio)

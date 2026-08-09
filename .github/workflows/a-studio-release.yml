@@ -6,6 +6,8 @@ on:
     paths:
       - '.github/workflows/a-studio-release.yml'
       - 'apps/signing/management/commands/bootstrap_a_studio.py'
+      - 'apps/publisher/job_recovery.py'
+      - 'apps/publisher/management/commands/recover_a_studio_jobs.py'
       - 'apps/integrations/apple_assets.py'
       - 'apps/publisher/tasks.py'
   push:
@@ -13,6 +15,8 @@ on:
     paths:
       - '.github/workflows/a-studio-release.yml'
       - 'apps/signing/management/commands/bootstrap_a_studio.py'
+      - 'apps/publisher/job_recovery.py'
+      - 'apps/publisher/management/commands/recover_a_studio_jobs.py'
       - 'apps/integrations/apple_assets.py'
       - 'apps/publisher/tasks.py'
 
@@ -38,9 +42,13 @@ jobs:
           ALLOWED_HOSTS: localhost,127.0.0.1
         run: |
           python manage.py check
+          python manage.py test apps.publisher.test_job_recovery
           python manage.py help bootstrap_a_studio >/dev/null
+          python manage.py help recover_a_studio_jobs >/dev/null
           python -m py_compile \
             apps/signing/management/commands/bootstrap_a_studio.py \
+            apps/publisher/job_recovery.py \
+            apps/publisher/management/commands/recover_a_studio_jobs.py \
             apps/integrations/apple_assets.py \
             apps/publisher/tasks.py
 
@@ -50,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Bootstrap A+ Studio in Publisher
+      - name: Recover stale jobs and bootstrap A+ Studio in Publisher
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -61,15 +69,17 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           for i in $(seq 1 90); do
             if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/signing/management/commands/bootstrap_a_studio.py"; then
+              "cd /opt/aplus-publisher && docker compose exec -T web test -f /app/apps/publisher/management/commands/recover_a_studio_jobs.py"; then
               break
             fi
             if [ "$i" -eq 90 ]; then
-              echo 'A+ Studio bootstrap command never appeared in production.' >&2
+              echo 'A+ Studio recovery command never appeared in production.' >&2
               exit 2
             fi
             sleep 5
           done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py recover_a_studio_jobs --app-version 1.0.0 --build-number 1 --stale-after-minutes 10"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --queue --publish"
 
@@ -125,4 +135,4 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"
 
-# Release resume trigger: supported Apple App Store version query deployed; reuse VALID binary and submit.
+# Release recovery: stale internal store jobs are failed only after a safe timeout so retries can proceed idempotently.

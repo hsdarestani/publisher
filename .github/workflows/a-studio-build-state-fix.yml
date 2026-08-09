@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/a-studio-build-state-fix.yml'
       - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/agent_lifecycle.py'
       - 'apps/publisher/urls.py'
       - 'apps/publisher/test_agent_completion.py'
       - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
@@ -14,6 +15,7 @@ on:
     paths:
       - '.github/workflows/a-studio-build-state-fix.yml'
       - 'apps/publisher/agent_completion.py'
+      - 'apps/publisher/agent_lifecycle.py'
       - 'apps/publisher/urls.py'
       - 'apps/publisher/test_agent_completion.py'
       - 'apps/signing/management/commands/normalize_a_studio_artifacts.py'
@@ -42,7 +44,10 @@ jobs:
           python manage.py check
           python manage.py test apps.publisher.test_agent_completion
           python manage.py help normalize_a_studio_artifacts >/dev/null
-          python -m py_compile apps/publisher/agent_completion.py apps/signing/management/commands/normalize_a_studio_artifacts.py
+          python -m py_compile \
+            apps/publisher/agent_completion.py \
+            apps/publisher/agent_lifecycle.py \
+            apps/signing/management/commands/normalize_a_studio_artifacts.py
 
   normalize:
     if: github.event_name != 'pull_request'

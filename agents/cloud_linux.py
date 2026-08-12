@@ -206,7 +206,10 @@ class CloudLinuxAgent(CloudMacAgent):
             if not files:
                 raise RuntimeError(f"Build completed but no AAB matched: {pattern}")
             artifact = max(files, key=lambda path: path.stat().st_mtime)
-            self._run(job_id, ["jarsigner", "-verify", "-verbose", "-certs", str(artifact)], repo_dir, 86)
+            # AABs are ordinary JAR containers. A concise verification is enough
+            # to fail on an invalid signature; verbose mode emits one line per
+            # bundle entry and can add minutes plus megabytes of logs.
+            self._run(job_id, ["jarsigner", "-verify", str(artifact)], repo_dir, 86)
             self.log(job_id, f"Signed AAB ready: {artifact.relative_to(repo_dir)}", 92)
             return artifact, {
                 "sha256": self.sha256(artifact),

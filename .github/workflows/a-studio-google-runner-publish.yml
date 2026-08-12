@@ -1,0 +1,281 @@
+name: Publish A+ Studio v2 to Google Play from runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-google-runner-publish.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-studio-google-runner-publish-v2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Install transfer and Google auth dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install -q 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Retrieve signed AAB and service-account credentials from Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django,base64,json; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp; a=MobileApp.objects.select_related('google_account').get(slug='a-studio'); print(base64.b64encode(json.dumps(a.google_account.get_credentials()).encode()).decode())\"" \
+            | tail -n 1 | base64 -d > /tmp/google-play-service-account.json
+          chmod 600 /tmp/google-play-service-account.json
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django,sys; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from pathlib import Path; from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='android'); assert b.status=='succeeded' and b.artifact, b.status; sys.stdout.buffer.write(Path(b.artifact.path).read_bytes())\"" \
+            > /tmp/a-studio-v2.aab
+
+          EXPECTED_SHA="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); print(r.builds.get(platform='android').artifact_checksum)\"" | tail -n 1 | tr -d '\r')"
+          ACTUAL_SHA="$(sha256sum /tmp/a-studio-v2.aab | awk '{print $1}')"
+          test -n "$EXPECTED_SHA"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "AAB checksum mismatch: expected=$EXPECTED_SHA actual=$ACTUAL_SHA" >&2
+            exit 2
+          fi
+          echo "SIGNED_AAB_SHA256=$ACTUAL_SHA" >> "$GITHUB_ENV"
+          echo "Signed AAB transferred and verified: sha256=$ACTUAL_SHA"
+
+      - name: Publish versionCode 2 to Google Play production
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import time
+          from pathlib import Path
+          from urllib.parse import quote
+
+          import requests
+          from google.auth.transport.requests import AuthorizedSession, Request
+          from google.oauth2 import service_account
+
+          PKG = 'de.aplussolution.studio'
+          VERSION_CODE = '2'
+          PUBLISH_SCOPE = 'https://www.googleapis.com/auth/androidpublisher'
+          CLOUD_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
+          CREDS_PATH = '/tmp/google-play-service-account.json'
+          AAB_PATH = '/tmp/a-studio-v2.aab'
+
+          info = json.loads(Path(CREDS_PATH).read_text())
+          project_id = info.get('project_id', '')
+          print('identity=' + info.get('client_email', ''))
+          print('cloud_project=' + project_id)
+
+          # Best-effort Service Usage check. If the Android Publisher API is
+          # explicitly disabled and this identity can enable it, do so here.
+          try:
+              cloud_creds = service_account.Credentials.from_service_account_info(info, scopes=[CLOUD_SCOPE])
+              cloud_creds.refresh(Request())
+              cloud = AuthorizedSession(cloud_creds)
+              service_url = f'https://serviceusage.googleapis.com/v1/projects/{quote(project_id, safe="")}/services/androidpublisher.googleapis.com'
+              sr = cloud.get(service_url, timeout=30)
+              state = ''
+              if sr.ok:
+                  state = (sr.json() or {}).get('state', '')
+                  print(f'androidpublisher_service={state or "unknown"}')
+              else:
+                  try:
+                      detail = (sr.json().get('error') or {}).get('message', '')
+                  except Exception:
+                      detail = sr.text[:300]
+                  print(f'service_usage_probe=HTTP_{sr.status_code} {detail[:300]}')
+
+              if sr.ok and state == 'DISABLED':
+                  er = cloud.post(service_url + ':enable', json={}, timeout=60)
+                  if not er.ok:
+                      raise RuntimeError(f'Could not enable Android Publisher API: HTTP {er.status_code} {er.text[:500]}')
+                  operation = (er.json() or {}).get('name', '')
+                  print('androidpublisher_enable_requested=true')
+                  if operation:
+                      for _ in range(30):
+                          op = cloud.get('https://serviceusage.googleapis.com/v1/' + operation.lstrip('/'), timeout=30)
+                          if op.ok and (op.json() or {}).get('done'):
+                              break
+                          time.sleep(2)
+                  time.sleep(5)
+          except Exception as exc:
+              # Service Usage access is not required when the Play API is already enabled.
+              print('service_usage_note=' + str(exc)[:500])
+
+          creds = service_account.Credentials.from_service_account_info(info, scopes=[PUBLISH_SCOPE])
+          creds.refresh(Request())
+          session = AuthorizedSession(creds)
+          endpoints = [
+              ('androidpublisher.googleapis.com',
+               'https://androidpublisher.googleapis.com/androidpublisher/v3',
+               'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'),
+              ('www.googleapis.com legacy',
+               'https://www.googleapis.com/androidpublisher/v3',
+               'https://www.googleapis.com/upload/androidpublisher/v3'),
+          ]
+
+          def safe_body(resp):
+              try:
+                  return json.dumps(resp.json(), ensure_ascii=False)[:1200]
+              except Exception:
+                  return ' '.join(resp.text.split())[:1200]
+
+          chosen = None
+          failures = []
+          for name, api_base, upload_base in endpoints:
+              r = session.post(
+                  f'{api_base}/applications/{quote(PKG, safe="._-")}/edits',
+                  json={}, timeout=60,
+              )
+              if r.ok:
+                  chosen = (name, api_base, upload_base, r.json()['id'])
+                  print(f'play_edit_opened={name}')
+                  break
+              failures.append((name, r.status_code, safe_body(r)))
+              print(f'play_edit_probe={name} HTTP_{r.status_code} {safe_body(r)}')
+          if not chosen:
+              raise RuntimeError('Google Play edits.insert failed from GitHub runner: ' + repr(failures))
+
+          name, api_base, upload_base, edit_id = chosen
+          qpkg = quote(PKG, safe='._-')
+          try:
+              # Upload the new signed AAB. A versionCode can only be uploaded once;
+              # if v2 already exists because an earlier edit reached Google, reuse it.
+              bundles_url = f'{api_base}/applications/{qpkg}/edits/{edit_id}/bundles'
+              listed = session.get(bundles_url, timeout=60)
+              if not listed.ok:
+                  raise RuntimeError(f'List bundles failed: HTTP {listed.status_code} {safe_body(listed)}')
+              existing = next((b for b in (listed.json().get('bundles') or []) if str(b.get('versionCode')) == VERSION_CODE), None)
+              if existing:
+                  bundle = existing
+                  print('bundle_reused=true')
+              else:
+                  payload = Path(AAB_PATH).read_bytes()
+                  ur = session.post(
+                      f'{upload_base}/applications/{qpkg}/edits/{edit_id}/bundles',
+                      params={'uploadType': 'media'},
+                      data=payload,
+                      headers={'Content-Type': 'application/octet-stream'},
+                      timeout=600,
+                  )
+                  if not ur.ok:
+                      raise RuntimeError(f'AAB upload failed: HTTP {ur.status_code} {safe_body(ur)}')
+                  bundle = ur.json()
+                  print('bundle_uploaded=true')
+
+              returned_code = str(bundle.get('versionCode'))
+              if returned_code != VERSION_CODE:
+                  raise RuntimeError(f'Expected versionCode {VERSION_CODE}, got {returned_code}')
+
+              track_body = {
+                  'track': 'production',
+                  'releases': [{
+                      'name': '1.0.0 (2)',
+                      'versionCodes': [VERSION_CODE],
+                      'status': 'completed',
+                      'releaseNotes': [{
+                          'language': 'de-DE',
+                          'text': 'Aktualisiertes App-Icon und kleinere Verbesserungen für Android.',
+                      }],
+                  }],
+              }
+              tr = session.put(
+                  f'{api_base}/applications/{qpkg}/edits/{edit_id}/tracks/production',
+                  json=track_body, timeout=120,
+              )
+              if not tr.ok:
+                  raise RuntimeError(f'Production track update failed: HTTP {tr.status_code} {safe_body(tr)}')
+
+              vr = session.post(
+                  f'{api_base}/applications/{qpkg}/edits/{edit_id}:validate',
+                  json={}, timeout=120,
+              )
+              if not vr.ok:
+                  raise RuntimeError(f'Edit validation failed: HTTP {vr.status_code} {safe_body(vr)}')
+
+              cr = session.post(
+                  f'{api_base}/applications/{qpkg}/edits/{edit_id}:commit',
+                  params={'changesInReviewBehavior': 'ERROR_IF_IN_REVIEW'},
+                  json={}, timeout=120,
+              )
+              if not cr.ok:
+                  raise RuntimeError(f'Edit commit failed: HTTP {cr.status_code} {safe_body(cr)}')
+              print('GOOGLE_PLAY_PUBLISH=SUCCESS')
+              print('package=' + PKG)
+              print('track=production')
+              print('version_code=' + VERSION_CODE)
+              print('endpoint=' + name)
+          except Exception:
+              try:
+                  session.delete(f'{api_base}/applications/{qpkg}/edits/{edit_id}', timeout=60)
+              except Exception:
+                  pass
+              raise
+
+          # Verify via a fresh edit after commit.
+          er = session.post(f'{api_base}/applications/{qpkg}/edits', json={}, timeout=60)
+          if not er.ok:
+              raise RuntimeError(f'Post-commit verification edit failed: HTTP {er.status_code} {safe_body(er)}')
+          verify_id = er.json()['id']
+          try:
+              rr = session.get(
+                  f'{api_base}/applications/{qpkg}/edits/{verify_id}/tracks/production',
+                  timeout=60,
+              )
+              if not rr.ok:
+                  raise RuntimeError(f'Production verify failed: HTTP {rr.status_code} {safe_body(rr)}')
+              releases = rr.json().get('releases') or []
+              match = next((x for x in releases if VERSION_CODE in [str(v) for v in x.get('versionCodes', [])]), None)
+              if not match:
+                  raise RuntimeError('versionCode 2 is not present on production after commit: ' + json.dumps(rr.json())[:1500])
+              print('PLAY_VERIFY=SUCCESS')
+              print('release_status=' + str(match.get('status', '')))
+              print('release_name=' + str(match.get('name', '')))
+              Path('/tmp/play-result.json').write_text(json.dumps({
+                  'package_name': PKG,
+                  'track': 'production',
+                  'version_code': VERSION_CODE,
+                  'status': match.get('status', ''),
+                  'name': match.get('name', ''),
+                  'endpoint': name,
+              }))
+          finally:
+              session.delete(f'{api_base}/applications/{qpkg}/edits/{verify_id}', timeout=60)
+          PY
+
+      - name: Record successful Google Play submission in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='android'); Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review','external_id':'2','submitted_at':timezone.now(),'raw':{'binary_only':True,'package_name':a.package_name,'track':'production','version_code':'2','artifact_sha256':b.artifact_checksum or '','publisher_path':'github-hosted-runner'}}); r.status='in_review'; r.save(update_fields=['status','updated_at']); print('publisher_submission_recorded=true')\""
+
+      - name: Remove temporary credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f /tmp/google-play-service-account.json /tmp/a-studio-v2.aab /tmp/play-result.json

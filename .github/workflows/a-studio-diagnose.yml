@@ -72,3 +72,45 @@ jobs:
           print(json.dumps(infos, indent=2, sort_keys=True))
           print("age_rating_info_end")
           PY
+
+      - name: Inspect current App Review submission state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app = MobileApp.objects.get(slug="a-studio")
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record["id"], "1.0.0")
+          if not version:
+              version = next((v for v in client.list_versions(record["id"]) if v.get("attributes", {}).get("versionString") == "1.0.0"), None)
+          if not version:
+              raise SystemExit("A+ Studio App Store version 1.0.0 not found")
+          version_id = version["id"]
+          matches = []
+          for state in ("READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW", "UNRESOLVED_ISSUES", "COMPLETE"):
+              try:
+                  submissions = client.list_review_submissions(record["id"], state)
+              except Exception:
+                  submissions = []
+              for submission in submissions:
+                  for item in client.list_review_submission_items(submission["id"]):
+                      rel = item.get("relationships", {}).get("appStoreVersion", {}).get("data") or {}
+                      if str(rel.get("id")) == str(version_id):
+                          matches.append({
+                              "submission_id": submission["id"],
+                              "submission_state": state,
+                              "item_id": item["id"],
+                              "item_state": item.get("attributes", {}).get("state"),
+                          })
+          print("app_review_status=" + json.dumps(matches, sort_keys=True))
+          PY

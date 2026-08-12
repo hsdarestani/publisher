@@ -1,0 +1,240 @@
+name: Resubmit A+ Studio App Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-review-resubmit.yml'
+
+permissions:
+  contents: read
+
+env:
+  APP_SLUG: a-studio
+  APP_VERSION: 1.0.0
+  BUILD_NUMBER: '3'
+
+jobs:
+  resubmit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Inspect and resubmit existing Apple review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Job, MobileApp, Submission
+
+          app = MobileApp.objects.get(slug='a-studio')
+          build = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=3,
+              platform='ios',
+          )
+          if build.status != 'succeeded' or not build.external_build_id:
+              raise SystemExit(f'Build 3 is not ready: status={build.status} external={build.external_build_id!r}')
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              versions = client.list_versions(record['id'])
+              version = next((v for v in versions if v.get('attributes', {}).get('versionString') == '1.0.0'), None)
+          if not version:
+              raise SystemExit('Could not find App Store version 1.0.0')
+
+          app_id = record['id']
+          version_id = version['id']
+          print(f'app_id={app_id}')
+          print(f'version_id={version_id}')
+          print(f'build_external_id={build.external_build_id}')
+
+          # List every current/recent review submission. Apple counts concurrent
+          # submissions globally for the app, so this also provides diagnostics.
+          response = client.request(
+              'GET',
+              f'/apps/{app_id}/reviewSubmissions?limit=200&include=items,appStoreVersionForReview&limit[items]=50&fields[reviewSubmissions]=state,submittedDate,platform,items,appStoreVersionForReview&fields[reviewSubmissionItems]=state,appStoreVersion',
+          )
+          submissions = response.get('data', [])
+          print('review_submissions_begin')
+          for sub in submissions:
+              state = sub.get('attributes', {}).get('state')
+              items = client.list_review_submission_items(sub['id'])
+              targets = []
+              for item in items:
+                  rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                  targets.append({
+                      'item_id': item['id'],
+                      'item_state': item.get('attributes', {}).get('state'),
+                      'version_id': rel.get('id'),
+                  })
+              print(json.dumps({'submission_id': sub['id'], 'state': state, 'items': targets}, sort_keys=True))
+          print('review_submissions_end')
+
+          def matching_items(sub):
+              values = []
+              for item in client.list_review_submission_items(sub['id']):
+                  rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                  if str(rel.get('id')) == str(version_id):
+                      values.append(item)
+              return values
+
+          # Correct path after a rejection: resolve the rejected app-version item
+          # inside the existing UNRESOLVED_ISSUES submission and resubmit that
+          # submission instead of creating a sixth concurrent submission.
+          target_submission = None
+          target_items = []
+          for sub in submissions:
+              if sub.get('attributes', {}).get('state') != 'UNRESOLVED_ISSUES':
+                  continue
+              items = matching_items(sub)
+              if items:
+                  target_submission = sub
+                  target_items = items
+                  break
+
+          if target_submission:
+              print(f'reusing_submission={target_submission["id"]}:UNRESOLVED_ISSUES')
+              for item in target_items:
+                  state = item.get('attributes', {}).get('state')
+                  print(f'current_item={item["id"]}:{state}')
+                  if state == 'REJECTED':
+                      body = {
+                          'data': {
+                              'type': 'reviewSubmissionItems',
+                              'id': item['id'],
+                              'attributes': {'resolved': True},
+                          }
+                      }
+                      updated = client.request(
+                          'PATCH', f'/reviewSubmissionItems/{item["id"]}', data=json.dumps(body)
+                      )['data']
+                      print(f'item_resolved={updated["id"]}:{updated.get("attributes", {}).get("state")}')
+
+              submit_body = {
+                  'data': {
+                      'type': 'reviewSubmissions',
+                      'id': target_submission['id'],
+                      'attributes': {'submitted': True},
+                  }
+              }
+              final = client.request(
+                  'PATCH', f'/reviewSubmissions/{target_submission["id"]}', data=json.dumps(submit_body)
+              )['data']
+              final_state = final.get('attributes', {}).get('state', '')
+              print(f'resubmitted_submission={final["id"]}:{final_state}')
+
+              Submission.objects.update_or_create(
+                  app=app,
+                  release=build.release,
+                  platform='ios',
+                  defaults={
+                      'state': 'in_review',
+                      'external_id': final['id'],
+                      'submitted_at': timezone.now(),
+                      'raw': {'submission': final, 'resubmitted_from_unresolved_issues': True},
+                      'last_error': '',
+                  },
+              )
+              build.release.status = 'in_review'
+              build.release.save(update_fields=['status', 'updated_at'])
+              print('RESULT=SUBMITTED')
+              raise SystemExit(0)
+
+          # If another automation already moved the same version into a review
+          # submission, report success rather than creating a duplicate.
+          for sub in submissions:
+              state = sub.get('attributes', {}).get('state')
+              if state not in {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+                  continue
+              items = matching_items(sub)
+              if not items:
+                  continue
+              if state == 'READY_FOR_REVIEW':
+                  submit_body = {
+                      'data': {
+                          'type': 'reviewSubmissions',
+                          'id': sub['id'],
+                          'attributes': {'submitted': True},
+                      }
+                  }
+                  final = client.request('PATCH', f'/reviewSubmissions/{sub["id"]}', data=json.dumps(submit_body))['data']
+                  state = final.get('attributes', {}).get('state', state)
+                  sub = final
+                  print(f'resubmitted_ready_submission={sub["id"]}:{state}')
+              else:
+                  print(f'already_active_submission={sub["id"]}:{state}')
+
+              Submission.objects.update_or_create(
+                  app=app,
+                  release=build.release,
+                  platform='ios',
+                  defaults={
+                      'state': 'in_review',
+                      'external_id': sub['id'],
+                      'submitted_at': timezone.now(),
+                      'raw': {'submission': sub, 'reused_existing_submission': True},
+                      'last_error': '',
+                  },
+              )
+              build.release.status = 'in_review'
+              build.release.save(update_fields=['status', 'updated_at'])
+              print('RESULT=SUBMITTED')
+              raise SystemExit(0)
+
+          raise SystemExit('No reusable review submission targets App Store version 1.0.0; refusing to mutate unrelated submissions.')
+          PY
+
+      - name: Verify Apple state after resubmit
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, MobileApp, Submission
+
+          app = MobileApp.objects.get(slug='a-studio')
+          build = Build.objects.get(release__app=app, release__version_name='1.0.0', release__build_number=3, platform='ios')
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              version = next(v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0')
+          version_id = version['id']
+          active = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW', 'UNRESOLVED_ISSUES'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == str(version_id):
+                          active.append({'submission_id': sub['id'], 'state': state, 'item_id': item['id'], 'item_state': item.get('attributes', {}).get('state')})
+          print('apple_active_for_version=' + json.dumps(active, sort_keys=True))
+          db = Submission.objects.filter(release=build.release, platform='ios').first()
+          print('publisher_submission_id=' + (db.external_id if db else '-'))
+          print('publisher_submission_state=' + (db.state if db else 'missing'))
+          if not any(row['state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'} for row in active):
+              raise SystemExit('Build 3/version 1.0.0 is not Waiting for Review or In Review after resubmit.')
+          PY

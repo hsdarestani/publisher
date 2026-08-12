@@ -1,0 +1,32 @@
+name: Inspect A+ Studio Android v2 state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-v2-status-now.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - name: Inspect Publisher release and Android build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='android'); print('RELEASE|'+r.status); print('BUILD|'+b.status+'|artifact='+str(bool(b.artifact))+'|sha='+str(b.artifact_checksum or '')); print('BUILD_LOG_TAIL'); print((b.logs or '')[-8000:]); print('JOBS'); [print(j.id,j.type,j.status,(j.error or '')[-1000:]) for j in r.jobs.order_by('-created_at')[:10]]\""

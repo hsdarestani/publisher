@@ -11,8 +11,6 @@ permissions:
   contents: read
   actions: write
 
-environment:
-
 concurrency:
   group: a-studio-android-icon-v2
   cancel-in-progress: false

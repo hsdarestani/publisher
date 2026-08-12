@@ -1,0 +1,293 @@
+name: A+ Studio iOS Build 3 to App Store
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-build3-submit.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  REVIEW_ARTIFACT_URL: 'https://sdmntprnortheu.oaiusercontent.com/files/00000000-dae8-81f4-9380-a178cf04da3d/raw?se=2026-08-12T16%3A23%3A01Z&sp=r&sv=2026-02-06&sr=b&scid=ca262c24-6fd1-5b71-9dd3-9091b7f4f68f&skoid=9b41a688-1b44-4731-856e-b0efcf3660ed&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-08-12T07%3A54%3A19Z&ske=2026-08-13T07%3A54%3A19Z&sks=b&skv=2026-02-06&sig=Q%2B4JygtT%2BFiUvRG2Yn2bDDopI8R1Cj6Eq8oWIenbTDE%3D'
+
+jobs:
+  release-ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass unzip >/dev/null
+
+      - name: Load dedicated Apple reviewer credentials
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --max-time 60 "$REVIEW_ARTIFACT_URL" -o /tmp/review.zip
+          REVIEW_TEXT="$(unzip -p /tmp/review.zip review-credentials.txt)"
+          REVIEW_EMAIL="$(printf '%s\n' "$REVIEW_TEXT" | sed -n 's/^Email: //p' | head -n1)"
+          REVIEW_PASSWORD="$(printf '%s\n' "$REVIEW_TEXT" | sed -n 's/^Password: //p' | head -n1)"
+          test -n "$REVIEW_EMAIL"
+          test -n "$REVIEW_PASSWORD"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          echo "REVIEW_EMAIL_B64=$(printf '%s' "$REVIEW_EMAIL" | base64 -w0)" >> "$GITHUB_ENV"
+          echo "REVIEW_PASSWORD_B64=$(printf '%s' "$REVIEW_PASSWORD" | base64 -w0)" >> "$GITHUB_ENV"
+          rm -f /tmp/review.zip
+
+      - name: Wait for Publisher production
+        run: |
+          curl --fail --silent --show-error \
+            --retry 30 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/ >/dev/null
+
+      - name: Prepare Apple-only Build 3 and review information
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e REVIEW_EMAIL_B64='$REVIEW_EMAIL_B64' -e REVIEW_PASSWORD_B64='$REVIEW_PASSWORD_B64' web python manage.py shell" <<'PY'
+          import base64
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import AppAsset, Build, Job, MobileApp, Release, Submission
+
+          app = MobileApp.objects.get(slug='a-studio')
+          email = base64.b64decode(os.environ['REVIEW_EMAIL_B64']).decode()
+          password = base64.b64decode(os.environ['REVIEW_PASSWORD_B64']).decode()
+
+          app.requires_login = True
+          app.review_username = email
+          app.set_review_password(password)
+          app.review_notes = (
+              "Dedicated App Review account with full access is provided. The workspace contains a pre-populated "
+              "project named 'Luna Booking' with a ready Preview and an existing AI Builder conversation, so the "
+              "main app creation, editing, preview and publishing workflow can be reviewed immediately. Reviewers "
+              "may also create a new project. No purchase, subscription or two-factor authentication is required. "
+              "The iOS binary has been revised to remove references and UI related to Google Play or other third-party "
+              "app distribution platforms."
+          )
+          config = dict(app.build_config or {})
+          config['ios_command'] = 'bash scripts/build-ios.sh'
+          config['ios_artifact'] = 'artifacts/a-studio.ipa'
+          app.build_config = config
+          app.save(update_fields=[
+              'requires_login', 'review_username', 'review_password_blob', 'review_notes',
+              'build_config', 'updated_at'
+          ])
+
+          # Keep App Store metadata platform-neutral. Apple previously rejected a
+          # cross-store reference, so do not let Publisher write it back on submit.
+          loc = app.localizations.filter(locale='de-DE').first()
+          if loc:
+              loc.full_description = (
+                  "A+ Studio ist die mobile AI Software Factory von A+ Solution. Beschreiben Sie Ihre App-Idee, "
+                  "erstellen Sie einen ersten Preview-Build und verbessern Sie das Produkt direkt im AI Builder.\n\n"
+                  "Verwalten Sie Projekte, verfolgen Sie Build-Status und Versionen, öffnen Sie Previews und starten "
+                  "Sie nach Ihrer Freigabe den strukturierten Publishing-Prozess direkt aus dem Projekt.\n\n"
+                  "Die mobile App konzentriert sich auf den produktiven Builder-Workflow: Konto, Projekte, "
+                  "AI-Änderungen, Preview, Publishing und Store-Anfragen. Digitale Käufe oder externe Zahlungslinks "
+                  "sind in Version 1.0 bewusst nicht Bestandteil der mobilen App."
+              )
+              loc.release_notes = (
+                  "Aktualisierte Version mit verbessertem App-Review-Zugang und bereinigter iOS-Publishing-Oberfläche."
+              )
+              loc.save(update_fields=['full_description', 'release_notes', 'updated_at'])
+
+          # The fourth generated iOS screenshot contains a cross-store label. Keep
+          # the first three clean screenshots and exclude that one from Apple sync.
+          for asset in app.assets.filter(kind='screenshot', platform='ios', sort_order=3):
+              asset.delete()
+
+          release, _ = Release.objects.update_or_create(
+              app=app,
+              version_name='1.0.0',
+              build_number=3,
+              defaults={
+                  'status': 'building',
+                  'source_branch': 'main',
+                  'android_track': 'production',
+                  'android_rollout': 1,
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'release_notes': 'App Review fixes: iOS store references removed and dedicated review account provided.',
+              },
+          )
+
+          Job.objects.filter(
+              release=release,
+              type__in=['build_ios', 'upload_apple', 'submit_apple'],
+              status__in=['queued', 'running'],
+          ).update(status='cancelled', finished_at=timezone.now(), error='Superseded by clean Build 3 App Store release.')
+          Submission.objects.filter(release=release, platform='ios').delete()
+
+          build, _ = Build.objects.get_or_create(release=release, platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status = 'queued'
+          build.agent = None
+          build.commit_sha = ''
+          build.artifact = ''
+          build.artifact_size = 0
+          build.artifact_checksum = ''
+          build.logs = ''
+          build.started_at = None
+          build.finished_at = None
+          build.external_build_id = ''
+          build.metadata = {}
+          build.save()
+
+          job = Job.objects.create(
+              type='build_ios', app=app, release=release, build=build,
+              payload={'source': 'a-studio-ios-build3-app-review-fix'},
+              available_to_agents=True, required_platform='macos',
+          )
+          print(f'release_id={release.pk}')
+          print(f'build_id={build.pk}')
+          print(f'build_job_id={job.pk}')
+          print(f'review_username={app.review_username}')
+          print(f'review_password_configured={bool(app.get_review_password())}')
+          print(f'ios_screenshots={app.assets.filter(kind="screenshot", platform="ios").count()}')
+          PY
+
+      - name: Wake Cloud Mac for Build 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for iOS Build 3
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=3,platform='ios'); print(b.status)\"" | tail -n1)"
+            echo "Build 3 status: $STATE"
+            if [ "$STATE" = "succeeded" ]; then break; fi
+            if [ "$STATE" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__build_number=3,type='build_ios').order_by('-created_at').first(); print(j.error); print(j.logs[-12000:])\""
+              exit 1
+            fi
+            if [ "$i" -eq 90 ]; then echo 'Timed out waiting for Build 3.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Queue App Store upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Build, Job
+          b = Build.objects.get(release__app__slug='a-studio', release__version_name='1.0.0', release__build_number=3, platform='ios')
+          if not b.external_build_id and not Job.objects.filter(build=b, type='upload_apple', status__in=['queued','running','succeeded']).exists():
+              j = Job.objects.create(type='upload_apple', app=b.release.app, release=b.release, build=b,
+                                     payload={'source':'a-studio-ios-build3-app-review-fix'},
+                                     available_to_agents=True, required_platform='macos')
+              print(f'apple_upload_job={j.pk}')
+          else:
+              print('apple_upload_job=existing')
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for App Store build processing
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 100); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=3,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-'))\"" | tail -n1)"
+            echo "App Store upload: $DATA"
+            STATUS="${DATA%%|*}"
+            EXT="${DATA#*|}"
+            if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__build_number=3,type='upload_apple').order_by('-created_at').first(); print(j.error); print(j.logs[-12000:])\""
+              exit 1
+            fi
+            if [ "$i" -eq 100 ]; then echo 'Timed out waiting for App Store processing.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Submit Build 3 to App Review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Build, Job
+          from apps.publisher.tasks import enqueue_job
+          b = Build.objects.get(release__app__slug='a-studio', release__version_name='1.0.0', release__build_number=3, platform='ios')
+          existing = Job.objects.filter(build=b, type='submit_apple', status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if existing:
+              print(f'apple_submit_job={existing.pk}:{existing.status}')
+          else:
+              j = enqueue_job('submit_apple', app=b.release.app, release=b.release, build=b)
+              print(f'apple_submit_job={j.pk}:queued')
+          PY
+
+      - name: Verify App Review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=3,type='submit_apple').order_by('-created_at').first(); print(j.status if j else 'missing')\"" | tail -n1)"
+            echo "App Review submission: $STATE"
+            if [ "$STATE" = "succeeded" ]; then break; fi
+            if [ "$STATE" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__build_number=3,type='submit_apple').order_by('-created_at').first(); print(j.error); print(j.logs[-12000:]); print(j.result)\""
+              exit 1
+            fi
+            if [ "$i" -eq 90 ]; then echo 'Timed out waiting for App Review submission.' >&2; exit 1; fi
+            sleep 20
+          done
+
+      - name: Final Build 3 state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job,Submission; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=3,platform='ios'); s=Submission.objects.filter(release=b.release,platform='ios').first(); print('build_status='+b.status); print('external_build_id='+(b.external_build_id or '-')); print('submission_state='+(s.state if s else 'missing')); print('submission_id='+(s.external_id if s else '-'))\""

@@ -1,0 +1,59 @@
+name: Check A+ Studio App Review status
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/a-studio-review-status-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Read current App Store Connect review status
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='a-studio')
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          versions = client.list_versions(record['id'])
+          version = next((v for v in versions if v.get('attributes', {}).get('versionString') == '1.0.0'), None)
+          if not version:
+              raise SystemExit('A+ Studio App Store version 1.0.0 not found')
+          version_id = version['id']
+
+          active = []
+          for state in ('IN_REVIEW','WAITING_FOR_REVIEW','UNRESOLVED_ISSUES','READY_FOR_REVIEW','COMPLETE'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == str(version_id):
+                          active.append({
+                              'submission_id': sub['id'],
+                              'submission_state': state,
+                              'item_id': item['id'],
+                              'item_state': item.get('attributes', {}).get('state'),
+                              'submitted_date': sub.get('attributes', {}).get('submittedDate'),
+                          })
+          print('A_STUDIO_REVIEW_STATUS=' + json.dumps(active, sort_keys=True))
+          PY

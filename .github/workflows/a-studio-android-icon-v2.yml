@@ -1,0 +1,288 @@
+name: Publish A+ Studio Android icon fix v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-android-icon-v2.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+environment:
+
+concurrency:
+  group: a-studio-android-icon-v2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Queue signed Android build 1.0.0 (2) in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          CODE_B64="$(base64 -w0 <<'PY'
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.signing.services import ensure_android_signing
+
+          app = MobileApp.objects.get(slug='a-studio')
+          if app.package_name != 'de.aplussolution.studio':
+              raise RuntimeError(f'Unexpected package: {app.package_name}')
+
+          release, _ = Release.objects.update_or_create(
+              app=app,
+              version_name='1.0.0',
+              build_number=2,
+              defaults={
+                  'source_branch': 'main',
+                  'android_track': 'production',
+                  'android_rollout': 1,
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'release_notes': 'Aktualisiertes App-Icon und kleinere Verbesserungen für Android.',
+              },
+          )
+          credential = ensure_android_signing(app)
+          print('android_signing=ready')
+          print('certificate_sha256=' + (credential.certificate_sha256 or ''))
+
+          build, _ = Build.objects.get_or_create(release=release, platform='android')
+          if build.status == 'succeeded' and build.artifact:
+              print('android_build=already_succeeded')
+          else:
+              active = Job.objects.filter(
+                  app=app,
+                  release=release,
+                  build=build,
+                  type='build_android',
+                  status__in=['queued', 'running'],
+              ).exists()
+              if active:
+                  print('android_build=already_queued')
+              else:
+                  build.status = 'queued'
+                  build.logs = ''
+                  build.save(update_fields=['status', 'logs', 'updated_at'])
+                  release.status = 'building'
+                  release.save(update_fields=['status', 'updated_at'])
+                  Job.objects.create(
+                      type='build_android',
+                      app=app,
+                      release=release,
+                      build=build,
+                      payload={'source': 'a-studio-android-icon-v2'},
+                      available_to_agents=True,
+                      required_platform='linux',
+                  )
+                  print('android_build=queued')
+          print(f'release={release.version_name}({release.build_number})')
+          print('repository=' + app.repository_url)
+          PY
+          )"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e CODE_B64='$CODE_B64' web python manage.py shell -c \"import os,base64; exec(base64.b64decode(os.environ['CODE_B64']))\""
+
+      - name: Wake Publisher Linux build agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for signed AAB
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          for i in $(seq 1 100); do
+            STATUS="$(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='android'); print('BUILDSTATE|'+b.status+'|'+str(bool(b.artifact))+'|'+str(b.artifact_checksum or ''))\"" \
+              | grep '^BUILDSTATE|' | tail -1)"
+            echo "$STATUS"
+            IFS='|' read -r _ STATE HAS_ARTIFACT CHECKSUM <<< "$STATUS"
+            if [ "$STATE" = succeeded ] && [ "$HAS_ARTIFACT" = True ]; then
+              echo "Signed AAB is ready. sha256=$CHECKSUM"
+              exit 0
+            fi
+            if [ "$STATE" = failed ]; then
+              sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-studio'); r=Release.objects.get(app=a,version_name='1.0.0',build_number=2); b=r.builds.get(platform='android'); print(b.logs[-12000:]); [print('JOB',j.type,j.status,j.error) for j in r.jobs.order_by('-created_at')[:5]]\"" || true
+              exit 3
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for A+ Studio Android build 2.' >&2
+          exit 4
+
+      - name: Publish only the new AAB to Google Play production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          CODE_B64="$(base64 -w0 <<'PY'
+          from pathlib import Path
+          from django.utils import timezone
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp, Release, Submission
+
+          app = MobileApp.objects.select_related('google_account').get(slug='a-studio')
+          release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
+          build = release.builds.get(platform='android')
+          if build.status != 'succeeded' or not build.artifact:
+              raise RuntimeError(f'Android build is not ready: {build.status}')
+          if not app.google_account or not app.google_account.configured:
+              raise RuntimeError('Google Play account is not configured in Publisher.')
+
+          client = GooglePlayClient(app.google_account)
+          edit = client._open_edit(app.package_name)
+          try:
+              bundles = client._edit_request(
+                  edit,
+                  'GET',
+                  f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/bundles',
+              ).get('bundles', [])
+              bundle = next((item for item in bundles if str(item.get('versionCode')) == '2'), None)
+              if bundle is None:
+                  payload = Path(build.artifact.path).read_bytes()
+                  bundle = client._upload_request(
+                      edit,
+                      f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/bundles',
+                      payload,
+                      'application/octet-stream',
+                  )
+                  print('bundle_uploaded=true')
+              else:
+                  print('bundle_reused=true')
+
+              version_code = str(bundle.get('versionCode'))
+              if version_code != '2':
+                  raise RuntimeError(f'Expected versionCode 2, got {version_code}')
+
+              track_body = {
+                  'track': 'production',
+                  'releases': [{
+                      'name': '1.0.0 (2)',
+                      'versionCodes': [version_code],
+                      'status': 'completed',
+                      'releaseNotes': [{
+                          'language': 'de-DE',
+                          'text': 'Aktualisiertes App-Icon und kleinere Verbesserungen für Android.',
+                      }],
+                  }],
+              }
+              client._edit_request(
+                  edit,
+                  'PUT',
+                  f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks/production',
+                  json_body=track_body,
+              )
+              client._validate_edit(edit)
+              committed = client._commit_edit(edit)
+          except Exception:
+              client._safe_delete_edit(edit)
+              raise
+
+          result = {
+              'binary_only': True,
+              'package_name': app.package_name,
+              'track': 'production',
+              'version_name': release.version_name,
+              'version_code': version_code,
+              'bundle': bundle,
+              'edit': committed,
+              'artifact_sha256': build.artifact_checksum or '',
+          }
+          Submission.objects.update_or_create(
+              app=app,
+              release=release,
+              platform='android',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': version_code,
+                  'submitted_at': timezone.now(),
+                  'raw': result,
+              },
+          )
+          release.status = 'in_review'
+          release.save(update_fields=['status', 'updated_at'])
+          print('GOOGLE_PLAY_PUBLISH=SUCCESS')
+          print('package=' + app.package_name)
+          print('track=production')
+          print('version_code=' + version_code)
+          print('artifact_sha256=' + (build.artifact_checksum or ''))
+          PY
+          )"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e CODE_B64='$CODE_B64' web python manage.py shell -c \"import os,base64; exec(base64.b64decode(os.environ['CODE_B64']))\""
+
+      - name: Verify production track contains versionCode 2
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          CODE_B64="$(base64 -w0 <<'PY'
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.select_related('google_account').get(slug='a-studio')
+          client = GooglePlayClient(app.google_account)
+          edit = client._open_edit(app.package_name)
+          try:
+              track = client._edit_request(
+                  edit,
+                  'GET',
+                  f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks/production',
+              )
+          finally:
+              client._safe_delete_edit(edit)
+          releases = track.get('releases') or []
+          match = next((r for r in releases if '2' in [str(v) for v in r.get('versionCodes', [])]), None)
+          if not match:
+              raise RuntimeError(f'versionCode 2 is not present on production track: {track}')
+          print('PLAY_VERIFY=SUCCESS')
+          print('versionCodes=' + ','.join(str(v) for v in match.get('versionCodes', [])))
+          print('status=' + str(match.get('status', '')))
+          print('release_name=' + str(match.get('name', '')))
+          PY
+          )"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e CODE_B64='$CODE_B64' web python manage.py shell -c \"import os,base64; exec(base64.b64decode(os.environ['CODE_B64']))\""

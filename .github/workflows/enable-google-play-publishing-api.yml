@@ -1,0 +1,89 @@
+name: Enable Google Play Publishing API
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/enable-google-play-publishing-api.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  enable:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Enable androidpublisher.googleapis.com and retest A+Bau
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import time
+          from google.auth.transport.requests import AuthorizedSession, Request
+          from google.oauth2 import service_account
+          from apps.publisher.models import MobileApp
+          from apps.integrations.google_play import GooglePlayClient
+
+          app = MobileApp.objects.filter(slug='a-bau').select_related('google_account').first()
+          if not app or not app.google_account:
+              raise SystemExit('a_bau_google_account=missing')
+
+          account = app.google_account
+          info = account.get_credentials()
+          project_id = info.get('project_id')
+          identity = info.get('client_email')
+          print(f'google_identity={identity}')
+          print(f'google_project={project_id}')
+          if not project_id:
+              raise SystemExit('google_project=missing')
+
+          creds = service_account.Credentials.from_service_account_info(
+              info,
+              scopes=['https://www.googleapis.com/auth/cloud-platform'],
+          )
+          creds.refresh(Request())
+          session = AuthorizedSession(creds)
+          service_name = f'projects/{project_id}/services/androidpublisher.googleapis.com'
+          get_url = f'https://serviceusage.googleapis.com/v1/{service_name}'
+          enable_url = get_url + ':enable'
+
+          before = session.get(get_url, timeout=60)
+          print('service_usage_before_status=' + str(before.status_code))
+          print('service_usage_before_body=' + ' '.join(before.text.split())[:1800])
+
+          response = session.post(enable_url, json={}, timeout=60)
+          print('service_enable_status=' + str(response.status_code))
+          print('service_enable_body=' + ' '.join(response.text.split())[:1800])
+
+          if response.ok:
+              body = response.json() if response.content else {}
+              op_name = body.get('name', '')
+              if op_name:
+                  op_url = 'https://serviceusage.googleapis.com/v1/' + op_name
+                  for _ in range(30):
+                      op = session.get(op_url, timeout=60)
+                      print('service_enable_operation=' + str(op.status_code) + ' ' + ' '.join(op.text.split())[:1200])
+                      if op.ok and op.json().get('done'):
+                          break
+                      time.sleep(2)
+
+          after = session.get(get_url, timeout=60)
+          print('service_usage_after_status=' + str(after.status_code))
+          print('service_usage_after_body=' + ' '.join(after.text.split())[:1800])
+
+          result = GooglePlayClient(account).test(app.package_name)
+          print('a_bau_google_ok=' + str(result.ok).lower())
+          print('a_bau_google_message=' + result.message.replace('\n', ' | '))
+          if not result.ok:
+              raise SystemExit(3)
+          PY

@@ -9,10 +9,11 @@ from apps.publisher.models import MobileApp
 
 
 APP_SLUG = "a-bau"
+APPLE_PRIMARY_CATEGORY = "BUSINESS"
 
 
 class Command(BaseCommand):
-    help = "Sync A+Bau app-level App Store localization (name, subtitle and privacy URLs)."
+    help = "Sync A+Bau app-level App Store localization and required App Information fields."
 
     def handle(self, *args, **options):
         app = MobileApp.objects.filter(slug=APP_SLUG).select_related("apple_account").first()
@@ -41,6 +42,31 @@ class Command(BaseCommand):
             ),
             infos[0],
         )
+
+        # A freshly-created App Store Connect record does not receive a primary
+        # category from the New App dialog. Apple requires one before review.
+        # A+Bau is a construction/business ERP, matching Publisher's Business
+        # category, so keep the App Info relationship idempotently on BUSINESS.
+        category_body = {
+            "data": {
+                "type": "appInfos",
+                "id": app_info["id"],
+                "relationships": {
+                    "primaryCategory": {
+                        "data": {
+                            "type": "appCategories",
+                            "id": APPLE_PRIMARY_CATEGORY,
+                        }
+                    }
+                },
+            }
+        }
+        client.request(
+            "PATCH",
+            f"/appInfos/{app_info['id']}",
+            data=json.dumps(category_body),
+        )
+        self.stdout.write(self.style.SUCCESS("apple_primary_category=BUSINESS"))
 
         for loc in app.localizations.all():
             existing = client.request(

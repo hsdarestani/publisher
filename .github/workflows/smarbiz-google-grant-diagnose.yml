@@ -1,0 +1,77 @@
+name: Diagnose Smarbiz Google Play grant
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-google-grant-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Inspect Play user grants and Smarbiz edit access
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check google-auth requests >/dev/null
+          python - <<'PY'
+          import json, os
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          developer = '5407401102636608516'
+          packages = ['de.aplussolution.smarbiz', 'de.aplussolution.workforce']
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          email = info['client_email']
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(Request())
+          s = AuthorizedSession(creds)
+
+          users_url = f'https://androidpublisher.googleapis.com/androidpublisher/v3/developers/{developer}/users'
+          r = s.get(users_url, params={'pageSize': -1}, timeout=60)
+          print('users_list_http=', r.status_code)
+          if r.ok:
+              users = r.json().get('users', [])
+              me = next((u for u in users if u.get('email') == email), None)
+              print('service_user_found=', bool(me))
+              if me:
+                  print('access_state=', me.get('accessState'))
+                  print('developer_permissions=', json.dumps(me.get('developerAccountPermissions', []), sort_keys=True))
+                  for g in me.get('grants', []):
+                      if g.get('packageName') in packages:
+                          print('grant=', json.dumps({
+                              'packageName': g.get('packageName'),
+                              'appLevelPermissions': g.get('appLevelPermissions', []),
+                              'name': g.get('name'),
+                          }, sort_keys=True))
+          else:
+              try: detail = json.dumps(r.json(), ensure_ascii=False)
+              except Exception: detail = ' '.join(r.text.split())
+              print('users_list_error=', detail[:3000])
+
+          for package in packages:
+              url = f'https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{quote(package, safe="._-")}/edits'
+              er = s.post(url, json={}, timeout=60)
+              print(f'edits_insert package={package} http={er.status_code} content_type={er.headers.get("content-type", "")}')
+              if er.ok:
+                  edit_id = er.json()['id']
+                  dr = s.delete(f'{url}/{edit_id}', timeout=30)
+                  print(f'edits_cleanup package={package} http={dr.status_code}')
+              else:
+                  try: detail = json.dumps(er.json(), ensure_ascii=False)
+                  except Exception: detail = ' '.join(er.text.split())
+                  print(f'edits_error package={package} detail={detail[:3000]}')
+          PY

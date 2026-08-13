@@ -1,0 +1,127 @@
+name: Release Smarbiz to Apple and Google
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/smarbiz-release.yml'
+      - 'apps/signing/management/commands/bootstrap_smarbiz.py'
+      - 'apps/signing/services.py'
+      - 'apps/integrations/apple_store.py'
+      - 'apps/integrations/google_play.py'
+      - 'apps/publisher/tasks.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-release.yml'
+      - 'apps/signing/management/commands/bootstrap_smarbiz.py'
+      - 'apps/signing/services.py'
+      - 'apps/integrations/apple_store.py'
+      - 'apps/integrations/google_play.py'
+      - 'apps/publisher/tasks.py'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: smarbiz-store-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate Publisher and Smarbiz release command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help bootstrap_smarbiz >/dev/null
+          python -m py_compile apps/signing/management/commands/bootstrap_smarbiz.py
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Wait for Smarbiz store-compliance endpoints
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            READY=1
+            for url in \
+              https://smarbiz.sbs/api/health \
+              https://smarbiz.sbs/de/privacy \
+              https://smarbiz.sbs/de/support \
+              https://smarbiz.sbs/de/account-deletion; do
+              if ! curl --fail --silent --show-error --location --max-time 20 "$url" >/dev/null; then READY=0; break; fi
+            done
+            if [ "$READY" = 1 ]; then echo 'Smarbiz store endpoints are ready.'; break; fi
+            if [ "$i" -eq 90 ]; then echo 'Smarbiz store endpoints did not become ready.' >&2; exit 2; fi
+            sleep 10
+          done
+
+      - name: Bootstrap Smarbiz in Publisher and queue signed builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_smarbiz >/dev/null"; then break; fi
+            if [ "$i" -eq 90 ]; then echo 'Smarbiz bootstrap command never appeared in Publisher production.' >&2; exit 3; fi
+            sleep 5
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_smarbiz --app-version 1.0.0 --build-number 1 --queue --publish"
+
+      - name: Wake Publisher build agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Advance store release as builds arrive
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 40); do
+            echo "=== Smarbiz Publisher pass $i ==="
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_smarbiz --app-version 1.0.0 --build-number 1 --publish")"
+            printf '%s\n' "$OUTPUT"
+            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=succeeded' && printf '%s\n' "$OUTPUT" | grep -q 'build_ios=succeeded'; then break; fi
+            sleep 30
+          done
+
+      - name: Final Smarbiz release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_smarbiz --app-version 1.0.0 --build-number 1 --publish"

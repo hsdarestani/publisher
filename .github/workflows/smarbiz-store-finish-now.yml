@@ -1,0 +1,307 @@
+name: Finish Smarbiz Store Submissions
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-store-finish-now.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify Apple and finish Google Play
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import re
+          import time
+          from urllib.parse import quote
+          from django.utils import timezone
+          from google.auth.transport.requests import AuthorizedSession, Request as GoogleAuthRequest
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient, PUBLISH_SCOPE
+          from apps.publisher.models import Build, MobileApp, Submission
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          android = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=2,
+              platform='android',
+          )
+          ios = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=2,
+              platform='ios',
+          )
+
+          # ---------------- Apple: verify the actual review state ----------------
+          apple = AppleStoreClient(app.apple_account)
+          apple_record = apple.find_app(app.bundle_id)
+          versions = apple.list_versions(apple_record['id'])
+          version = next(
+              (v for v in versions if v.get('attributes', {}).get('versionString') == '1.0.0'),
+              None,
+          )
+          if not version:
+              version = apple.ensure_version(apple_record['id'], '1.0.0')
+          version_id = version['id']
+
+          matching = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW', 'UNRESOLVED_ISSUES'):
+              try:
+                  submissions = apple.list_review_submissions(apple_record['id'], state)
+              except Exception as exc:
+                  print(f'apple_state_probe_{state}=error:{type(exc).__name__}')
+                  continue
+              for sub in submissions:
+                  try:
+                      items = apple.list_review_submission_items(sub['id'])
+                  except Exception:
+                      continue
+                  for item in items:
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == str(version_id):
+                          matching.append({
+                              'submission_id': sub['id'],
+                              'state': state,
+                              'item_id': item['id'],
+                              'item_state': item.get('attributes', {}).get('state'),
+                          })
+          print('apple_matching=' + json.dumps(matching, sort_keys=True))
+
+          active = next((x for x in matching if x['state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}), None)
+          if active:
+              print('APPLE=SUBMITTED:' + active['state'])
+          else:
+              ready = next((x for x in matching if x['state'] == 'READY_FOR_REVIEW'), None)
+              contact = {
+                  'contactFirstName': 'Ashkan',
+                  'contactLastName': 'Asadian',
+                  'contactPhone': '+491727779721',
+                  'contactEmail': 'info@aplus-solution.de',
+              }
+              apple.set_review_details(version_id, app, contact=contact)
+              if ready:
+                  body = {
+                      'data': {
+                          'type': 'reviewSubmissions',
+                          'id': ready['submission_id'],
+                          'attributes': {'submitted': True},
+                      }
+                  }
+                  final = apple.request(
+                      'PATCH',
+                      f'/reviewSubmissions/{ready["submission_id"]}',
+                      data=json.dumps(body),
+                  )['data']
+                  final_state = final.get('attributes', {}).get('state', '')
+                  print('APPLE=SUBMITTED:' + final_state)
+              else:
+                  # Only attach if Apple does not already report the processed build.
+                  try:
+                      current_build = apple.request('GET', f'/appStoreVersions/{version_id}/build').get('data')
+                  except Exception:
+                      current_build = None
+                  if not current_build or str(current_build.get('id')) != str(ios.external_build_id):
+                      for attempt in range(3):
+                          try:
+                              apple.attach_build(version_id, ios.external_build_id)
+                              break
+                          except Exception as exc:
+                              if attempt == 2:
+                                  raise
+                              print(f'apple_attach_retry={attempt+1}:{type(exc).__name__}')
+                              time.sleep(4 * (attempt + 1))
+                  result = apple.submit_version(apple_record['id'], version_id)
+                  final = result['submission']
+                  final_state = final.get('attributes', {}).get('state', '')
+                  print('APPLE=SUBMITTED:' + final_state)
+                  Submission.objects.update_or_create(
+                      app=app,
+                      release=ios.release,
+                      platform='ios',
+                      defaults={
+                          'state': 'in_review',
+                          'external_id': final['id'],
+                          'submitted_at': timezone.now(),
+                          'raw': result,
+                          'last_error': '',
+                      },
+                  )
+
+          # ---------------- Google: grant if possible, then promote existing v2 ----------------
+          google = GooglePlayClient(app.google_account)
+          identity = google.info.get('client_email', '')
+          bucket = (app.google_account.google_bucket_id or '').strip().replace('gs://', '')
+          print('google_identity=' + identity)
+          print('google_bucket=' + (bucket or '-'))
+
+          def probe():
+              result = google.test(app.package_name)
+              print('google_test_ok=' + str(result.ok).lower())
+              print('google_test_message=' + result.message.replace('\n', ' | '))
+              if getattr(result, 'details', None):
+                  print('google_test_details=' + json.dumps(result.details, ensure_ascii=False, sort_keys=True)[:12000])
+              return result
+
+          check = probe()
+
+          # If this newly-created package lacks an app-level grant, try to repair it
+          # through the official users/grants API. This succeeds only when the
+          # configured service account already has permission-management rights.
+          if not check.ok and bucket.startswith('pubsite_prod_rev_'):
+              developer = bucket.removeprefix('pubsite_prod_rev_')
+              creds = google.credentials([PUBLISH_SCOPE])
+              creds.refresh(GoogleAuthRequest())
+              session = AuthorizedSession(creds)
+              users_url = f'https://androidpublisher.googleapis.com/androidpublisher/v3/developers/{quote(developer, safe="")}/users'
+              users_resp = session.get(users_url, params={'pageSize': -1}, timeout=60)
+              print(f'google_users_probe_http={users_resp.status_code}')
+              if users_resp.ok:
+                  users = users_resp.json().get('users', [])
+                  me = next((u for u in users if u.get('email') == identity), None)
+                  print('google_service_user_found=' + str(bool(me)).lower())
+                  if me:
+                      grants = me.get('grants') or []
+                      current = next((g for g in grants if g.get('packageName') == app.package_name), None)
+                      permissions = [
+                          'CAN_VIEW_NON_FINANCIAL_DATA',
+                          'CAN_MANAGE_PUBLIC_APKS',
+                          'CAN_MANAGE_TRACK_APKS',
+                          'CAN_MANAGE_PUBLIC_LISTING',
+                          'CAN_MANAGE_APP_CONTENT',
+                      ]
+                      user_name = me['name']
+                      grant_body = {
+                          'packageName': app.package_name,
+                          'appLevelPermissions': permissions,
+                      }
+                      if current:
+                          grant_name = current['name']
+                          r = session.patch(
+                              'https://androidpublisher.googleapis.com/androidpublisher/v3/' + grant_name,
+                              params={'updateMask': 'appLevelPermissions'},
+                              json={**grant_body, 'name': grant_name},
+                              timeout=60,
+                          )
+                          print(f'google_grant_patch_http={r.status_code}')
+                          if not r.ok:
+                              print('google_grant_patch_error=' + ' '.join(r.text.split())[:4000])
+                      else:
+                          r = session.post(
+                              f'https://androidpublisher.googleapis.com/androidpublisher/v3/{user_name}/grants',
+                              json=grant_body,
+                              timeout=60,
+                          )
+                          print(f'google_grant_create_http={r.status_code}')
+                          if not r.ok:
+                              print('google_grant_create_error=' + ' '.join(r.text.split())[:4000])
+                      if r.ok:
+                          time.sleep(5)
+                          check = probe()
+              else:
+                  print('google_users_probe_error=' + ' '.join(users_resp.text.split())[:4000])
+
+          if not check.ok:
+              print('GOOGLE=BLOCKED')
+              raise SystemExit(0)
+
+          # The first AAB was already uploaded manually, so do NOT upload version 2
+          # again. Reuse versionCode 2 and move that existing artifact to Production.
+          edit = google._open_edit(app.package_name)
+          try:
+              bundles = google._edit_request(
+                  edit,
+                  'GET',
+                  f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}/bundles',
+              ).get('bundles', [])
+              codes = {str(x.get('versionCode')) for x in bundles}
+              print('google_bundle_codes=' + ','.join(sorted(codes)))
+              if '2' not in codes:
+                  raise RuntimeError('Google edit can open, but versionCode 2 is not visible. The manual AAB upload is not finalized yet.')
+
+              # Store listing from Publisher metadata.
+              for loc in app.localizations.all():
+                  body = {
+                      'title': loc.title,
+                      'shortDescription': loc.short_description or loc.subtitle,
+                      'fullDescription': loc.full_description,
+                      'video': '',
+                  }
+                  google._edit_request(
+                      edit,
+                      'PUT',
+                      f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}/listings/{google._q(loc.locale)}',
+                      json_body=body,
+                  )
+
+              track_body = {
+                  'track': 'production',
+                  'releases': [{
+                      'name': '1.0.0',
+                      'versionCodes': ['2'],
+                      'status': 'completed',
+                      'releaseNotes': [
+                          {'language': loc.locale, 'text': (loc.release_notes or android.release.release_notes)[:500]}
+                          for loc in app.localizations.all()
+                          if (loc.release_notes or android.release.release_notes)
+                      ],
+                  }],
+              }
+              google._edit_request(
+                  edit,
+                  'PUT',
+                  f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}/tracks/production',
+                  json_body=track_body,
+              )
+              google._validate_edit(edit)
+              committed = google._commit_edit(edit)
+              print('google_commit=' + json.dumps(committed, sort_keys=True)[:4000])
+          except Exception:
+              google._safe_delete_edit(edit)
+              raise
+
+          try:
+              compliance = app.compliance
+          except Exception:
+              compliance = None
+          if compliance and compliance.data_safety_csv.strip():
+              result = google.apply_data_safety(app.package_name, compliance.data_safety_csv)
+              print('google_data_safety=applied')
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=android.release,
+              platform='android',
+              defaults={
+                  'state': 'in_review',
+                  'submitted_at': timezone.now(),
+                  'raw': {'edit': committed, 'version_code': '2', 'track': 'production'},
+                  'last_error': '',
+              },
+          )
+          android.release.status = 'in_review'
+          android.release.save(update_fields=['status', 'updated_at'])
+          print('GOOGLE=SUBMITTED:production')
+          PY

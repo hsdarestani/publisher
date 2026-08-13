@@ -66,8 +66,6 @@ jobs:
           print(f'version_id={version_id}')
           print(f'build_external_id={build.external_build_id}')
 
-          # List every current/recent review submission. Apple counts concurrent
-          # submissions globally for the app, so this also provides diagnostics.
           response = client.request(
               'GET',
               f'/apps/{app_id}/reviewSubmissions?limit=200&include=items,appStoreVersionForReview&limit[items]=50&fields[reviewSubmissions]=state,submittedDate,platform,items,appStoreVersionForReview&fields[reviewSubmissionItems]=state,appStoreVersion',
@@ -96,9 +94,6 @@ jobs:
                       values.append(item)
               return values
 
-          # Correct path after a rejection: resolve the rejected app-version item
-          # inside the existing UNRESOLVED_ISSUES submission and resubmit that
-          # submission instead of creating a sixth concurrent submission.
           target_submission = None
           target_items = []
           for sub in submissions:
@@ -158,8 +153,6 @@ jobs:
               print('RESULT=SUBMITTED')
               raise SystemExit(0)
 
-          # If another automation already moved the same version into a review
-          # submission, report success rather than creating a duplicate.
           for sub in submissions:
               state = sub.get('attributes', {}).get('state')
               if state not in {'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
@@ -238,3 +231,5 @@ jobs:
           if not any(row['state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'} for row in active):
               raise SystemExit('Build 3/version 1.0.0 is not Waiting for Review or In Review after resubmit.')
           PY
+
+# Status probe 2026-08-13T18:39Z

@@ -1,0 +1,65 @@
+name: Probe A+Bau Google account fallback
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-google-account-fallback.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Test every configured Google StoreAccount against A+Bau
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp, StoreAccount
+          from apps.integrations.google_play import GooglePlayClient
+
+          app = MobileApp.objects.filter(slug='a-bau').first()
+          if not app:
+              raise SystemExit('a_bau=missing')
+
+          accounts = list(StoreAccount.objects.filter(provider='google', enabled=True).order_by('created_at'))
+          print('google_accounts=' + str(len(accounts)))
+          any_ok = False
+          for account in accounts:
+              try:
+                  configured = account.configured
+              except Exception:
+                  configured = False
+              if not configured:
+                  print('ACCOUNT ' + json.dumps({'id': account.pk, 'configured': False}))
+                  continue
+              info = account.get_credentials()
+              identity = info.get('client_email', '')
+              project = info.get('project_id', '')
+              result = GooglePlayClient(account).test(app.package_name)
+              print('ACCOUNT ' + json.dumps({
+                  'id': account.pk,
+                  'configured': True,
+                  'identity': identity,
+                  'project': project,
+                  'ok': result.ok,
+                  'message': result.message.replace('\n', ' | '),
+              }, ensure_ascii=False))
+              if result.ok:
+                  any_ok = True
+                  print('WORKING_ACCOUNT_ID=' + str(account.pk))
+          print('working_account_found=' + str(any_ok).lower())
+          PY

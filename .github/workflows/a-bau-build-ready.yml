@@ -1,0 +1,120 @@
+name: Build signed A+Bau AAB and IPA
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/a-bau-build-ready.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau_release_v2.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-build-ready.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau_release_v2.py'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate A+Bau signed build command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help bootstrap_a_bau_release_v2 >/dev/null
+          python -m py_compile apps/signing/management/commands/bootstrap_a_bau_release_v2.py
+
+  build:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APP_VERSION: '2.2.0'
+      BUILD_NUMBER: '22001'
+    steps:
+      - name: Wait for signed-build command in production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_release_v2 >/dev/null 2>&1"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 2
+
+      - name: Provision signing and queue A+Bau Android/iOS builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release_v2 --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --queue"
+
+      - name: Wake cloud build agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for signed AAB and IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 60); do
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release_v2 --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER'")"
+            printf '%s\n' "$OUTPUT"
+            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=succeeded artifact=yes' && \
+               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=succeeded artifact=yes'; then
+              echo 'A+Bau signed AAB and IPA are ready in Publisher.'
+              exit 0
+            fi
+            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=failed' || \
+               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=failed'; then
+              echo 'Signed A+Bau build failed.' >&2
+              exit 3
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for signed builds.' >&2
+          exit 4
+
+      - name: Final A+Bau Publisher state
+        if: always()
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release_v2 --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER'"

@@ -42,7 +42,6 @@ jobs:
           from django.utils import timezone
           from apps.integrations.apple_store import AppleStoreClient
           from apps.publisher.models import MobileApp, Build, Submission
-          from apps.publisher.review_contacts import apple_review_contact
 
           app = MobileApp.objects.get(slug='a-studio')
           build = Build.objects.get(
@@ -70,10 +69,6 @@ jobs:
           )
           loc.save(update_fields=['full_description', 'release_notes', 'updated_at'])
 
-          # Preserve the dedicated reviewer credentials already provisioned in Publisher.
-          if not app.review_username or not app.get_review_password():
-              raise SystemExit('Dedicated App Review credentials are missing; refusing to overwrite review details.')
-          app.requires_login = True
           app.review_notes = (
               "Typical service example: a service business asks A+ Solution to create a customer-facing booking app. "
               "The customer uses A+ Studio to describe the required features, review the generated project preview, "
@@ -85,7 +80,7 @@ jobs:
               "pre-populated 'Luna Booking' project with an existing AI Builder conversation and a ready Preview so the "
               "complete workflow can be tested immediately. No subscription, purchase or two-factor authentication is required."
           )
-          app.save(update_fields=['requires_login', 'review_notes', 'updated_at'])
+          app.save(update_fields=['review_notes', 'updated_at'])
 
           client = AppleStoreClient(app.apple_account)
           record = client.find_app(app.bundle_id)
@@ -97,8 +92,20 @@ jobs:
               )
 
           client.set_localization(version['id'], loc)
-          contact = apple_review_contact(app)
-          client.set_review_details(version['id'], app, contact=contact or None)
+
+          # Update only the explanatory review notes. Preserve Apple's existing
+          # demo-account name/password and every other review-detail field.
+          detail = client.request('GET', f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data')
+          if not detail:
+              raise SystemExit('Existing App Store review details are missing; refusing to recreate them without the current credentials.')
+          note_body = {
+              'data': {
+                  'type': 'appStoreReviewDetails',
+                  'id': detail['id'],
+                  'attributes': {'notes': app.review_notes},
+              }
+          }
+          client.request('PATCH', f"/appStoreReviewDetails/{detail['id']}", data=json.dumps(note_body))
           client.attach_build(version['id'], build.external_build_id)
 
           # Verify exactly what App Store Connect now stores for the German description.

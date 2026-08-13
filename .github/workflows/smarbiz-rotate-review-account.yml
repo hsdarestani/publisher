@@ -1,0 +1,33 @@
+name: Rotate Smarbiz Store Review Account
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-rotate-review-account.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Clear revoked credentials and create a fresh review account
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='smarbiz'); a.review_username=''; a.review_password_blob=''; a.save(update_fields=['review_username','review_password_blob','updated_at']); print('revoked_publisher_review_credentials=cleared')\" && docker compose exec -T web python manage.py bootstrap_smarbiz_final --app-version 1.0.0 --build-number 2"

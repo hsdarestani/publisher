@@ -1,0 +1,170 @@
+name: Fix Smarbiz Apple Review Eligibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-apple-eligibility-fix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fix-and-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Fix required metadata and submit with full diagnostics
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import requests
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, MobileApp, Submission
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          build = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=2,
+              platform='ios',
+          )
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              version = next(v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0')
+          app_id, version_id = record['id'], version['id']
+
+          # First blocker returned by Apple: copyright is required.
+          copyright_body = {
+              'data': {
+                  'type': 'appStoreVersions',
+                  'id': version_id,
+                  'attributes': {'copyright': '2026 A+ Solution GmbH'},
+              }
+          }
+          updated = client.request('PATCH', f'/appStoreVersions/{version_id}', data=json.dumps(copyright_body))['data']
+          print('copyright=' + str(updated.get('attributes', {}).get('copyright')))
+
+          # Print app-level information before submission; these are frequent sources
+          # of first-version review blockers and contain no credentials.
+          try:
+              infos = client.request('GET', f'/apps/{app_id}/appInfos?limit=10')
+              print('app_infos=' + json.dumps(infos, sort_keys=True))
+          except Exception as exc:
+              print('app_infos_error=' + str(exc))
+
+          # Reuse an active/ready submission if one appeared asynchronously.
+          ready = None
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW'):
+              for sub in client.list_review_submissions(app_id, state):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) != str(version_id):
+                          continue
+                      print(f'existing_submission={sub["id"]}:{state}')
+                      if state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+                          Submission.objects.update_or_create(
+                              app=app, release=build.release, platform='ios',
+                              defaults={
+                                  'state': 'in_review', 'external_id': sub['id'],
+                                  'submitted_at': timezone.now(), 'raw': {'submission': sub},
+                                  'last_error': '',
+                              },
+                          )
+                          build.release.status = 'in_review'
+                          build.release.save(update_fields=['status', 'updated_at'])
+                          print('RESULT=ALREADY_SUBMITTED')
+                          raise SystemExit(0)
+                      ready = sub
+
+          headers = {
+              'Authorization': f'Bearer {client.token()}',
+              'Content-Type': 'application/json',
+          }
+          base = 'https://api.appstoreconnect.apple.com/v1'
+
+          if ready is None:
+              create_body = {
+                  'data': {
+                      'type': 'reviewSubmissions',
+                      'attributes': {},
+                      'relationships': {'app': {'data': {'type': 'apps', 'id': app_id}}},
+                  }
+              }
+              r = requests.post(base + '/reviewSubmissions', headers=headers, data=json.dumps(create_body), timeout=90)
+              print('create_submission_http=' + str(r.status_code))
+              print('create_submission_body=' + r.text)
+              r.raise_for_status()
+              ready = r.json()['data']
+
+              item_body = {
+                  'data': {
+                      'type': 'reviewSubmissionItems',
+                      'relationships': {
+                          'reviewSubmission': {'data': {'type': 'reviewSubmissions', 'id': ready['id']}},
+                          'appStoreVersion': {'data': {'type': 'appStoreVersions', 'id': version_id}},
+                      },
+                  }
+              }
+              r = requests.post(base + '/reviewSubmissionItems', headers=headers, data=json.dumps(item_body), timeout=90)
+              print('create_item_http=' + str(r.status_code))
+              print('create_item_body=' + r.text)
+              r.raise_for_status()
+
+          submit_body = {
+              'data': {
+                  'type': 'reviewSubmissions',
+                  'id': ready['id'],
+                  'attributes': {'submitted': True},
+              }
+          }
+          r = requests.patch(base + f'/reviewSubmissions/{ready["id"]}', headers=headers, data=json.dumps(submit_body), timeout=90)
+          print('submit_http=' + str(r.status_code))
+          print('submit_body_begin')
+          print(r.text)
+          print('submit_body_end')
+
+          if not r.ok:
+              # Do not accumulate an unrelated draft on repeated diagnostics.
+              cancel_body = {
+                  'data': {
+                      'type': 'reviewSubmissions',
+                      'id': ready['id'],
+                      'attributes': {'canceled': True},
+                  }
+              }
+              c = requests.patch(base + f'/reviewSubmissions/{ready["id"]}', headers=headers, data=json.dumps(cancel_body), timeout=90)
+              print('cancel_http=' + str(c.status_code))
+              print('cancel_body=' + c.text)
+              raise SystemExit(f'Apple review eligibility remains blocked: HTTP {r.status_code}')
+
+          final = r.json()['data']
+          Submission.objects.update_or_create(
+              app=app, release=build.release, platform='ios',
+              defaults={
+                  'state': 'in_review', 'external_id': final['id'],
+                  'submitted_at': timezone.now(), 'raw': {'submission': final},
+                  'last_error': '',
+              },
+          )
+          build.release.status = 'in_review'
+          build.release.save(update_fields=['status', 'updated_at'])
+          print(f'RESULT=SUBMITTED:{final["id"]}:{final.get("attributes", {}).get("state", "")}')
+          PY

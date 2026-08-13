@@ -1,4 +1,4 @@
-name: Rotate Smarbiz Store Review Account
+name: Sync Smarbiz Store Review Account
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  rotate:
+  sync:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 15
@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Clear revoked credentials and create a fresh review account
+      - name: Sync Publisher credential to Apple and Smarbiz production
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -29,5 +29,158 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='smarbiz'); a.review_username=''; a.review_password_blob=''; a.save(update_fields=['review_username','review_password_blob','updated_at']); print('revoked_publisher_review_credentials=cleared')\" && docker compose exec -T web python manage.py bootstrap_smarbiz_final --app-version 1.0.0 --build-number 2"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" <<'REMOTE'
+          set -euo pipefail
+
+          test -d /opt/aplus-publisher
+          test -d /opt/smarbiz/current
+
+          cd /opt/aplus-publisher
+          REVIEW_CREDS_B64="$(docker compose exec -T web python - <<'PY'
+          import base64
+          import json
+          import os
+
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          import django
+          django.setup()
+
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          email = (app.review_username or '').strip().lower()
+          password = app.get_review_password()
+          expected = 'smarbiz-review-b0b501a6@aplus-solution.de'
+          if email != expected:
+              raise SystemExit(f'Publisher review username mismatch: expected {expected}, got {email or "<empty>"}')
+          if not password:
+              raise SystemExit('Publisher review password is empty; refusing to modify store or production account.')
+
+          payload = json.dumps({'email': email, 'password': password}, separators=(',', ':')).encode()
+          print(base64.urlsafe_b64encode(payload).decode(), end='')
+          PY
+          )"
+          test -n "$REVIEW_CREDS_B64"
+
+          # Update App Store Connect first. If Apple refuses the credential edit,
+          # abort before changing the real Smarbiz password so the pending review
+          # can never be left with mismatched credentials.
+          docker compose exec -T -e REVIEW_CREDS_B64="$REVIEW_CREDS_B64" web python - <<'PY'
+          import base64
+          import json
+          import os
+
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          import django
+          django.setup()
+
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+
+          creds = json.loads(base64.urlsafe_b64decode(os.environ['REVIEW_CREDS_B64']).decode())
+          app = MobileApp.objects.get(slug='smarbiz')
+          if app.review_username.strip().lower() != creds['email'] or app.get_review_password() != creds['password']:
+              raise SystemExit('Publisher review credential changed during sync; aborting.')
+
+          apple = AppleStoreClient(app.apple_account)
+          apple_app = apple.find_app(app.bundle_id)
+          version = next(
+              (v for v in apple.list_versions(apple_app['id']) if v.get('attributes', {}).get('versionString') == '1.0.0'),
+              None,
+          )
+          if not version:
+              raise SystemExit('Apple 1.0.0 version was not found; aborting credential sync.')
+
+          contact = {
+              'contactFirstName': 'Ashkan',
+              'contactLastName': 'Asadian',
+              'contactPhone': '+491727779721',
+              'contactEmail': 'info@aplus-solution.de',
+          }
+          apple.set_review_details(version['id'], app, contact=contact)
+          print('apple_review_credentials=updated')
+
+          states = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW'):
+              try:
+                  for submission in apple.list_review_submissions(apple_app['id'], state):
+                      for item in apple.list_review_submission_items(submission['id']):
+                          rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                          if str(rel.get('id')) == str(version['id']):
+                              states.append(state)
+              except Exception:
+                  pass
+          print('apple_review_state=' + (states[0] if states else 'unknown'))
+          PY
+
+          # Now make the actual production account use the exact same encrypted
+          # credential currently stored by Publisher. The password itself is never
+          # printed to Actions logs.
+          cd /opt/smarbiz/current
+          docker compose --env-file .env.production -f docker-compose.prod.yml exec -T \
+            -e REVIEW_CREDS_B64="$REVIEW_CREDS_B64" api python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.request
+
+          from app.database import SessionLocal
+          from app import models as m
+          from app.security import hash_password, verify_password
+
+          creds = json.loads(base64.urlsafe_b64decode(os.environ['REVIEW_CREDS_B64']).decode())
+          email = creds['email'].strip().lower()
+          password = creds['password']
+
+          db = SessionLocal()
+          try:
+              user = db.query(m.User).filter(m.User.email == email).first()
+              restored = False
+              if not user:
+                  # Previous security rotation renamed old review users instead of
+                  # deleting their seeded workspace. Reuse the newest one so the
+                  # reviewer keeps the prepared demo data.
+                  user = (
+                      db.query(m.User)
+                      .filter(m.User.email.like('disabled-review-%@invalid.local'))
+                      .order_by(m.User.id.desc())
+                      .first()
+                  )
+                  if user:
+                      user.email = email
+                      restored = True
+              if not user:
+                  raise SystemExit('No existing or disabled seeded Smarbiz review user was found; refusing to create an empty reviewer workspace.')
+
+              user.password_hash = hash_password(password)
+              if hasattr(user, 'is_active'):
+                  user.is_active = True
+              db.commit()
+              db.refresh(user)
+              if not verify_password(password, user.password_hash):
+                  raise SystemExit('Local password verification failed after reset.')
+              print('smarbiz_review_user=restored_and_synced' if restored else 'smarbiz_review_user=synced')
+              print('smarbiz_review_email=' + user.email)
+          finally:
+              db.close()
+
+          body = json.dumps({'email': email, 'password': password}).encode()
+          req = urllib.request.Request(
+              'http://127.0.0.1:8000/auth/login',
+              data=body,
+              headers={'Content-Type': 'application/json'},
+              method='POST',
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              payload = json.loads(response.read().decode())
+              if response.status != 200 or not payload.get('access_token'):
+                  raise SystemExit('Real login endpoint did not return a valid token.')
+              returned = (payload.get('user') or {}).get('email', '').lower()
+              if returned != email:
+                  raise SystemExit('Real login returned the wrong account.')
+          print('smarbiz_real_login=verified')
+          PY
+
+          unset REVIEW_CREDS_B64
+          echo 'review_credential_sync=complete'
+          REMOTE

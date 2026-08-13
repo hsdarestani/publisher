@@ -19,14 +19,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Promote existing versionCode 2 to production and send for review
+      - name: Prepare first production release from existing versionCode 2
         env:
           GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check google-auth requests >/dev/null
           python - <<'PY'
-          import json, os, sys
+          import json, os
           from urllib.parse import quote
           from google.oauth2 import service_account
           from google.auth.transport.requests import AuthorizedSession, Request
@@ -61,19 +61,12 @@ jobs:
               if '2' not in codes:
                   raise SystemExit('versionCode 2 is not visible in Google Play yet')
 
-              for track in ('internal', 'production'):
-                  tr = s.get(f'{base}/applications/{qp}/edits/{edit}/tracks/{track}', timeout=60)
-                  if tr.ok:
-                      print(f'track_before_{track}=' + json.dumps(tr.json(), ensure_ascii=False, sort_keys=True)[:5000])
-                  else:
-                      print(f'track_before_{track}_http={tr.status_code}')
-
               body = {
                   'track': 'production',
                   'releases': [{
                       'name': '1.0.0',
                       'versionCodes': ['2'],
-                      'status': 'completed',
+                      'status': 'draft',
                       'releaseNotes': [
                           {'language': 'de-DE', 'text': 'Erste mobile Version von Smarbiz mit Brand Pulse, Content Studio, Freigaben, Kalender und Reports.'},
                           {'language': 'en-US', 'text': 'First Smarbiz mobile release with Brand Pulse, Content Studio, approvals, calendar and reports.'},
@@ -95,7 +88,7 @@ jobs:
                   timeout=120,
               )
               if not cr.ok: fail('edit_commit', cr)
-              print('GOOGLE=SUBMITTED_FOR_REVIEW')
+              print('GOOGLE=PRODUCTION_DRAFT_READY')
               print('commit=' + json.dumps(cr.json(), ensure_ascii=False, sort_keys=True))
           except BaseException:
               try:

@@ -37,3 +37,28 @@ class Command(ABBauBootstrapCommand):
             },
         )
         self.stdout.write("localization=ready short_description_chars=76")
+
+    def _upsert_assets(self, app):
+        # Keep the base Android/iPhone assets, then add the 13-inch iPad set.
+        # The generated Capacitor iOS app supports iPad, so App Store Connect
+        # requires a valid iPad screenshot set before the version can be reviewed.
+        super()._upsert_assets(app)
+        frames = [
+            ("Alles an einem Ort.", "Projekte, Kunden und Termine übersichtlich verwalten."),
+            ("Direkt auf der Baustelle.", "Zeit, Fotos, Berichte und Aufmaß im Einsatz dokumentieren."),
+            ("Erst prüfen. Dann freigeben.", "Monteur, Büro und Kunde in einem nachvollziehbaren Ablauf."),
+            ("Von der Kalkulation zur Rechnung.", "Preise, Margen, Finanzen und KI nur für berechtigte Rollen."),
+        ]
+        for index, (title, subtitle) in enumerate(frames):
+            self._save_asset(
+                app,
+                kind="screenshot",
+                platform="ios",
+                filename=f"ios-ipad-13-{index+1}.png",
+                data=self._screenshot_bytes(2048, 2732, index, title, subtitle),
+                width=2048,
+                height=2732,
+                sort_order=index,
+                device_type="APP_IPAD_PRO_3GEN_129",
+            )
+        self.stdout.write("ipad_store_assets=ready display=APP_IPAD_PRO_3GEN_129 size=2048x2732")

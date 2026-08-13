@@ -1,0 +1,211 @@
+name: Stage A+Bau first Google Play release from runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-google-first-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-bau-google-first-release
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install -q 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Export A+Bau signed bundle and Store package
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/google.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp
+          a=MobileApp.objects.select_related('google_account').get(slug='a-bau')
+          print(json.dumps(a.google_account.get_credentials()))
+          PY
+          chmod 600 /tmp/google.json
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/manifest.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp,Release
+          a=MobileApp.objects.get(slug='a-bau')
+          r=Release.objects.get(app=a,version_name='2.2.0',build_number=22001)
+          locs=[{'locale':x.locale,'title':x.title,'short':x.short_description or x.subtitle,'full':x.full_description,'notes':x.release_notes or r.release_notes} for x in a.localizations.all()]
+          assets=[]
+          for x in a.assets.filter(platform__in=['android','shared']).order_by('locale','kind','sort_order'):
+              if x.kind not in {'icon','feature_graphic','promo','screenshot'}: continue
+              assets.append({'id':x.pk,'kind':x.kind,'locale':x.locale,'device_type':x.device_type,'sort_order':x.sort_order,'name':f'{x.pk}_{os.path.basename(x.file.name)}'})
+          try: safety=a.compliance.data_safety_csv or ''
+          except Exception: safety=''
+          print(json.dumps({'package':a.package_name,'version':'2.2.0','code':'22001','localizations':locs,'assets':assets,'data_safety_csv':safety},ensure_ascii=False))
+          PY
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/assets.tgz <<'PY'
+          import io,os,tarfile,django,sys
+          from pathlib import Path
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp
+          a=MobileApp.objects.get(slug='a-bau'); out=io.BytesIO()
+          with tarfile.open(fileobj=out,mode='w:gz') as tf:
+              for x in a.assets.filter(platform__in=['android','shared']).order_by('locale','kind','sort_order'):
+                  if x.kind not in {'icon','feature_graphic','promo','screenshot'}: continue
+                  p=Path(x.file.path); data=p.read_bytes(); i=tarfile.TarInfo(f'{x.pk}_{p.name}'); i.size=len(data); tf.addfile(i,io.BytesIO(data))
+          sys.stdout.buffer.write(out.getvalue())
+          PY
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/a-bau.aab <<'PY'
+          import os,django,sys
+          from pathlib import Path
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp,Release
+          a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.0',build_number=22001); b=r.builds.get(platform='android')
+          assert b.status=='succeeded' and b.artifact
+          sys.stdout.buffer.write(Path(b.artifact.path).read_bytes())
+          PY
+          mkdir -p /tmp/assets && tar -xzf /tmp/assets.tgz -C /tmp/assets
+          echo "A+Bau first-release package ready on GitHub runner"
+
+      - name: Commit first production release as Google Play draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,mimetypes
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.auth.transport.requests import AuthorizedSession,Request
+          from google.oauth2 import service_account
+
+          info=json.loads(Path('/tmp/google.json').read_text()); m=json.loads(Path('/tmp/manifest.json').read_text())
+          pkg=m['package']; qpkg=quote(pkg,safe='._-'); code=m['code']
+          creds=service_account.Credentials.from_service_account_info(info,scopes=['https://www.googleapis.com/auth/androidpublisher']); creds.refresh(Request()); s=AuthorizedSession(creds)
+          api='https://androidpublisher.googleapis.com/androidpublisher/v3'; upload='https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+          def body(r):
+              try:return json.dumps(r.json(),ensure_ascii=False)[:2500]
+              except:return ' '.join(r.text.split())[:2500]
+
+          er=s.post(f'{api}/applications/{qpkg}/edits',json={},timeout=60)
+          print(f'play_edit_probe=HTTP_{er.status_code}')
+          if not er.ok: raise RuntimeError(body(er))
+          edit=er.json()['id']; print('play_edit_opened=true')
+          try:
+              br=s.get(f'{api}/applications/{qpkg}/edits/{edit}/bundles',timeout=60)
+              if not br.ok: raise RuntimeError('bundle list '+body(br))
+              existing=next((b for b in br.json().get('bundles',[]) if str(b.get('versionCode'))==code),None)
+              if not existing:
+                  ur=s.post(f'{upload}/applications/{qpkg}/edits/{edit}/bundles',params={'uploadType':'media'},data=Path('/tmp/a-bau.aab').read_bytes(),headers={'Content-Type':'application/octet-stream'},timeout=600)
+                  if not ur.ok: raise RuntimeError('bundle upload '+body(ur))
+                  print('bundle_uploaded=true')
+              else: print('bundle_reused=true')
+
+              for loc in m['localizations']:
+                  rr=s.put(f'{api}/applications/{qpkg}/edits/{edit}/listings/{quote(loc["locale"],safe="._-")}',json={'title':loc['title'],'shortDescription':loc['short'],'fullDescription':loc['full'],'video':''},timeout=120)
+                  if not rr.ok: raise RuntimeError('listing '+body(rr))
+              print('listing_synced=true')
+
+              imap={'icon':'icon','feature_graphic':'featureGraphic','promo':'promoGraphic'}; smap={'phone':'phoneScreenshots','seven_inch':'sevenInchScreenshots','ten_inch':'tenInchScreenshots','tv':'tvScreenshots','wear':'wearScreenshots','chromeos':'chromeosScreenshots'}
+              groups={}
+              for a in m['assets']:
+                  typ=smap.get(a.get('device_type') or '','phoneScreenshots') if a['kind']=='screenshot' else imap.get(a['kind'])
+                  if typ: groups.setdefault((a['locale'],typ),[]).append(a)
+              for (locale,typ),vals in groups.items():
+                  pth=f'/applications/{qpkg}/edits/{edit}/listings/{quote(locale,safe="._-")}/{typ}'
+                  dr=s.delete(api+pth,timeout=120)
+                  if not dr.ok: raise RuntimeError('image delete '+body(dr))
+                  for a in sorted(vals,key=lambda z:z['sort_order']):
+                      p=Path('/tmp/assets')/a['name']; ct=mimetypes.guess_type(p.name)[0] or 'application/octet-stream'
+                      ir=s.post(upload+pth,params={'uploadType':'media'},data=p.read_bytes(),headers={'Content-Type':ct},timeout=300)
+                      if not ir.ok: raise RuntimeError(f'image {typ} '+body(ir))
+              print(f'store_image_groups_synced={len(groups)}')
+
+              notes=[{'language':x['locale'],'text':x['notes'][:500]} for x in m['localizations'] if x.get('notes')]
+              tr=s.put(f'{api}/applications/{qpkg}/edits/{edit}/tracks/production',json={'track':'production','releases':[{'name':f"{m['version']} ({code})",'versionCodes':[code],'status':'draft','releaseNotes':notes}]},timeout=120)
+              if not tr.ok: raise RuntimeError('track '+body(tr))
+              print('production_draft_prepared=true')
+
+              vr=s.post(f'{api}/applications/{qpkg}/edits/{edit}:validate',json={},timeout=120)
+              print(f'edit_validate=HTTP_{vr.status_code}')
+              if not vr.ok: raise RuntimeError('validate '+body(vr))
+              cr=s.post(f'{api}/applications/{qpkg}/edits/{edit}:commit',json={},timeout=120)
+              print(f'edit_commit=HTTP_{cr.status_code}')
+              if not cr.ok: raise RuntimeError('commit '+body(cr))
+              print('GOOGLE_PLAY_DRAFT_COMMIT=SUCCESS')
+          except Exception:
+              try:s.delete(f'{api}/applications/{qpkg}/edits/{edit}',timeout=60)
+              except:pass
+              raise
+
+          safety=m.get('data_safety_csv','')
+          if safety.strip():
+              sr=s.post(f'{api}/applications/{qpkg}/dataSafety',json={'safetyLabels':safety},timeout=120)
+              print(f'data_safety=HTTP_{sr.status_code}')
+              if not sr.ok: print('data_safety_warning='+body(sr))
+              else: print('data_safety_synced=true')
+
+          # Try to promote after the draft commit. Google may require the first publication action in Play Console.
+          er2=s.post(f'{api}/applications/{qpkg}/edits',json={},timeout=60)
+          if not er2.ok: raise RuntimeError('promotion edit '+body(er2))
+          e2=er2.json()['id']
+          try:
+              tr2=s.put(f'{api}/applications/{qpkg}/edits/{e2}/tracks/production',json={'track':'production','releases':[{'name':f"{m['version']} ({code})",'versionCodes':[code],'status':'completed','releaseNotes':notes}]},timeout=120)
+              if tr2.ok:
+                  v2=s.post(f'{api}/applications/{qpkg}/edits/{e2}:validate',json={},timeout=120)
+                  if v2.ok:
+                      c2=s.post(f'{api}/applications/{qpkg}/edits/{e2}:commit',json={},timeout=120)
+                      if c2.ok:
+                          print('GOOGLE_PLAY_FIRST_RELEASE_PUBLISHED=SUCCESS')
+                          Path('/tmp/result-state').write_text('in_review')
+                      else:
+                          print('promotion_commit_blocked='+body(c2)); s.delete(f'{api}/applications/{qpkg}/edits/{e2}',timeout=60); Path('/tmp/result-state').write_text('draft_ready')
+                  else:
+                      print('promotion_validate_blocked='+body(v2)); s.delete(f'{api}/applications/{qpkg}/edits/{e2}',timeout=60); Path('/tmp/result-state').write_text('draft_ready')
+              else:
+                  print('promotion_track_blocked='+body(tr2)); s.delete(f'{api}/applications/{qpkg}/edits/{e2}',timeout=60); Path('/tmp/result-state').write_text('draft_ready')
+          except Exception:
+              try:s.delete(f'{api}/applications/{qpkg}/edits/{e2}',timeout=60)
+              except:pass
+              raise
+          if not Path('/tmp/result-state').exists(): Path('/tmp/result-state').write_text('draft_ready')
+          print('publisher_state='+Path('/tmp/result-state').read_text().strip())
+          PY
+
+      - name: Record Google first-release state in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE="$(cat /tmp/result-state)"
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e PLAY_STATE='$STATE' web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.0',build_number=22001); st=os.environ['PLAY_STATE']; Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':st,'external_id':'22001','submitted_at':timezone.now() if st=='in_review' else None,'last_error':'','raw':{'package_name':a.package_name,'track':'production','version_code':'22001','publisher_path':'github-hosted-runner','first_release':True}}); r.status='in_review' if st=='in_review' else 'uploaded'; r.save(update_fields=['status','updated_at']); print('publisher_google_state='+st)\""
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/google.json /tmp/manifest.json /tmp/assets.tgz /tmp/assets /tmp/a-bau.aab /tmp/result-state

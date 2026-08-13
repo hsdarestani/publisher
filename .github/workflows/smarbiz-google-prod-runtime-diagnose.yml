@@ -1,0 +1,48 @@
+name: Diagnose Smarbiz Google Play from Publisher production
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-google-prod-runtime-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Probe stored Publisher Google credential
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          account = app.google_account
+          info = account.get_credentials()
+          print('db_identity=', info.get('client_email'))
+          print('db_project=', info.get('project_id'))
+          print('db_private_key_id=', info.get('private_key_id'))
+          client = GooglePlayClient(account)
+          for package in ['de.aplussolution.smarbiz', 'de.aplussolution.workforce', 'de.aplusesthetic.app']:
+              result = client.test(package)
+              print('package=', package, 'ok=', result.ok)
+              print('message=', result.message.replace('\n', ' | '))
+          PY

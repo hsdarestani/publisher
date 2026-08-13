@@ -14,6 +14,12 @@ APPLE_REVIEW_CONTACTS = {
         "contactPhone": "+491727779721",
         "contactEmail": "info@aplus-solution.de",
     },
+    "smarbiz": {
+        "contactFirstName": "Ashkan",
+        "contactLastName": "Asadian",
+        "contactPhone": "+491727779721",
+        "contactEmail": "info@aplus-solution.de",
+    },
 }
 
 

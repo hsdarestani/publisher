@@ -1,0 +1,106 @@
+name: Submit Smarbiz to Google Play
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-google-submit-direct.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Promote existing versionCode 2 to production and send for review
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check google-auth requests >/dev/null
+          python - <<'PY'
+          import json, os, sys
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          package = 'de.aplussolution.smarbiz'
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(Request())
+          s = AuthorizedSession(creds)
+          base = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          qp = quote(package, safe='._-')
+
+          def fail(label, r):
+              try: detail = json.dumps(r.json(), ensure_ascii=False)
+              except Exception: detail = ' '.join(r.text.split())
+              print(f'{label}_http={r.status_code}')
+              print(f'{label}_error={detail[:12000]}')
+              raise SystemExit(1)
+
+          r = s.post(f'{base}/applications/{qp}/edits', json={}, timeout=60)
+          if not r.ok: fail('edit_insert', r)
+          edit = r.json()['id']
+          print('edit_insert=ok')
+
+          try:
+              br = s.get(f'{base}/applications/{qp}/edits/{edit}/bundles', timeout=60)
+              if not br.ok: fail('bundles_list', br)
+              bundles = br.json().get('bundles', [])
+              codes = sorted({str(x.get('versionCode')) for x in bundles})
+              print('bundle_codes=' + ','.join(codes))
+              if '2' not in codes:
+                  raise SystemExit('versionCode 2 is not visible in Google Play yet')
+
+              for track in ('internal', 'production'):
+                  tr = s.get(f'{base}/applications/{qp}/edits/{edit}/tracks/{track}', timeout=60)
+                  if tr.ok:
+                      print(f'track_before_{track}=' + json.dumps(tr.json(), ensure_ascii=False, sort_keys=True)[:5000])
+                  else:
+                      print(f'track_before_{track}_http={tr.status_code}')
+
+              body = {
+                  'track': 'production',
+                  'releases': [{
+                      'name': '1.0.0',
+                      'versionCodes': ['2'],
+                      'status': 'completed',
+                      'releaseNotes': [
+                          {'language': 'de-DE', 'text': 'Erste mobile Version von Smarbiz mit Brand Pulse, Content Studio, Freigaben, Kalender und Reports.'},
+                          {'language': 'en-US', 'text': 'First Smarbiz mobile release with Brand Pulse, Content Studio, approvals, calendar and reports.'},
+                      ],
+                  }],
+              }
+              ur = s.put(f'{base}/applications/{qp}/edits/{edit}/tracks/production', json=body, timeout=60)
+              if not ur.ok: fail('track_update', ur)
+              print('track_update=ok')
+
+              vr = s.post(f'{base}/applications/{qp}/edits/{edit}:validate', json={}, timeout=60)
+              if not vr.ok: fail('edit_validate', vr)
+              print('edit_validate=ok')
+
+              cr = s.post(
+                  f'{base}/applications/{qp}/edits/{edit}:commit',
+                  params={'changesInReviewBehavior': 'ERROR_IF_IN_REVIEW'},
+                  json={},
+                  timeout=120,
+              )
+              if not cr.ok: fail('edit_commit', cr)
+              print('GOOGLE=SUBMITTED_FOR_REVIEW')
+              print('commit=' + json.dumps(cr.json(), ensure_ascii=False, sort_keys=True))
+          except BaseException:
+              try:
+                  s.delete(f'{base}/applications/{qp}/edits/{edit}', timeout=30)
+              except Exception:
+                  pass
+              raise
+          PY

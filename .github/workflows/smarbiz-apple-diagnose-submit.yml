@@ -1,0 +1,177 @@
+name: Diagnose and submit Smarbiz App Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-apple-diagnose-submit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Inspect Apple eligibility and retry existing review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import requests
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, MobileApp, Submission
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          build = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=2,
+              platform='ios',
+          )
+          if build.status != 'succeeded' or not build.external_build_id:
+              raise SystemExit(f'iOS build is not processed: status={build.status} external={build.external_build_id!r}')
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              version = next(
+                  (v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0'),
+                  None,
+              )
+          if not version:
+              raise SystemExit('App Store version 1.0.0 not found')
+
+          app_id = record['id']
+          version_id = version['id']
+          print('app_id=' + app_id)
+          print('version_id=' + version_id)
+          print('version_attributes=' + json.dumps(version.get('attributes', {}), sort_keys=True))
+          print('build_external_id=' + build.external_build_id)
+
+          for label, path in (
+              ('review_detail', f'/appStoreVersions/{version_id}/appStoreReviewDetail'),
+              ('localizations', f'/appStoreVersions/{version_id}/appStoreVersionLocalizations?limit=50'),
+              ('build_relationship', f'/appStoreVersions/{version_id}/relationships/build'),
+          ):
+              try:
+                  data = client.request('GET', path)
+                  print(label + '=' + json.dumps(data, sort_keys=True))
+              except Exception as exc:
+                  print(label + '_error=' + str(exc))
+
+          active = []
+          ready_target = None
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW', 'UNRESOLVED_ISSUES'):
+              try:
+                  submissions = client.list_review_submissions(app_id, state)
+              except Exception as exc:
+                  print(f'list_submission_{state}_error={exc}')
+                  continue
+              for sub in submissions:
+                  items = client.list_review_submission_items(sub['id'])
+                  for item in items:
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) != str(version_id):
+                          continue
+                      row = {
+                          'submission_id': sub['id'],
+                          'submission_state': state,
+                          'item_id': item['id'],
+                          'item_state': item.get('attributes', {}).get('state'),
+                      }
+                      active.append(row)
+                      if state == 'READY_FOR_REVIEW':
+                          ready_target = sub
+          print('review_submissions_for_version=' + json.dumps(active, sort_keys=True))
+
+          if any(row['submission_state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'} for row in active):
+              target = next(row for row in active if row['submission_state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'})
+              Submission.objects.update_or_create(
+                  app=app, release=build.release, platform='ios',
+                  defaults={
+                      'state': 'in_review',
+                      'external_id': target['submission_id'],
+                      'submitted_at': timezone.now(),
+                      'raw': {'diagnostic': active, 'already_active': True},
+                      'last_error': '',
+                  },
+              )
+              build.release.status = 'in_review'
+              build.release.save(update_fields=['status', 'updated_at'])
+              print('RESULT=ALREADY_SUBMITTED')
+              raise SystemExit(0)
+
+          if not ready_target:
+              print('No READY_FOR_REVIEW submission currently targets this version; asking Publisher to create/reuse one.')
+              try:
+                  client.submit_version(app_id, version_id)
+              except Exception as exc:
+                  print('publisher_submit_error=' + str(exc))
+              for sub in client.list_review_submissions(app_id, 'READY_FOR_REVIEW'):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == str(version_id):
+                          ready_target = sub
+                          break
+                  if ready_target:
+                      break
+          if not ready_target:
+              raise SystemExit('No reusable READY_FOR_REVIEW submission exists for Smarbiz 1.0.0')
+
+          url = f'https://api.appstoreconnect.apple.com/v1/reviewSubmissions/{ready_target["id"]}'
+          body = {
+              'data': {
+                  'type': 'reviewSubmissions',
+                  'id': ready_target['id'],
+                  'attributes': {'submitted': True},
+              }
+          }
+          response = requests.patch(
+              url,
+              headers={
+                  'Authorization': f'Bearer {client.token()}',
+                  'Content-Type': 'application/json',
+              },
+              data=json.dumps(body),
+              timeout=90,
+          )
+          print('raw_submit_http=' + str(response.status_code))
+          print('raw_submit_body_begin')
+          print(response.text)
+          print('raw_submit_body_end')
+          if not response.ok:
+              raise SystemExit(f'Apple review submission remains blocked: HTTP {response.status_code}')
+
+          final = response.json()['data']
+          final_state = final.get('attributes', {}).get('state', '')
+          Submission.objects.update_or_create(
+              app=app, release=build.release, platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': final['id'],
+                  'submitted_at': timezone.now(),
+                  'raw': {'submission': final, 'diagnostic_retry': True},
+                  'last_error': '',
+              },
+          )
+          build.release.status = 'in_review'
+          build.release.save(update_fields=['status', 'updated_at'])
+          print(f'RESULT=SUBMITTED:{final["id"]}:{final_state}')
+          PY

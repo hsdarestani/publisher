@@ -10,11 +10,20 @@ class StyledModelForm(forms.ModelForm):
 
 class MobileAppForm(StyledModelForm):
     repository_token = forms.CharField(required=False, widget=forms.PasswordInput(render_value=False), help_text="Optional. Leave empty to keep the current token.")
-    review_password = forms.CharField(required=False, widget=forms.PasswordInput(render_value=False), help_text="Optional reviewer password; encrypted at rest.")
+    review_password = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=True, attrs={"autocomplete": "off"}),
+        help_text="Stored reviewer password. Keep this exact value in Google Play/App Store review access. Change it only when intentionally rotating the real review account.",
+    )
     class Meta:
         model = MobileApp
         fields = ["name", "slug", "client_name", "platform", "framework", "status", "package_name", "bundle_id", "google_app_id", "apple_app_id", "repository_url", "default_branch", "repository_token", "privacy_policy_url", "support_url", "marketing_url", "category", "content_rating", "requires_login", "review_username", "review_password", "review_notes", "google_account", "apple_account", "build_config"]
         widgets = {"review_notes": forms.Textarea(attrs={"rows": 4})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if getattr(self.instance, "pk", None):
+            self.fields["review_password"].initial = self.instance.get_review_password()
 
     def save(self, commit=True):
         obj = super().save(commit=False)

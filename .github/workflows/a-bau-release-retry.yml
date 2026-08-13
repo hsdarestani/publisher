@@ -41,6 +41,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 35
     env:
       APP_VERSION: '2.2.0'
       BUILD_NUMBER: '22001'
@@ -63,7 +64,7 @@ jobs:
           done
           exit 2
 
-      - name: Create isolated review login when A+Bau is co-located and bootstrap release
+      - name: Create isolated review login when A+Bau is co-located and bootstrap release once
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -100,10 +101,12 @@ jobs:
               -e A_BAU_REVIEW_USERNAME=demo \
               -e A_BAU_REVIEW_PASSWORD="$REVIEW_PASS" \
               web python manage.py bootstrap_a_bau_release \
-              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" --queue --publish
+              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" \
+              --recover-publish-after-restart --queue --publish
           else
             docker compose exec -T web python manage.py bootstrap_a_bau_release \
-              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" --queue --publish
+              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" \
+              --recover-publish-after-restart --queue --publish
           fi
           unset REVIEW_PASS
           REMOTE
@@ -126,7 +129,7 @@ jobs:
           gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
           gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
 
-      - name: Advance release until both store submissions finish or a store blocker is confirmed
+      - name: Poll Store submission status without regenerating assets
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -134,23 +137,33 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          for i in $(seq 1 50); do
-            echo "=== A+Bau release pass $i ==="
+          for i in $(seq 1 60); do
+            echo "=== A+Bau lightweight status pass $i ==="
             OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish")"
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --diagnose-only")"
             printf '%s\n' "$OUTPUT"
-            if printf '%s\n' "$OUTPUT" | grep -q 'job=upload_google:succeeded' && \
-               printf '%s\n' "$OUTPUT" | grep -q 'job=submit_apple:succeeded'; then
-              echo 'A+Bau Google and Apple submissions completed.'
-              exit 0
+            APPLE_STATUS="$(printf '%s\n' "$OUTPUT" | grep '^job=submit_apple:' | tail -1 || true)"
+            GOOGLE_STATUS="$(printf '%s\n' "$OUTPUT" | grep '^job=upload_google:' | tail -1 || true)"
+
+            if printf '%s\n' "$APPLE_STATUS" | grep -q '^job=submit_apple:succeeded'; then
+              if printf '%s\n' "$GOOGLE_STATUS" | grep -q '^job=upload_google:succeeded'; then
+                echo 'A+Bau Google and Apple submissions completed.'
+                exit 0
+              fi
+              if printf '%s\n' "$OUTPUT" | grep -q '^google_record=blocked'; then
+                echo 'A+Bau Apple submission completed; Google Play API access is still blocked.' >&2
+                exit 4
+              fi
             fi
-            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=failed' || \
-               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=failed'; then
-              echo 'A+Bau build failed; stopping retry loop for diagnosis.' >&2
-              exit 3
+
+            if printf '%s\n' "$APPLE_STATUS" | grep -q '^job=submit_apple:failed'; then
+              echo "Latest Apple submission failed: $APPLE_STATUS" >&2
+              exit 5
             fi
-            sleep 30
+            sleep 20
           done
+          echo 'Timed out waiting for the current Store submission jobs.' >&2
+          exit 6
 
       - name: Final Publisher state
         if: always()
@@ -161,4 +174,4 @@ jobs:
         run: |
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --diagnose-only"

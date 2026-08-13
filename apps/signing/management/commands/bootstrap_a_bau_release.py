@@ -1,11 +1,53 @@
 from __future__ import annotations
 
-from apps.publisher.models import AppLocalization
+from django.utils import timezone
+
+from apps.publisher.models import AppLocalization, Job, Release
 from apps.signing.management.commands.bootstrap_a_bau import Command as ABBauBootstrapCommand
 
 
 class Command(ABBauBootstrapCommand):
     help = "Run the production A+Bau Publisher release with Store-safe localization limits."
+
+    def add_arguments(self, parser):
+        super().add_arguments(parser)
+        parser.add_argument(
+            "--recover-publish-after-restart",
+            action="store_true",
+            help="Fail only currently-running internal A+Bau Store publish jobs after a confirmed Publisher worker restart so they can be retried idempotently.",
+        )
+
+    def handle(self, *args, **options):
+        if options.get("recover_publish_after_restart"):
+            app = self._find_app()
+            release = None
+            if app:
+                release = Release.objects.filter(
+                    app=app,
+                    version_name=options["app_version"],
+                    build_number=options["build_number"],
+                ).first()
+            recovered = []
+            if app and release:
+                jobs = Job.objects.filter(
+                    app=app,
+                    release=release,
+                    type__in=["submit_apple", "upload_google", "submit_google"],
+                    status="running",
+                    available_to_agents=False,
+                ).order_by("created_at")
+                for job in jobs:
+                    job.status = "failed"
+                    job.finished_at = timezone.now()
+                    job.error = "Recovered after confirmed Publisher worker restart; safe to retry idempotently."
+                    job.append_log(job.error)
+                    job.save(update_fields=["status", "finished_at", "error", "updated_at"])
+                    recovered.append(job.pk)
+            self.stdout.write(
+                "restart_recovered_publish_jobs="
+                + (",".join(map(str, recovered)) if recovered else "none")
+            )
+        return super().handle(*args, **options)
 
     def _upsert_localization(self, app):
         full = (

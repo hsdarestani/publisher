@@ -6,6 +6,9 @@ APPLE_USES_NON_EXEMPT_ENCRYPTION = {
     # explicitly sets ITSAppUsesNonExemptEncryption=NO. It does not ship custom
     # cryptographic algorithms or a separate crypto library.
     "a-studio": False,
+    # A+Bau likewise declares ITSAppUsesNonExemptEncryption=NO in its native iOS
+    # release configuration and relies on ordinary platform HTTPS/TLS.
+    "a-bau": False,
 }
 
 
@@ -15,51 +18,61 @@ APPLE_CONTENT_RIGHTS = {
     # verify content and third-party rights before production use, so the
     # conservative App Store declaration is that third-party content may be used.
     "a-studio": "USES_THIRD_PARTY_CONTENT",
+    # A+Bau allows authenticated business users to attach photos, documents and
+    # other project material. Treat this conservatively as possible third-party
+    # content rather than claiming the app can never access such material.
+    "a-bau": "USES_THIRD_PARTY_CONTENT",
+}
+
+
+_BASE_BUSINESS_AGE_RATING = {
+    # In-app controls.
+    "parentalControls": False,
+    "ageAssurance": False,
+    # Capabilities.
+    "unrestrictedWebAccess": False,
+    "userGeneratedContent": True,
+    "socialMedia": False,
+    "socialMediaAgeRestricted": False,
+    "messagingAndChat": False,
+    "advertising": False,
+    # Medical / wellness.
+    "healthOrWellnessTopics": False,
+    "medicalOrTreatmentInformation": "NONE",
+    # Mature themes.
+    "profanityOrCrudeHumor": "NONE",
+    "horrorOrFearThemes": "NONE",
+    "matureOrSuggestiveThemes": "NONE",
+    "alcoholTobaccoOrDrugUseOrReferences": "NONE",
+    # Sexuality / nudity.
+    "sexualContentOrNudity": "NONE",
+    "sexualContentGraphicAndNudity": "NONE",
+    # Violence / weapons.
+    "violenceCartoonOrFantasy": "NONE",
+    "violenceRealistic": "NONE",
+    "violenceRealisticProlongedGraphicOrSadistic": "NONE",
+    "gunsOrOtherWeapons": "NONE",
+    # Chance-based activities.
+    "gamblingSimulated": "NONE",
+    "contests": "NONE",
+    "gambling": False,
+    "lootBox": False,
+    # Neither app is in the Kids category and neither needs a manual regional or
+    # global override. Apple exposes both legacy and current override fields but
+    # rejects a single update that sends both; use only the current V2 field.
+    "kidsAgeBand": None,
+    "ageRatingOverrideV2": "NONE",
+    "koreaAgeRatingOverride": "NONE",
 }
 
 
 APPLE_AGE_RATING_PROFILES = {
-    "a-studio": {
-        # In-app controls.
-        "parentalControls": False,
-        "ageAssurance": False,
-        # Capabilities. A+ Studio has no browser, social feed, advertising or
-        # user-to-user messaging. User-created application content can be
-        # published, so declare UGC conservatively even without social discovery.
-        "unrestrictedWebAccess": False,
-        "userGeneratedContent": True,
-        "socialMedia": False,
-        "socialMediaAgeRestricted": False,
-        "messagingAndChat": False,
-        "advertising": False,
-        # Medical / wellness.
-        "healthOrWellnessTopics": False,
-        "medicalOrTreatmentInformation": "NONE",
-        # Mature themes.
-        "profanityOrCrudeHumor": "NONE",
-        "horrorOrFearThemes": "NONE",
-        "matureOrSuggestiveThemes": "NONE",
-        "alcoholTobaccoOrDrugUseOrReferences": "NONE",
-        # Sexuality / nudity.
-        "sexualContentOrNudity": "NONE",
-        "sexualContentGraphicAndNudity": "NONE",
-        # Violence / weapons.
-        "violenceCartoonOrFantasy": "NONE",
-        "violenceRealistic": "NONE",
-        "violenceRealisticProlongedGraphicOrSadistic": "NONE",
-        "gunsOrOtherWeapons": "NONE",
-        # Chance-based activities.
-        "gamblingSimulated": "NONE",
-        "contests": "NONE",
-        "gambling": False,
-        "lootBox": False,
-        # Not a Kids-category app and no manual rating override. Apple exposes
-        # both the legacy V1 override and the current V2 override, but rejects a
-        # single update that includes both. Send only the current V2 field.
-        "kidsAgeBand": None,
-        "ageRatingOverrideV2": "NONE",
-        "koreaAgeRatingOverride": "NONE",
-    },
+    "a-studio": dict(_BASE_BUSINESS_AGE_RATING),
+    # A+Bau is a restricted-access construction/business ERP. Users can create
+    # project records, reports, photos and documents, hence UGC is declared
+    # conservatively. It has no unrestricted browser, social network, advertising,
+    # gambling, weapons/violence or adult-content feature.
+    "a-bau": dict(_BASE_BUSINESS_AGE_RATING),
 }
 
 

@@ -1,0 +1,156 @@
+name: Complete Smarbiz App Store Metadata
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-apple-metadata-fix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  complete-metadata:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Apply reviewed App Store metadata
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import requests
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, MobileApp
+          from apps.publisher.store_compliance import apple_age_rating_profile
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          build = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=2,
+              platform='ios',
+          )
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          app_id = record['id']
+          infos = client.request('GET', f'/apps/{app_id}/appInfos?limit=10')['data']
+          info = next((x for x in infos if x.get('attributes', {}).get('appStoreState') == 'PREPARE_FOR_SUBMISSION'), infos[0])
+          info_id = info['id']
+
+          # Content rights: Smarbiz can contain user/third-party brand assets.
+          client.request('PATCH', f'/apps/{app_id}', data=json.dumps({
+              'data': {
+                  'type': 'apps', 'id': app_id,
+                  'attributes': {'contentRightsDeclaration': 'USES_THIRD_PARTY_CONTENT'},
+              }
+          }))
+          print('content_rights=ready')
+
+          # Business is the reviewed primary category for this B2B workspace.
+          client.request('PATCH', f'/appInfos/{info_id}', data=json.dumps({
+              'data': {
+                  'type': 'appInfos', 'id': info_id,
+                  'relationships': {
+                      'primaryCategory': {'data': {'type': 'appCategories', 'id': 'BUSINESS'}}
+                  },
+              }
+          }))
+          print('primary_category=BUSINESS')
+
+          # Apple requires a privacy policy URL on every App Info localization.
+          localizations = client.request('GET', f'/appInfos/{info_id}/appInfoLocalizations?limit=50')['data']
+          for loc in localizations:
+              client.request('PATCH', f'/appInfoLocalizations/{loc["id"]}', data=json.dumps({
+                  'data': {
+                      'type': 'appInfoLocalizations', 'id': loc['id'],
+                      'attributes': {'privacyPolicyUrl': app.privacy_policy_url},
+                  }
+              }))
+          print(f'privacy_policy_localizations={len(localizations)}')
+
+          # Current App Store age questionnaire. Values come from Smarbiz's
+          # reviewed business-app profile in Publisher; do not invent defaults.
+          rating = client.request('GET', f'/appInfos/{info_id}/ageRatingDeclaration')['data']
+          profile = apple_age_rating_profile(app)
+          if not profile:
+              raise SystemExit('Smarbiz age-rating profile is unavailable on production Publisher')
+          client.request('PATCH', f'/ageRatingDeclarations/{rating["id"]}', data=json.dumps({
+              'data': {
+                  'type': 'ageRatingDeclarations', 'id': rating['id'],
+                  'attributes': profile,
+              }
+          }))
+          print('age_rating=ready')
+
+          # The signed native build declares platform HTTPS/TLS only.
+          if not build.external_build_id:
+              raise SystemExit('Processed iOS build ID is missing')
+          client.request('PATCH', f'/builds/{build.external_build_id}', data=json.dumps({
+              'data': {
+                  'type': 'builds', 'id': build.external_build_id,
+                  'attributes': {'usesNonExemptEncryption': False},
+              }
+          }))
+          print('encryption=ready')
+
+          # Set the app to Free. If a schedule was already created manually, keep it.
+          base = 'https://api.appstoreconnect.apple.com/v1'
+          headers = {'Authorization': f'Bearer {client.token()}', 'Content-Type': 'application/json'}
+          existing = requests.get(base + f'/apps/{app_id}/appPriceSchedule', headers=headers, timeout=90)
+          if existing.ok:
+              print('pricing=already_ready')
+          elif existing.status_code == 404:
+              points = requests.get(
+                  base + f'/apps/{app_id}/appPricePoints',
+                  headers=headers,
+                  params={'filter[territory]': 'DEU', 'include': 'territory', 'limit': 200},
+                  timeout=90,
+              )
+              points.raise_for_status()
+              free = next(
+                  (p for p in points.json().get('data', []) if float(p.get('attributes', {}).get('customerPrice') or -1) == 0.0),
+                  None,
+              )
+              if not free:
+                  raise SystemExit('Apple returned no free DEU price point')
+              body = {
+                  'data': {
+                      'type': 'appPriceSchedules',
+                      'relationships': {
+                          'app': {'data': {'type': 'apps', 'id': app_id}},
+                          'baseTerritory': {'data': {'type': 'territories', 'id': 'DEU'}},
+                          'manualPrices': {'data': [{
+                              'type': 'appPrices',
+                              'relationships': {
+                                  'appPricePoint': {'data': {'type': 'appPricePoints', 'id': free['id']}},
+                                  'territory': {'data': {'type': 'territories', 'id': 'DEU'}},
+                              },
+                          }]},
+                      },
+                  }
+              }
+              created = requests.post(base + '/appPriceSchedules', headers=headers, data=json.dumps(body), timeout=90)
+              print('pricing_create_http=' + str(created.status_code))
+              if not created.ok:
+                  print('pricing_create_error=' + created.text[:4000])
+                  raise SystemExit('Unable to create free App Store price schedule')
+              print('pricing=free')
+          else:
+              print('pricing_probe_http=' + str(existing.status_code))
+              print('pricing_probe_error=' + existing.text[:4000])
+              raise SystemExit('Unable to inspect App Store pricing')
+          PY

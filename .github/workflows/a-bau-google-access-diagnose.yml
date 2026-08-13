@@ -1,0 +1,69 @@
+name: Diagnose A+Bau Google Play access
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-google-access-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Compare Google Play API access across Publisher apps
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+          from apps.integrations.google_play import GooglePlayClient
+
+          target = MobileApp.objects.filter(slug='a-bau').select_related('google_account').first()
+          if not target or not target.google_account:
+              raise SystemExit('a_bau_google_account=missing')
+
+          account = target.google_account
+          info = account.get_credentials()
+          print('google_identity=' + str(info.get('client_email', '')))
+          print('google_project=' + str(info.get('project_id', '')))
+          print('a_bau_package=' + str(target.package_name))
+
+          apps = list(
+              MobileApp.objects.filter(google_account=account)
+              .exclude(package_name='')
+              .order_by('slug')
+          )
+          print('linked_apps=' + str(len(apps)))
+          for app in apps:
+              result = GooglePlayClient(account).test(app.package_name)
+              data = result.data or {}
+              probes = data.get('endpoint_probes', [])
+              compact = []
+              for probe in probes:
+                  compact.append({
+                      'endpoint': probe.get('endpoint'),
+                      'status': probe.get('status'),
+                      'content_type': probe.get('content_type'),
+                      'body': probe.get('body'),
+                  })
+              print('APP ' + json.dumps({
+                  'slug': app.slug,
+                  'package': app.package_name,
+                  'ok': result.ok,
+                  'message': result.message,
+                  'probes': compact,
+              }, ensure_ascii=False))
+          PY

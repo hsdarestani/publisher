@@ -79,6 +79,6 @@ def set_store_review_credentials(request):
 
     app.review_username = username[:120]
     app.set_review_password(password)
-    app.save(update_fields=["review_username", "review_password_encrypted", "updated_at"])
+    app.save(update_fields=["review_username", "review_password_blob", "updated_at"])
 
     return JsonResponse({"ok": True, "app_id": app.pk, "review_username": app.review_username})

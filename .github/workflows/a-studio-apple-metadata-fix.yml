@@ -1,0 +1,204 @@
+name: Fix A+ Studio App Store metadata
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-apple-metadata-fix.yml'
+  workflow_run:
+    workflows: ['Release A+ Studio to Apple and Google']
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-studio-apple-metadata-fix
+  cancel-in-progress: false
+
+jobs:
+  sanitize:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Sanitize live App Store metadata and review information
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Build, Submission
+          from apps.publisher.review_contacts import apple_review_contact
+
+          app = MobileApp.objects.get(slug='a-studio')
+          build = Build.objects.get(
+              release__app=app,
+              release__version_name='1.0.0',
+              release__build_number=3,
+              platform='ios',
+          )
+          if build.status != 'succeeded' or not build.external_build_id:
+              raise SystemExit(f'Build 3 is not ready: {build.status} / {build.external_build_id!r}')
+
+          loc = app.localizations.get(locale='de-DE')
+          loc.full_description = (
+              "A+ Studio ist die mobile AI Software Factory von A+ Solution. Beschreiben Sie Ihre App-Idee, "
+              "erstellen Sie einen ersten Preview-Build und verbessern Sie das Produkt direkt im AI Builder.\n\n"
+              "Verwalten Sie Projekte, verfolgen Sie Build-Status und Versionen, öffnen Sie Previews und geben Sie "
+              "Änderungen direkt im Projekt in Auftrag. Nach Ihrer Freigabe begleitet A+ Solution die technische "
+              "Qualitätssicherung, Signierung und Veröffentlichung Ihrer eigenen App.\n\n"
+              "Die mobile App konzentriert sich auf den produktiven Builder-Workflow: Konto, Projekte, AI-Änderungen, "
+              "Preview, Build-Status und Publishing-Anfragen. Digitale Käufe oder externe Zahlungslinks sind in Version "
+              "1.0 nicht Bestandteil der mobilen App."
+          )
+          loc.release_notes = (
+              "Aktualisierte Version mit verbessertem App-Review-Zugang und bereinigter Publishing-Oberfläche."
+          )
+          loc.save(update_fields=['full_description', 'release_notes', 'updated_at'])
+
+          # Preserve the dedicated reviewer credentials already provisioned in Publisher.
+          if not app.review_username or not app.get_review_password():
+              raise SystemExit('Dedicated App Review credentials are missing; refusing to overwrite review details.')
+          app.requires_login = True
+          app.review_notes = (
+              "Typical service example: a service business asks A+ Solution to create a customer-facing booking app. "
+              "The customer uses A+ Studio to describe the required features, review the generated project preview, "
+              "request changes in the AI Builder, and follow the build and publishing status. A+ Solution then provides "
+              "the software-development service: technical implementation, quality assurance, signing and publication "
+              "of the customer's own app. A+ Studio helps render this service by centralizing the project brief, AI-guided "
+              "iterations, previews, version/build status and the final publishing request in one workspace. It is not a "
+              "marketplace and no digital purchase is required in the iOS app. The dedicated review account contains the "
+              "pre-populated 'Luna Booking' project with an existing AI Builder conversation and a ready Preview so the "
+              "complete workflow can be tested immediately. No subscription, purchase or two-factor authentication is required."
+          )
+          app.save(update_fields=['requires_login', 'review_notes', 'updated_at'])
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.find_editable_version(record['id'], '1.0.0')
+          if not version:
+              version = next(
+                  v for v in client.list_versions(record['id'])
+                  if v.get('attributes', {}).get('versionString') == '1.0.0'
+              )
+
+          client.set_localization(version['id'], loc)
+          contact = apple_review_contact(app)
+          client.set_review_details(version['id'], app, contact=contact or None)
+          client.attach_build(version['id'], build.external_build_id)
+
+          # Verify exactly what App Store Connect now stores for the German description.
+          remote_locs = client.request(
+              'GET',
+              f"/appStoreVersions/{version['id']}/appStoreVersionLocalizations?filter[locale]=de-DE&limit=1",
+          ).get('data', [])
+          if not remote_locs:
+              raise SystemExit('App Store localization was not found after update.')
+          remote_description = remote_locs[0].get('attributes', {}).get('description') or ''
+          lowered = remote_description.lower()
+          forbidden = [term for term in ('google play', 'android', 'play store') if term in lowered]
+          if forbidden:
+              raise SystemExit('Forbidden third-party platform references remain in App Store description: ' + ', '.join(forbidden))
+          print('app_store_description_sanitized=yes')
+          print('app_store_description=' + remote_description.replace('\n', ' | '))
+
+          detail = client.request('GET', f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data')
+          attrs = (detail or {}).get('attributes', {})
+          print('review_demo_account_required=' + str(attrs.get('demoAccountRequired')))
+          print('review_demo_account_name=' + str(attrs.get('demoAccountName') or ''))
+          print('review_notes_updated=' + str(bool(attrs.get('notes'))))
+
+          # Reuse the existing submission only. Never create another review submission.
+          version_id = str(version['id'])
+          target = None
+          target_items = []
+          target_state = None
+          for state in ('UNRESOLVED_ISSUES', 'READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  items = []
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == version_id:
+                          items.append(item)
+                  if items:
+                      target, target_items, target_state = sub, items, state
+                      break
+              if target:
+                  break
+
+          if not target:
+              raise SystemExit('No existing App Review submission targets version 1.0.0.')
+
+          if target_state == 'UNRESOLVED_ISSUES':
+              for item in target_items:
+                  if item.get('attributes', {}).get('state') == 'REJECTED':
+                      body = {'data': {'type': 'reviewSubmissionItems', 'id': item['id'], 'attributes': {'resolved': True}}}
+                      client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(body))
+              body = {'data': {'type': 'reviewSubmissions', 'id': target['id'], 'attributes': {'submitted': True}}}
+              target = client.request('PATCH', f"/reviewSubmissions/{target['id']}", data=json.dumps(body))['data']
+              target_state = target.get('attributes', {}).get('state', target_state)
+          elif target_state == 'READY_FOR_REVIEW':
+              body = {'data': {'type': 'reviewSubmissions', 'id': target['id'], 'attributes': {'submitted': True}}}
+              target = client.request('PATCH', f"/reviewSubmissions/{target['id']}", data=json.dumps(body))['data']
+              target_state = target.get('attributes', {}).get('state', target_state)
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=build.release,
+              platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': target['id'],
+                  'submitted_at': timezone.now(),
+                  'last_error': '',
+                  'raw': {'submission': target, 'metadata_fix_applied': True},
+              },
+          )
+          build.release.status = 'in_review'
+          build.release.save(update_fields=['status', 'updated_at'])
+          print(f'app_review_submission={target["id"]}:{target_state}')
+          PY
+
+      - name: Verify review remains active
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='a-studio')
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = next(v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0')
+          active = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_REVIEW', 'UNRESOLVED_ISSUES'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                      if str(rel.get('id')) == str(version['id']):
+                          active.append({'submission': sub['id'], 'state': state, 'item_state': item.get('attributes', {}).get('state')})
+          print('active_review=' + json.dumps(active, sort_keys=True))
+          if not any(row['state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'} for row in active):
+              raise SystemExit('A+ Studio is not Waiting for Review or In Review after metadata fix.')
+          PY

@@ -9,10 +9,11 @@ from apps.publisher.models import MobileApp
 
 
 APP_SLUG = "a-bau"
+APP_VERSION = "2.2.0"
 
 
 class Command(BaseCommand):
-    help = "Read live A+Bau App Store privacy and review-submission resources without modifying them."
+    help = "Read live A+Bau App Store privacy, version and review-submission resources without modifying them."
 
     def _call(self, client, path: str):
         try:
@@ -41,6 +42,12 @@ class Command(BaseCommand):
         apple_id = record["id"]
         self.stdout.write(f"apple_app_id={apple_id}")
 
+        self._print_call(
+            client,
+            "app_store_version",
+            f"/apps/{apple_id}/appStoreVersions?filter[versionString]={APP_VERSION}&limit=10",
+        )
+
         probes = [
             ("privacy_app_data_usages", f"/apps/{apple_id}/dataUsages?limit=200"),
             ("privacy_app_data_usages_relationship", f"/apps/{apple_id}/relationships/dataUsages?limit=200"),
@@ -61,9 +68,6 @@ class Command(BaseCommand):
             if state == "READY_FOR_REVIEW" and payload:
                 ready = payload.get("data", [])
 
-        # Read the items for every draft. This identifies which draft already owns
-        # A+Bau's current appStoreVersion and which drafts are empty leftovers from
-        # validation failures, without modifying or canceling anything.
         for submission in ready:
             submission_id = submission.get("id")
             if not submission_id:

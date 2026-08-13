@@ -57,3 +57,5 @@ jobs:
                           })
           print('A_STUDIO_REVIEW_STATUS=' + json.dumps(active, sort_keys=True))
           PY
+
+# automation status probe: 2026-08-13T01:38Z

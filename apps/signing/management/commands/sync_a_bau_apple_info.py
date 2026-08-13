@@ -10,10 +10,11 @@ from apps.publisher.models import MobileApp
 
 APP_SLUG = "a-bau"
 APPLE_PRIMARY_CATEGORY = "BUSINESS"
+APPLE_COPYRIGHT = "2026 A+ Solution GmbH"
 
 
 class Command(BaseCommand):
-    help = "Sync A+Bau app-level App Store localization and required App Information fields."
+    help = "Sync A+Bau app-level localization and required App Store information/version fields."
 
     def handle(self, *args, **options):
         app = MobileApp.objects.filter(slug=APP_SLUG).select_related("apple_account").first()
@@ -24,7 +25,8 @@ class Command(BaseCommand):
 
         client = AppleStoreClient(app.apple_account)
         record = client.find_app(app.bundle_id)
-        infos = client.request("GET", f"/apps/{record['id']}/appInfos?limit=10").get("data", [])
+        apple_app_id = record["id"]
+        infos = client.request("GET", f"/apps/{apple_app_id}/appInfos?limit=10").get("data", [])
         if not infos:
             raise CommandError("Apple appInfo record not found for A+Bau.")
 
@@ -43,10 +45,6 @@ class Command(BaseCommand):
             infos[0],
         )
 
-        # A freshly-created App Store Connect record does not receive a primary
-        # category from the New App dialog. Apple requires one before review.
-        # A+Bau is a construction/business ERP, matching Publisher's Business
-        # category, so keep the App Info relationship idempotently on BUSINESS.
         category_body = {
             "data": {
                 "type": "appInfos",
@@ -67,6 +65,40 @@ class Command(BaseCommand):
             data=json.dumps(category_body),
         )
         self.stdout.write(self.style.SUCCESS("apple_primary_category=BUSINESS"))
+
+        # Copyright is a required appStoreVersion attribute. Keep every editable
+        # A+Bau version populated so a future Publisher retry cannot reach review
+        # validation with a null copyright value.
+        versions = client.request(
+            "GET",
+            f"/apps/{apple_app_id}/appStoreVersions?limit=50",
+        ).get("data", [])
+        patched = 0
+        for version in versions:
+            attrs = version.get("attributes", {})
+            state = attrs.get("appStoreState") or attrs.get("appVersionState")
+            if state not in editable_states:
+                continue
+            if attrs.get("copyright") == APPLE_COPYRIGHT:
+                continue
+            version_body = {
+                "data": {
+                    "type": "appStoreVersions",
+                    "id": version["id"],
+                    "attributes": {"copyright": APPLE_COPYRIGHT},
+                }
+            }
+            client.request(
+                "PATCH",
+                f"/appStoreVersions/{version['id']}",
+                data=json.dumps(version_body),
+            )
+            patched += 1
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"apple_copyright={APPLE_COPYRIGHT} patched_versions={patched}"
+            )
+        )
 
         for loc in app.localizations.all():
             existing = client.request(

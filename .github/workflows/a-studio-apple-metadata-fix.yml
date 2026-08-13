@@ -106,7 +106,6 @@ jobs:
               }
           }
           client.request('PATCH', f"/appStoreReviewDetails/{detail['id']}", data=json.dumps(note_body))
-          client.attach_build(version['id'], build.external_build_id)
 
           # Verify exactly what App Store Connect now stores for the German description.
           remote_locs = client.request(

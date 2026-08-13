@@ -1,0 +1,144 @@
+name: Release A+Bau to Apple and Google
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: A+Bau version
+        required: false
+        default: '2.2.0'
+      build_number:
+        description: Store build number
+        required: false
+        default: '22001'
+  pull_request:
+    paths:
+      - '.github/workflows/a-bau-release.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau.py'
+      - 'apps/signing/management/commands/sync_a_bau_apple_info.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-release.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau.py'
+      - 'apps/signing/management/commands/sync_a_bau_apple_info.py'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Validate A+Bau release modules
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help bootstrap_a_bau >/dev/null
+          python manage.py help sync_a_bau_apple_info >/dev/null
+          python -m py_compile \
+            apps/signing/management/commands/bootstrap_a_bau.py \
+            apps/signing/management/commands/sync_a_bau_apple_info.py
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APP_VERSION: ${{ inputs.app_version || '2.2.0' }}
+      BUILD_NUMBER: ${{ inputs.build_number || '22001' }}
+    steps:
+      - name: Wait for A+Bau Publisher command in production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau >/dev/null 2>&1"; then
+              echo "A+Bau Publisher command is deployed."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'bootstrap_a_bau never appeared in production.' >&2
+          exit 2
+
+      - name: Bootstrap A+Bau, signing, assets and release jobs
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --queue --publish"
+
+      - name: Sync A+Bau App Store name and subtitle when record exists
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py sync_a_bau_apple_info"
+
+      - name: Wake Android and iOS cloud agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Advance A+Bau publishing while builds and uploads arrive
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 50); do
+            echo "=== A+Bau Publisher pass $i ==="
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish")"
+            printf '%s\n' "$OUTPUT"
+
+            if printf '%s\n' "$OUTPUT" | grep -q 'job=upload_google:succeeded' && \
+               printf '%s\n' "$OUTPUT" | grep -q 'job=submit_apple:succeeded'; then
+              echo 'Both store submissions have completed from Publisher.'
+              break
+            fi
+            sleep 30
+          done
+
+      - name: Final A+Bau release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish"

@@ -9,6 +9,9 @@ APPLE_USES_NON_EXEMPT_ENCRYPTION = {
     # A+Bau likewise declares ITSAppUsesNonExemptEncryption=NO in its native iOS
     # release configuration and relies on ordinary platform HTTPS/TLS.
     "a-bau": False,
+    # Smarbiz is a Capacitor wrapper around the HTTPS web application and does not
+    # ship custom/non-exempt cryptographic algorithms.
+    "smarbiz": False,
 }
 
 
@@ -22,6 +25,9 @@ APPLE_CONTENT_RIGHTS = {
     # other project material. Treat this conservatively as possible third-party
     # content rather than claiming the app can never access such material.
     "a-bau": "USES_THIRD_PARTY_CONTENT",
+    # Smarbiz users create, upload, review and publish brand/content assets and AI
+    # output, so conservatively declare that third-party content may be present.
+    "smarbiz": "USES_THIRD_PARTY_CONTENT",
 }
 
 
@@ -57,9 +63,8 @@ _BASE_BUSINESS_AGE_RATING = {
     "contests": "NONE",
     "gambling": False,
     "lootBox": False,
-    # Neither app is in the Kids category and neither needs a manual regional or
-    # global override. Apple exposes both legacy and current override fields but
-    # rejects a single update that sends both; use only the current V2 field.
+    # These business apps are not in the Kids category and do not need manual
+    # regional/global rating overrides.
     "kidsAgeBand": None,
     "ageRatingOverrideV2": "NONE",
     "koreaAgeRatingOverride": "NONE",
@@ -73,6 +78,10 @@ APPLE_AGE_RATING_PROFILES = {
     # conservatively. It has no unrestricted browser, social network, advertising,
     # gambling, weapons/violence or adult-content feature.
     "a-bau": dict(_BASE_BUSINESS_AGE_RATING),
+    # Smarbiz is a business content workspace. Users can create/upload their own
+    # content, but it has no unrestricted browser, mature-content feature,
+    # gambling, weapons, advertising or medical/treatment functionality.
+    "smarbiz": dict(_BASE_BUSINESS_AGE_RATING),
 }
 
 

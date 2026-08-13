@@ -1,0 +1,164 @@
+name: Retry A+Bau Apple and Google release
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/a-bau-release-retry.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau_release.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-release-retry.yml'
+      - 'apps/signing/management/commands/bootstrap_a_bau_release.py'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate fixed A+Bau release command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help bootstrap_a_bau_release >/dev/null
+          python -m py_compile apps/signing/management/commands/bootstrap_a_bau_release.py
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APP_VERSION: '2.2.0'
+      BUILD_NUMBER: '22001'
+    steps:
+      - name: Wait for fixed command in Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_release >/dev/null 2>&1"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 2
+
+      - name: Create isolated review login when A+Bau is co-located and bootstrap release
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "APP_VERSION='$APP_VERSION' BUILD_NUMBER='$BUILD_NUMBER' bash -s" <<'REMOTE'
+          set -euo pipefail
+          REVIEW_PASS=""
+          if [ -d /opt/kayi ] && [ -f /opt/kayi/docker-compose.yml ]; then
+            REVIEW_PASS="$(openssl rand -hex 24)"
+            cd /opt/kayi
+            docker compose exec -T -e REVIEW_PASS="$REVIEW_PASS" web python manage.py shell -c '
+          import os
+          from django.contrib.auth import get_user_model
+          User = get_user_model()
+          user = User.objects.filter(username="demo").first()
+          assert user is not None, "isolated demo user missing"
+          user.set_password(os.environ["REVIEW_PASS"])
+          user.is_active = True
+          user.save(update_fields=["password", "is_active"])
+          print("a_bau_review_demo=ready")
+          '
+            echo 'review_source=isolated_demo_account'
+          else
+            echo 'review_source=publisher_existing_credentials'
+          fi
+
+          cd /opt/aplus-publisher
+          if [ -n "$REVIEW_PASS" ]; then
+            docker compose exec -T \
+              -e A_BAU_REVIEW_USERNAME=demo \
+              -e A_BAU_REVIEW_PASSWORD="$REVIEW_PASS" \
+              web python manage.py bootstrap_a_bau_release \
+              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" --queue --publish
+          else
+            docker compose exec -T web python manage.py bootstrap_a_bau_release \
+              --app-version "$APP_VERSION" --build-number "$BUILD_NUMBER" --queue --publish
+          fi
+          unset REVIEW_PASS
+          REMOTE
+
+      - name: Sync A+Bau App Store app-level metadata
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py sync_a_bau_apple_info"
+
+      - name: Wake Publisher cloud builders
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Advance release until both store submissions finish or a store blocker is confirmed
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 50); do
+            echo "=== A+Bau release pass $i ==="
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish")"
+            printf '%s\n' "$OUTPUT"
+            if printf '%s\n' "$OUTPUT" | grep -q 'job=upload_google:succeeded' && \
+               printf '%s\n' "$OUTPUT" | grep -q 'job=submit_apple:succeeded'; then
+              echo 'A+Bau Google and Apple submissions completed.'
+              exit 0
+            fi
+            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=failed' || \
+               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=failed'; then
+              echo 'A+Bau build failed; stopping retry loop for diagnosis.' >&2
+              exit 3
+            fi
+            sleep 30
+          done
+
+      - name: Final Publisher state
+        if: always()
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release --app-version '$APP_VERSION' --build-number '$BUILD_NUMBER' --publish"

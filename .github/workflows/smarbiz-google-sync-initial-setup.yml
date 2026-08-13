@@ -1,0 +1,202 @@
+name: Sync Smarbiz Google Play initial setup
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-google-sync-initial-setup.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install --disable-pip-version-check google-auth requests >/dev/null
+
+      - name: Export Publisher metadata and assets
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python -' > /tmp/smarbiz-play-payload.json <<'PY'
+          import os, json, base64
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          import django
+          django.setup()
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='smarbiz')
+          localizations = []
+          for loc in app.localizations.all():
+              localizations.append({
+                  'locale': loc.locale,
+                  'title': loc.title,
+                  'short_description': loc.short_description or loc.subtitle,
+                  'full_description': loc.full_description,
+              })
+
+          assets = []
+          for a in app.assets.filter(platform__in=['shared', 'android']).order_by('kind', 'sort_order'):
+              if a.kind not in {'icon', 'feature_graphic', 'screenshot'}:
+                  continue
+              with a.file.open('rb') as fh:
+                  raw = fh.read()
+              assets.append({
+                  'kind': a.kind,
+                  'filename': os.path.basename(a.file.name),
+                  'sort_order': a.sort_order,
+                  'content_b64': base64.b64encode(raw).decode('ascii'),
+              })
+
+          try:
+              data_safety_csv = app.compliance.data_safety_csv or ''
+          except Exception:
+              data_safety_csv = ''
+
+          print(json.dumps({
+              'package': app.package_name,
+              'default_language': 'de-DE',
+              'contact_website': app.support_url or 'https://smarbiz.sbs/de/support',
+              'contact_email': 'app@aplus-solution.de',
+              'contact_phone': '+491727779721',
+              'localizations': localizations,
+              'assets': assets,
+              'data_safety_csv': data_safety_csv,
+          }, ensure_ascii=False))
+          PY
+          python - <<'PY'
+          import json
+          p = json.load(open('/tmp/smarbiz-play-payload.json', encoding='utf-8'))
+          print('publisher_payload=ok')
+          print('localizations=', len(p.get('localizations', [])))
+          print('assets=', len(p.get('assets', [])))
+          print('data_safety_csv=', 'ready' if p.get('data_safety_csv','').strip() else 'missing')
+          PY
+
+      - name: Sync Play listing, contact details, images and Data Safety
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, json, os
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          payload = json.load(open('/tmp/smarbiz-play-payload.json', encoding='utf-8'))
+          package = payload['package']
+          qp = quote(package, safe='._-')
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(Request())
+          s = AuthorizedSession(creds)
+          base = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          upload_base = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+
+          def detail(resp):
+              try:
+                  return json.dumps(resp.json(), ensure_ascii=False)[:8000]
+              except Exception:
+                  return ' '.join(resp.text.split())[:8000]
+
+          def require(label, resp):
+              print(f'{label}_http={resp.status_code}')
+              if not resp.ok:
+                  print(f'{label}_error={detail(resp)}')
+                  raise SystemExit(1)
+              return resp
+
+          edit_r = require('edit_insert', s.post(f'{base}/applications/{qp}/edits', json={}, timeout=60))
+          edit = edit_r.json()['id']
+          try:
+              details = {
+                  'defaultLanguage': payload['default_language'],
+                  'contactWebsite': payload['contact_website'],
+                  'contactEmail': payload['contact_email'],
+                  'contactPhone': payload['contact_phone'],
+              }
+              require('details_update', s.put(
+                  f'{base}/applications/{qp}/edits/{edit}/details', json=details, timeout=60))
+
+              for loc in payload['localizations']:
+                  body = {
+                      'title': loc['title'],
+                      'shortDescription': loc['short_description'],
+                      'fullDescription': loc['full_description'],
+                      'video': '',
+                  }
+                  lang = quote(loc['locale'], safe='-')
+                  require(f'listing_{loc["locale"]}', s.put(
+                      f'{base}/applications/{qp}/edits/{edit}/listings/{lang}', json=body, timeout=60))
+
+              default_lang = quote(payload['default_language'], safe='-')
+              image_groups = {
+                  'icon': [a for a in payload['assets'] if a['kind'] == 'icon'][:1],
+                  'featureGraphic': [a for a in payload['assets'] if a['kind'] == 'feature_graphic'][:1],
+                  'phoneScreenshots': sorted(
+                      [a for a in payload['assets'] if a['kind'] == 'screenshot'],
+                      key=lambda x: x.get('sort_order', 0),
+                  )[:8],
+              }
+              for image_type, items in image_groups.items():
+                  if not items:
+                      print(f'{image_type}=no_source_asset')
+                      continue
+                  delete_url = f'{base}/applications/{qp}/edits/{edit}/listings/{default_lang}/{image_type}'
+                  dr = s.delete(delete_url, timeout=60)
+                  if dr.status_code not in (200, 204, 404):
+                      require(f'{image_type}_deleteall', dr)
+                  for idx, item in enumerate(items, 1):
+                      raw = base64.b64decode(item['content_b64'])
+                      ur = s.post(
+                          f'{upload_base}/applications/{qp}/edits/{edit}/listings/{default_lang}/{image_type}',
+                          params={'uploadType': 'media'},
+                          data=raw,
+                          headers={'Content-Type': 'image/png'},
+                          timeout=120,
+                      )
+                      require(f'{image_type}_upload_{idx}', ur)
+
+              require('edit_validate', s.post(
+                  f'{base}/applications/{qp}/edits/{edit}:validate', json={}, timeout=60))
+              commit = require('edit_commit', s.post(
+                  f'{base}/applications/{qp}/edits/{edit}:commit',
+                  params={'changesInReviewBehavior': 'ERROR_IF_IN_REVIEW'},
+                  json={}, timeout=120))
+              print('PLAY_LISTING_AND_ASSETS=SYNCED')
+              print('commit=' + json.dumps(commit.json(), sort_keys=True)[:2000])
+          except BaseException:
+              try:
+                  s.delete(f'{base}/applications/{qp}/edits/{edit}', timeout=30)
+              except Exception:
+                  pass
+              raise
+
+          csv = payload.get('data_safety_csv', '').strip()
+          if csv:
+              ds = require('data_safety', s.post(
+                  f'{base}/applications/{qp}/dataSafety',
+                  json={'safetyLabels': csv}, timeout=120))
+              print('DATA_SAFETY=SYNCED')
+          else:
+              print('DATA_SAFETY=NO_CSV_IN_PUBLISHER')
+          PY

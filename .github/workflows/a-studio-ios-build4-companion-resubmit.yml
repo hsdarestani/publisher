@@ -1,0 +1,582 @@
+name: A+ Studio iOS Build 4 Companion Resubmit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-build4-companion-resubmit.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  ASTUDIO_REPO: https://github.com/hsdarestani/a-studio.git
+  ASTUDIO_COMMIT: 4fd06306ebf9b7405a2eb017608b689f242c9ae6
+  APP_VERSION: '1.0.0'
+  APP_BUILD: '4'
+
+jobs:
+  release-ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass unzip >/dev/null
+
+      - name: Wait for Publisher deployment and health
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            DATA="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow deploy.yml --branch main --commit "$GITHUB_SHA" --limit 1 --json status,conclusion --jq 'if length == 0 then "missing|" else .[0].status + "|" + (. [0].conclusion // "") end' 2>/dev/null || echo 'missing|')"
+            echo "Publisher deployment: $DATA"
+            STATUS="${DATA%%|*}"
+            CONCLUSION="${DATA#*|}"
+            if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" = "success" ]; then break; fi
+            if [ "$STATUS" = "completed" ] && [ -n "$CONCLUSION" ] && [ "$CONCLUSION" != "success" ]; then
+              echo "Publisher deployment failed: $CONCLUSION" >&2
+              exit 1
+            fi
+            if [ "$i" -eq 60 ]; then echo 'Timed out waiting for Publisher deploy.' >&2; exit 1; fi
+            sleep 10
+          done
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 20 https://publisher.smarbiz.sbs/healthz/ >/dev/null
+
+      - name: Create fresh companion-only App Review account
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVIEW_EMAIL="app-review-b4-${GITHUB_RUN_ID}@studio.aplus-solution.de"
+          REVIEW_PASSWORD="$(python3 - <<'PY'
+          import secrets, string
+          alphabet = string.ascii_letters + string.digits
+          print('ASb4!' + ''.join(secrets.choice(alphabet) for _ in range(26)))
+          PY
+          )"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          export REVIEW_EMAIL REVIEW_PASSWORD
+
+          SIGNUP_PAYLOAD="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              'email': os.environ['REVIEW_EMAIL'],
+              'password': os.environ['REVIEW_PASSWORD'],
+              'full_name': 'App Reviewer',
+              'company_name': 'A+ Studio Review',
+          }))
+          PY
+          )"
+          SIGNUP="$(curl -4 -fsS --connect-timeout 15 --max-time 30 \
+            -H 'Content-Type: application/json' -d "$SIGNUP_PAYLOAD" \
+            https://studio.aplus-solution.de/api/mobile/signup/)"
+          TOKEN="$(python3 - "$SIGNUP" <<'PY'
+          import json, sys
+          data=json.loads(sys.argv[1])
+          if not data.get('ok') or not data.get('token'):
+              raise SystemExit('Companion review signup failed: '+repr(data))
+          print(data['token'])
+          PY
+          )"
+          echo "::add-mask::$TOKEN"
+
+          PROJECT_PAYLOAD='{"name":"Luna Booking","business_type":"Friseursalon","description":"Mobile Projektbegleitung für die Abstimmung einer Termin- und Kunden-App mit A+ Solution. Anforderungen, Prioritäten und Status werden hier koordiniert.","language":"de"}'
+          PROJECT="$(curl -4 -fsS --connect-timeout 15 --max-time 30 \
+            -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+            -d "$PROJECT_PAYLOAD" https://studio.aplus-solution.de/api/mobile/projects/)"
+          PROJECT_ID="$(python3 - "$PROJECT" <<'PY'
+          import json, sys
+          data=json.loads(sys.argv[1]); p=data.get('project') or {}
+          if not data.get('ok') or not p.get('id'):
+              raise SystemExit('Companion project creation failed: '+repr(data))
+          forbidden={'preview_url','live_url','repo_url','deployment','credits','plan'} & set(p)
+          if forbidden:
+              raise SystemExit('Forbidden mobile fields exposed: '+repr(sorted(forbidden)))
+          print(p['id'])
+          PY
+          )"
+
+          for MESSAGE in \
+            'Bitte die Terminübersicht auf dem Tablet übersichtlicher priorisieren.' \
+            'Bitte die Texte für den nächsten Abstimmungstermin prüfen.'; do
+            BODY="$(MESSAGE="$MESSAGE" python3 - <<'PY'
+          import json, os
+          print(json.dumps({'message': os.environ['MESSAGE']}))
+          PY
+          )"
+            curl -4 -fsS --connect-timeout 15 --max-time 30 \
+              -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+              -d "$BODY" "https://studio.aplus-solution.de/api/mobile/projects/$PROJECT_ID/chat/" >/dev/null
+          done
+
+          DETAIL="$(curl -4 -fsS --connect-timeout 15 --max-time 30 \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://studio.aplus-solution.de/api/mobile/projects/$PROJECT_ID/")"
+          python3 - "$DETAIL" <<'PY'
+          import json, sys
+          data=json.loads(sys.argv[1]); p=data.get('project') or {}
+          if not data.get('ok'): raise SystemExit('Review project detail failed')
+          if len(p.get('change_requests') or []) < 2: raise SystemExit('Review project lacks change requests')
+          forbidden={'preview_url','live_url','repo_url','deployment','credits','plan'} & set(p)
+          if forbidden: raise SystemExit('Forbidden mobile fields exposed: '+repr(sorted(forbidden)))
+          print('companion_review_account=verified')
+          print('project='+p.get('name',''))
+          print('change_requests='+str(len(p.get('change_requests') or [])))
+          PY
+
+          {
+            echo "REVIEW_EMAIL=$REVIEW_EMAIL"
+            echo "REVIEW_PASSWORD=$REVIEW_PASSWORD"
+            echo "REVIEW_PROJECT_ID=$PROJECT_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Capture real companion iPhone screenshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet "$ASTUDIO_REPO" /tmp/a-studio
+          git -C /tmp/a-studio checkout --quiet "$ASTUDIO_COMMIT"
+          mkdir -p /tmp/a-studio-screens
+
+          cd /tmp
+          npm init -y >/dev/null 2>&1
+          npm install --no-audit --no-fund playwright@1.55.0 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+
+          sudo python3 -m http.server 80 --bind 127.0.0.1 --directory /tmp/a-studio/www >/tmp/a-studio-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'sudo kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost/ >/dev/null; then break; fi
+            sleep 1
+          done
+
+          cat >/tmp/capture-a-studio.mjs <<'JS'
+          import { chromium } from 'playwright';
+          const browser = await chromium.launch({headless:true});
+          const context = await browser.newContext({
+            viewport: {width:430, height:932},
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            locale: 'de-DE',
+            userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1'
+          });
+          const page = await context.newPage();
+          await page.goto('http://localhost/', {waitUntil:'networkidle'});
+          await page.locator('input[name="email"]').fill(process.env.REVIEW_EMAIL);
+          await page.locator('input[name="password"]').fill(process.env.REVIEW_PASSWORD);
+          await page.locator('button[type="submit"]').click();
+          await page.locator('.project-card').first().waitFor({state:'visible', timeout:30000});
+          await page.screenshot({path:'/tmp/a-studio-screens/01-projekte.png'});
+
+          await page.locator('.project-card').first().click();
+          await page.getByText('Projektstatus', {exact:true}).waitFor({state:'visible', timeout:30000});
+          await page.screenshot({path:'/tmp/a-studio-screens/02-projektstatus.png'});
+
+          await page.locator('[data-route="account"]').click();
+          await page.getByText('Über diese App', {exact:true}).waitFor({state:'visible', timeout:30000});
+          await page.screenshot({path:'/tmp/a-studio-screens/03-konto.png'});
+          await browser.close();
+          JS
+          node /tmp/capture-a-studio.mjs
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          for p in sorted(Path('/tmp/a-studio-screens').glob('*.png')):
+              data=p.read_bytes()
+              if data[:8] != b'\x89PNG\r\n\x1a\n': raise SystemExit(f'Not PNG: {p}')
+              w,h=struct.unpack('>II', data[16:24])
+              print(f'{p.name}: {w}x{h} ({p.stat().st_size} bytes)')
+              if (w,h)!=(1290,2796): raise SystemExit(f'Unexpected App Store screenshot size: {w}x{h}')
+          PY
+
+      - name: Configure Publisher, metadata, screenshots, and Build 4
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for FILE in /tmp/a-studio-screens/*.png; do
+            sshpass -p "$PASS" scp -q -P "$PORT" -o StrictHostKeyChecking=no "$FILE" root@"$HOST:/tmp/$(basename "$FILE")"
+          done
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          WEB_ID="$(docker compose ps -q web)"
+          test -n "$WEB_ID"
+          for FILE in /tmp/01-projekte.png /tmp/02-projektstatus.png /tmp/03-konto.png; do
+            docker cp "$FILE" "$WEB_ID:$FILE"
+          done
+          REMOTE
+
+          REVIEW_EMAIL_B64="$(printf '%s' "$REVIEW_EMAIL" | base64 -w0)"
+          REVIEW_PASSWORD_B64="$(printf '%s' "$REVIEW_PASSWORD" | base64 -w0)"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e REVIEW_EMAIL_B64='$REVIEW_EMAIL_B64' -e REVIEW_PASSWORD_B64='$REVIEW_PASSWORD_B64' web python manage.py shell" <<'PY'
+          import base64, os
+          from django.core.files import File
+          from django.utils import timezone
+          from apps.publisher.models import AppAsset, Build, Job, MobileApp, Release, Submission
+
+          app = MobileApp.objects.get(slug='a-studio')
+          if not app.apple_account or not app.apple_account.configured:
+              raise SystemExit('A+ Studio Apple account is not configured in Publisher.')
+          email=base64.b64decode(os.environ['REVIEW_EMAIL_B64']).decode()
+          password=base64.b64decode(os.environ['REVIEW_PASSWORD_B64']).decode()
+
+          app.requires_login=True
+          app.review_username=email
+          app.set_review_password(password)
+          app.review_notes=(
+              "A+ Studio for iOS is a free project-companion app for coordinating software projects with A+ Solution. "
+              "The iOS app lets users view project status, create project briefings, send change/support requests to the "
+              "project team, and view existing distribution status read-only. It does not generate, download, install, "
+              "preview, publish, or execute application code or other apps. There are no credits, prices, subscriptions, "
+              "purchases, external payment links, or feature unlocks in the iOS app. The full browser-based A+ Studio web "
+              "product is a separate service and is not linked from iOS as a purchase mechanism. A dedicated review account "
+              "is provided with the pre-populated 'Luna Booking' companion project and change requests. The local 'Demo ansehen' "
+              "flow can also be reviewed without an account. No purchase or two-factor authentication is required."
+          )
+          config=dict(app.build_config or {})
+          config['ios_command']='bash scripts/build-ios.sh'
+          config['ios_artifact']='artifacts/a-studio.ipa'
+          app.build_config=config
+          app.save(update_fields=['requires_login','review_username','review_password_blob','review_notes','build_config','updated_at'])
+
+          german_description=(
+              "A+ Studio ist die mobile Begleit-App für Softwareprojekte mit A+ Solution.\n\n"
+              "Behalten Sie laufende Projekte im Blick, erfassen Sie Projektbriefings und senden Sie Änderungswünsche oder "
+              "Fragen an das Projektteam. Bestehende Veröffentlichungsprozesse können als Status eingesehen werden.\n\n"
+              "Die mobile App dient ausschließlich der Projektkoordination. Sie erstellt, lädt, installiert oder führt keinen "
+              "Programmcode und keine anderen Apps aus. App-Builds, ausführbare Previews und Store-Einreichungen werden nicht "
+              "innerhalb der mobilen App erzeugt oder gestartet.\n\n"
+              "In A+ Studio für iOS gibt es keine Käufe, Abonnements, Credits, Preisangaben oder Freischaltungen."
+          )
+          english_description=(
+              "A+ Studio is the mobile companion app for software projects with A+ Solution.\n\n"
+              "Track project status, create project briefings, and send change requests or questions to the project team. "
+              "Existing distribution processes can be viewed as read-only status.\n\n"
+              "The mobile app is for project coordination only. It does not generate, download, install, preview, publish, "
+              "or execute application code or other apps.\n\nThere are no purchases, subscriptions, credits, prices, or "
+              "feature unlocks in A+ Studio for iOS."
+          )
+          for loc in app.localizations.all():
+              if loc.locale.lower().startswith('de'):
+                  loc.subtitle='Projekte mobil begleiten'
+                  loc.full_description=german_description
+                  loc.keywords='projekt,projektmanagement,software,status,briefing,anforderungen,team,business,produktivität'
+                  loc.promotional_text='Softwareprojekte mit A+ Solution mobil begleiten: Status, Briefings und Änderungswünsche an einem Ort.'
+                  loc.release_notes='Überarbeitete iOS-Version als mobile Begleit-App für Projektstatus, Briefings und Änderungswünsche.'
+              else:
+                  loc.subtitle='Project companion'
+                  loc.full_description=english_description
+                  loc.keywords='project,management,software,status,briefing,requirements,team,business,productivity'
+                  loc.promotional_text='Coordinate A+ Solution software projects on mobile: status, briefings and change requests in one place.'
+                  loc.release_notes='Reworked iOS version focused on project status, briefings and change requests.'
+              loc.save()
+
+          for asset in list(app.assets.filter(kind='screenshot', platform='ios')):
+              asset.file.delete(save=False)
+              asset.delete()
+          screen_files=[
+              ('/tmp/01-projekte.png','01-projekte.png'),
+              ('/tmp/02-projektstatus.png','02-projektstatus.png'),
+              ('/tmp/03-konto.png','03-konto.png'),
+          ]
+          locales=list(app.localizations.values_list('locale', flat=True)) or ['de-DE']
+          locale='de-DE' if 'de-DE' in locales else locales[0]
+          for order,(path,name) in enumerate(screen_files):
+              asset=AppAsset(app=app,kind='screenshot',platform='ios',locale=locale,device_type='APP_IPHONE_67',sort_order=order,width=1290,height=2796)
+              with open(path,'rb') as handle:
+                  asset.file.save(name, File(handle), save=False)
+              asset.save()
+
+          release,_=Release.objects.update_or_create(
+              app=app, version_name='1.0.0', build_number=4,
+              defaults={
+                  'status':'building',
+                  'source_branch':'main',
+                  'source_commit':'4fd06306ebf9b7405a2eb017608b689f242c9ae6',
+                  'android_track':'production',
+                  'android_rollout':1,
+                  'ios_release_type':'manual',
+                  'auto_submit':False,
+                  'release_notes':'App Review fix: companion-only iOS client, new metadata and screenshots.',
+              },
+          )
+          Job.objects.filter(release=release,type__in=['build_ios','upload_apple','submit_apple'],status__in=['queued','running']).update(
+              status='cancelled',finished_at=timezone.now(),error='Superseded by fresh Build 4 companion resubmission.'
+          )
+          Submission.objects.filter(release=release,platform='ios').delete()
+          build,_=Build.objects.get_or_create(release=release,platform='ios')
+          if build.artifact: build.artifact.delete(save=False)
+          build.status='queued'; build.agent=None; build.commit_sha=''; build.artifact=''; build.artifact_size=0
+          build.artifact_checksum=''; build.logs=''; build.started_at=None; build.finished_at=None
+          build.external_build_id=''; build.metadata={}; build.save()
+          job=Job.objects.create(type='build_ios',app=app,release=release,build=build,
+                                 payload={'source':'a-studio-ios-build4-companion-resubmit'},
+                                 available_to_agents=True,required_platform='macos')
+          print('app='+app.name)
+          print('repository='+app.repository_url)
+          print('bundle_id='+app.bundle_id)
+          print('apple_configured='+str(app.apple_account.configured))
+          print('review_account_configured='+str(bool(app.review_username and app.get_review_password())))
+          print('ios_screenshots='+str(app.assets.filter(kind='screenshot',platform='ios').count()))
+          print('release_id='+str(release.pk))
+          print('build_id='+str(build.pk))
+          print('build_job_id='+str(job.pk))
+          PY
+
+      - name: Wake Cloud Mac for Build 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for iOS Build 4
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=4,platform='ios'); print(b.status)\"" | tail -n1)"
+            echo "Build 4 status: $STATE"
+            if [ "$STATE" = "succeeded" ]; then break; fi
+            if [ "$STATE" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__build_number=4,type='build_ios').order_by('-created_at').first(); print(j.error); print(j.logs[-16000:])\""
+              exit 1
+            fi
+            if [ "$i" -eq 90 ]; then echo 'Timed out waiting for Build 4.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Queue App Store upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Build,Job
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=4,platform='ios')
+          old=Job.objects.filter(build=b,type='upload_apple',status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if old:
+              print(f'apple_upload_job={old.pk}:{old.status}')
+          else:
+              j=Job.objects.create(type='upload_apple',app=b.release.app,release=b.release,build=b,
+                                   payload={'source':'a-studio-ios-build4-companion-resubmit'},
+                                   available_to_agents=True,required_platform='macos')
+              print(f'apple_upload_job={j.pk}:queued')
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for App Store processing
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 100); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=4,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-'))\"" | tail -n1)"
+            echo "App Store upload: $DATA"
+            STATUS="${DATA%%|*}"; EXT="${DATA#*|}"
+            if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='a-studio',release__build_number=4,type='upload_apple').order_by('-created_at').first(); print(j.error); print(j.logs[-16000:])\""
+              exit 1
+            fi
+            if [ "$i" -eq 100 ]; then echo 'Timed out waiting for App Store processing.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Apply companion metadata and resubmit rejected version
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json, time
+          from django.utils import timezone
+          from apps.integrations.apple_assets import sync_app_store_screenshots
+          from apps.integrations.apple_compliance import apply_app_store_compliance, ensure_build_encryption_declaration
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build,Submission
+          from apps.publisher.review_contacts import apple_review_contact
+          from apps.publisher.store_compliance import apple_age_rating_profile,apple_content_rights_declaration,apple_uses_non_exempt_encryption
+
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=4,platform='ios')
+          if b.status!='succeeded' or not b.external_build_id:
+              raise SystemExit(f'Build 4 not ready: {b.status} / {b.external_build_id!r}')
+          release=b.release; app=release.app
+          client=AppleStoreClient(app.apple_account)
+          record=client.find_app(app.bundle_id)
+          version=client.ensure_version(record['id'],'1.0.0')
+
+          apply_app_store_compliance(client,record['id'],content_rights=apple_content_rights_declaration(app),age_rating=apple_age_rating_profile(app))
+          encryption=apple_uses_non_exempt_encryption(app)
+          if encryption is not None:
+              ensure_build_encryption_declaration(client,b.external_build_id,encryption)
+
+          for loc in app.localizations.all():
+              client.set_localization(version['id'],loc)
+
+          # App name/subtitle live at AppInfoLocalization level, not version localization.
+          subtitle_updates=0
+          infos=client.request('GET',f"/apps/{record['id']}/appInfos?limit=20").get('data',[])
+          for info in infos:
+              info_locs=client.request('GET',f"/appInfos/{info['id']}/appInfoLocalizations?limit=50").get('data',[])
+              for info_loc in info_locs:
+                  locale=(info_loc.get('attributes',{}).get('locale') or '').lower()
+                  subtitle='Projekte mobil begleiten' if locale.startswith('de') else 'Project companion'
+                  body={'data':{'type':'appInfoLocalizations','id':info_loc['id'],'attributes':{'subtitle':subtitle}}}
+                  try:
+                      client.request('PATCH',f"/appInfoLocalizations/{info_loc['id']}",data=json.dumps(body))
+                      subtitle_updates+=1
+                  except Exception as exc:
+                      print('subtitle_update_skipped='+str(exc)[:300])
+          if not subtitle_updates:
+              raise SystemExit('Could not update any App Store subtitle localization.')
+
+          screens=sync_app_store_screenshots(client,version['id'],app.localizations.all(),app.assets.filter(kind='screenshot',platform='ios'),timeout=360)
+          if len(screens.get('screenshot_ids') or [])<3:
+              raise SystemExit('Fewer than three companion screenshots reached App Store Connect.')
+
+          client.attach_build(version['id'],b.external_build_id)
+          contact=apple_review_contact(app)
+          client.set_review_details(version['id'],app,contact=contact or None)
+
+          version_id=str(version['id'])
+          target=None; target_items=[]; target_state=None
+          for state in ('UNRESOLVED_ISSUES','READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'],state):
+                  matches=[]
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel=item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}
+                      if str(rel.get('id'))==version_id:
+                          matches.append(item)
+                  if matches:
+                      target=sub; target_items=matches; target_state=state; break
+              if target: break
+
+          if target_state=='UNRESOLVED_ISSUES':
+              for item in target_items:
+                  if item.get('attributes',{}).get('state')=='REJECTED':
+                      body={'data':{'type':'reviewSubmissionItems','id':item['id'],'attributes':{'resolved':True}}}
+                      client.request('PATCH',f"/reviewSubmissionItems/{item['id']}",data=json.dumps(body))
+              time.sleep(2)
+              body={'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}
+              final=client.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps(body))['data']
+              result={'submission':final,'reused':True,'resolved_previous_rejection':True}
+          elif target_state=='READY_FOR_REVIEW':
+              body={'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}
+              final=client.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps(body))['data']
+              result={'submission':final,'reused':True}
+          elif target_state in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
+              result={'submission':target,'reused':True,'already_submitted':True}
+          else:
+              result=client.submit_version(record['id'],version['id'])
+
+          submission=result['submission']
+          Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={
+              'state':'in_review','external_id':submission['id'],'submitted_at':timezone.now(),'last_error':'',
+              'raw':{'submission':submission,'build4_companion':True,'screenshots':screens},
+          })
+          release.status='in_review'; release.save(update_fields=['status','updated_at'])
+
+          # Verify the exact remote version now points to Build 4 and companion metadata.
+          attached=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data') or {}
+          if str(attached.get('id'))!=str(b.external_build_id):
+              raise SystemExit(f'App Store version is not attached to Build 4: {attached.get("id")} != {b.external_build_id}')
+          remote_locs=client.request('GET',f"/appStoreVersions/{version['id']}/appStoreVersionLocalizations?limit=50").get('data',[])
+          descriptions='\n'.join((x.get('attributes',{}).get('description') or '') for x in remote_locs).lower()
+          for forbidden in ('ai builder','preview-build','feature-credits','build your first version'):
+              if forbidden in descriptions:
+                  raise SystemExit('Old builder positioning remains in App Store description: '+forbidden)
+          detail=client.request('GET',f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data') or {}
+          attrs=detail.get('attributes',{})
+          if not attrs.get('demoAccountRequired') or not attrs.get('demoAccountName'):
+              raise SystemExit('App Review demo credentials were not saved.')
+          print('build4_external_id='+b.external_build_id)
+          print('screenshots='+json.dumps(screens,sort_keys=True))
+          print('review_demo_account='+str(attrs.get('demoAccountName')))
+          print('submission_id='+submission['id'])
+          print('submission_state='+str(submission.get('attributes',{}).get('state')))
+          PY
+
+      - name: Verify App Review is active
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 30); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY' | tail -n1
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+          app=MobileApp.objects.get(slug='a-studio'); client=AppleStoreClient(app.apple_account); record=client.find_app(app.bundle_id)
+          version=next(v for v in client.list_versions(record['id']) if v.get('attributes',{}).get('versionString')=='1.0.0')
+          matches=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW','READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+              for sub in client.list_review_submissions(record['id'],state):
+                  for item in client.list_review_submission_items(sub['id']):
+                      rel=item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}
+                      if str(rel.get('id'))==str(version['id']): matches.append({'state':state,'submission':sub['id'],'item_state':item.get('attributes',{}).get('state')})
+          print(json.dumps(matches,sort_keys=True))
+          PY
+          )"
+            echo "App Review state: $STATE"
+            if python3 - "$STATE" <<'PY'
+          import json,sys
+          rows=json.loads(sys.argv[1])
+          raise SystemExit(0 if any(r.get('state') in {'WAITING_FOR_REVIEW','IN_REVIEW'} for r in rows) else 1)
+          PY
+            then
+              echo 'A+ Studio Build 4 is active in App Review.'
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'Build 4 was uploaded and configured, but App Review did not reach WAITING_FOR_REVIEW/IN_REVIEW.' >&2
+          exit 1

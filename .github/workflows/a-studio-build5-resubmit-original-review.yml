@@ -1,0 +1,211 @@
+name: A+ Studio Build 5 Resubmit Original Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build5-resubmit-original-review.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  resubmit-original:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 60); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"print('ready')\"" \
+              2>/dev/null | grep -q '^ready$'; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Publisher did not become ready.' >&2
+          exit 1
+
+      - name: Attach Build 5 to original rejected review and resubmit
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Submission
+          from apps.publisher.review_contacts import apple_review_contact
+
+          ORIGINAL_SUBMISSION_ID = '6b4c9437-b7fb-4151-99e7-dec41d4c4934'
+
+          b = Build.objects.get(
+              release__app__slug='a-studio',
+              release__version_name='1.0.0',
+              release__build_number=5,
+              platform='ios',
+          )
+          if b.status != 'succeeded' or not b.external_build_id:
+              raise SystemExit(f'Build 5 not ready: {b.status} / {b.external_build_id!r}')
+
+          release = b.release
+          app = release.app
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.ensure_version(record['id'], '1.0.0')
+          version_id = str(version['id'])
+
+          # Verify the already-uploaded binary and immutable export-compliance answer.
+          remote_build = client.request(
+              'GET',
+              f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption',
+          ).get('data') or {}
+          attrs = remote_build.get('attributes', {})
+          if attrs.get('processingState') != 'VALID':
+              raise SystemExit(f"Build 5 is not VALID: {attrs.get('processingState')!r}")
+          if attrs.get('usesNonExemptEncryption') is not False:
+              raise SystemExit(f"Export compliance is not false: {attrs.get('usesNonExemptEncryption')!r}")
+          print('apple_build_id='+str(b.external_build_id))
+          print('processing_state=VALID')
+          print('uses_non_exempt_encryption=false')
+
+          # Make version 1.0.0 point to the corrected Build 5 and refresh review metadata.
+          client.attach_build(version_id, b.external_build_id)
+          client.set_review_details(version_id, app, contact=apple_review_contact(app) or None)
+          for loc in app.localizations.all():
+              client.set_localization(version_id, loc)
+
+          # Apple explicitly reports that this appStoreVersion is already part of
+          # ORIGINAL_SUBMISSION_ID. Reuse that review instead of allocating a new one.
+          original = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
+          if str(original.get('id')) != ORIGINAL_SUBMISSION_ID:
+              raise SystemExit('Original review submission could not be loaded.')
+          original_state = original.get('attributes', {}).get('state')
+          print('original_submission_state_before='+str(original_state))
+
+          items = client.list_review_submission_items(ORIGINAL_SUBMISSION_ID)
+          target_item = next((i for i in items if client._item_targets_version(i, version_id)), None)
+          if not target_item:
+              raise SystemExit(
+                  f'Original submission does not expose version {version_id}; items=' +
+                  json.dumps([
+                      {
+                          'id': i.get('id'),
+                          'state': i.get('attributes', {}).get('state'),
+                          'version_id': ((i.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}).get('id')),
+                      }
+                      for i in items
+                  ], sort_keys=True)
+              )
+
+          item_state = target_item.get('attributes', {}).get('state')
+          print('original_item_id='+str(target_item['id']))
+          print('original_item_state_before='+str(item_state))
+
+          if item_state == 'REJECTED':
+              resolve_body = {
+                  'data': {
+                      'type': 'reviewSubmissionItems',
+                      'id': target_item['id'],
+                      'attributes': {'resolved': True},
+                  }
+              }
+              client.request(
+                  'PATCH',
+                  f"/reviewSubmissionItems/{target_item['id']}",
+                  data=json.dumps(resolve_body),
+              )
+              print('resolved_original_rejected_item=true')
+              time.sleep(2)
+
+          # Resubmit the original review. This is the same submission ID Apple
+          # referenced in the rejection message and in its duplicate-item error.
+          submit_body = {
+              'data': {
+                  'type': 'reviewSubmissions',
+                  'id': ORIGINAL_SUBMISSION_ID,
+                  'attributes': {'submitted': True},
+              }
+          }
+          client.request(
+              'PATCH',
+              f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}',
+              data=json.dumps(submit_body),
+          )
+          print('original_submission_resubmitted=true')
+
+          final_state = None
+          final_item = None
+          for attempt in range(20):
+              current = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
+              final_state = current.get('attributes', {}).get('state')
+              current_items = client.list_review_submission_items(ORIGINAL_SUBMISSION_ID)
+              final_item = next((i for i in current_items if client._item_targets_version(i, version_id)), None)
+              print(f'poll_{attempt+1}_state='+str(final_state))
+              if final_state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+                  break
+              time.sleep(2)
+
+          if final_state not in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+              raise SystemExit(f'Original submission did not enter review queue; state={final_state!r}')
+
+          attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
+          if str(attached.get('id')) != str(b.external_build_id):
+              raise SystemExit(f"Wrong build attached: {attached.get('id')}")
+
+          detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          dattrs = detail.get('attributes', {})
+          if not dattrs.get('demoAccountRequired') or not dattrs.get('demoAccountName'):
+              raise SystemExit('App Review demo account is missing.')
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=release,
+              platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': ORIGINAL_SUBMISSION_ID,
+                  'submitted_at': timezone.now(),
+                  'last_error': '',
+                  'raw': {
+                      'submission_id': ORIGINAL_SUBMISSION_ID,
+                      'review_state': final_state,
+                      'build5_no_registration': True,
+                      'usesNonExemptEncryption': False,
+                      'resubmitted_original_review': True,
+                  },
+              },
+          )
+          release.status = 'in_review'
+          release.save(update_fields=['status', 'updated_at'])
+
+          print('attached_build='+str(attached.get('id')))
+          print('review_account='+str(dattrs.get('demoAccountName')))
+          print('review_submission_id='+ORIGINAL_SUBMISSION_ID)
+          print('review_state='+str(final_state))
+          print('review_item_state='+str((final_item or {}).get('attributes', {}).get('state')))
+          PY

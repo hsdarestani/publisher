@@ -52,7 +52,7 @@ jobs:
             exit 1
           fi
 
-      - name: Set export compliance and resubmit Build 5
+      - name: Reuse review draft and resubmit Build 5
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -86,31 +86,28 @@ jobs:
           version = client.ensure_version(record['id'], '1.0.0')
           version_id = str(version['id'])
 
-          # App Store Connect requires this Build resource attribute before the
-          # version can enter review. The native target already declares
-          # ITSAppUsesNonExemptEncryption=NO; mirror that answer on ASC Build 5.
+          # Keep the already-uploaded Build 5. Apple has processed it as VALID.
           client.set_build_uses_non_exempt_encryption(b.external_build_id, False)
-          build_remote = client.request(
+          remote_build = client.request(
               'GET',
               f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption',
           ).get('data') or {}
-          battrs = build_remote.get('attributes', {})
-          if battrs.get('processingState') != 'VALID':
-              raise SystemExit(f"Apple Build 5 is not VALID: {battrs.get('processingState')}")
-          if battrs.get('usesNonExemptEncryption') is not False:
-              raise SystemExit('Apple Build 5 export-compliance value was not saved as false.')
+          attrs = remote_build.get('attributes', {})
+          if attrs.get('processingState') != 'VALID':
+              raise SystemExit(f"Apple Build 5 is not VALID: {attrs.get('processingState')}")
+          if attrs.get('usesNonExemptEncryption') is not False:
+              raise SystemExit('Export compliance was not saved as false.')
           print('apple_build_id='+str(b.external_build_id))
+          print('processing_state='+str(attrs.get('processingState')))
           print('uses_non_exempt_encryption=false')
-          print('processing_state='+str(battrs.get('processingState')))
 
-          # Ensure the exact valid Build 5 and review metadata are attached.
           client.attach_build(version_id, b.external_build_id)
           client.set_review_details(version_id, app, contact=apple_review_contact(app) or None)
           for loc in app.localizations.all():
               client.set_localization(version_id, loc)
 
-          # Resolve a previous rejected item if Apple still exposes it as an
-          # unresolved issue. This is safe to retry and targets this version only.
+          # If the rejected review item still exists, mark only this exact version
+          # resolved. This preserves all other App Store Connect review records.
           for sub in client.list_review_submissions(record['id'], 'UNRESOLVED_ISSUES'):
               for item in client.list_review_submission_items(sub['id']):
                   if not client._item_targets_version(item, version_id):
@@ -123,19 +120,149 @@ jobs:
                               'attributes': {'resolved': True},
                           }
                       }
-                      client.request(
-                          'PATCH',
-                          f"/reviewSubmissionItems/{item['id']}",
-                          data=json.dumps(body),
-                      )
-                      print('resolved_previous_rejection_item='+str(item['id']))
+                      client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(body))
+                      print('resolved_rejected_item='+str(item['id']))
           time.sleep(2)
 
-          # submit_version is idempotent: it reuses READY_FOR_REVIEW and returns
-          # existing WAITING_FOR_REVIEW/IN_REVIEW submissions instead of creating
-          # a duplicate App Review slot.
-          result = client.submit_version(record['id'], version_id)
-          submission = result['submission']
+          # If Apple already has this exact version waiting/in review, stop here.
+          active = None
+          active_item = None
+          active_state = None
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  item, _ = client._review_submission_matches(sub, version_id)
+                  if item:
+                      active, active_item, active_state = sub, item, state
+                      break
+              if active:
+                  break
+
+          submission = active
+          item = active_item
+          final_state = active_state
+
+          if not submission:
+              # Publisher retries previously created orphan READY_FOR_REVIEW drafts.
+              # Reuse an existing draft instead of creating a sixth submission.
+              ready_rows = []
+              matching = None
+              matching_item = None
+              empty = None
+              for sub in client.list_review_submissions(record['id'], 'READY_FOR_REVIEW'):
+                  items = client.list_review_submission_items(sub['id'])
+                  targets = [
+                      i for i in items
+                      if client._item_targets_version(i, version_id)
+                  ]
+                  summary = {
+                      'submission_id': sub['id'],
+                      'item_count': len(items),
+                      'target_match': bool(targets),
+                  }
+                  ready_rows.append(summary)
+                  if targets and matching is None:
+                      matching, matching_item = sub, targets[0]
+                  if not items and empty is None:
+                      empty = sub
+
+              print('ready_drafts='+json.dumps(ready_rows, sort_keys=True))
+
+              if matching:
+                  submission = matching
+                  item = matching_item
+                  print('reusing_matching_ready_submission='+str(submission['id']))
+              elif empty:
+                  submission = empty
+                  print('reusing_empty_ready_submission='+str(submission['id']))
+                  item_body = {
+                      'data': {
+                          'type': 'reviewSubmissionItems',
+                          'relationships': {
+                              'reviewSubmission': {
+                                  'data': {'type': 'reviewSubmissions', 'id': submission['id']}
+                              },
+                              'appStoreVersion': {
+                                  'data': {'type': 'appStoreVersions', 'id': version_id}
+                              },
+                          },
+                      }
+                  }
+                  item = client.request(
+                      'POST', '/reviewSubmissionItems', data=json.dumps(item_body)
+                  )['data']
+                  print('attached_version_to_orphan_draft='+str(item['id']))
+              else:
+                  # Do not cancel or mutate unrelated non-empty drafts blindly.
+                  # Print the full concurrent state so a subsequent repair can be
+                  # targeted without risking another live review item.
+                  all_subs = client.request(
+                      'GET', f"/apps/{record['id']}/reviewSubmissions?limit=200"
+                  ).get('data', [])
+                  diagnostic = []
+                  for sub in all_subs:
+                      items = client.list_review_submission_items(sub['id'])
+                      diagnostic.append({
+                          'submission_id': sub['id'],
+                          'state': sub.get('attributes', {}).get('state'),
+                          'items': [
+                              {
+                                  'id': i['id'],
+                                  'state': i.get('attributes', {}).get('state'),
+                                  'version_id': (
+                                      i.get('relationships', {})
+                                      .get('appStoreVersion', {})
+                                      .get('data', {}) or {}
+                                  ).get('id'),
+                              }
+                              for i in items
+                          ],
+                      })
+                  print('review_submission_diagnostic='+json.dumps(diagnostic, sort_keys=True))
+                  raise SystemExit('No reusable empty or matching READY_FOR_REVIEW draft exists.')
+
+              submit_body = {
+                  'data': {
+                      'type': 'reviewSubmissions',
+                      'id': submission['id'],
+                      'attributes': {'submitted': True},
+                  }
+              }
+              submission = client.request(
+                  'PATCH',
+                  f"/reviewSubmissions/{submission['id']}",
+                  data=json.dumps(submit_body),
+              )['data']
+              final_state = submission.get('attributes', {}).get('state')
+              print('submitted_reused_review_submission='+str(submission['id']))
+
+          # Apple can take a moment to expose WAITING_FOR_REVIEW after PATCH.
+          found = []
+          for attempt in range(12):
+              found.clear()
+              for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+                  for sub in client.list_review_submissions(record['id'], state):
+                      candidate, _ = client._review_submission_matches(sub, version_id)
+                      if candidate:
+                          found.append((state, sub, candidate))
+              if found:
+                  break
+              time.sleep(2)
+
+          if not found:
+              raise SystemExit(
+                  f"Submission {submission['id']} was sent but did not reach WAITING_FOR_REVIEW/IN_REVIEW; "
+                  f"last_state={final_state!r}"
+              )
+
+          final_state, final_submission, final_item = found[0]
+          attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
+          if str(attached.get('id')) != str(b.external_build_id):
+              raise SystemExit('App Store version is not attached to Build 5.')
+
+          detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          dattrs = detail.get('attributes', {})
+          if not dattrs.get('demoAccountRequired') or not dattrs.get('demoAccountName'):
+              raise SystemExit('App Review demo credentials are missing.')
 
           Submission.objects.update_or_create(
               app=app,
@@ -143,44 +270,23 @@ jobs:
               platform='ios',
               defaults={
                   'state': 'in_review',
-                  'external_id': submission['id'],
+                  'external_id': final_submission['id'],
                   'submitted_at': timezone.now(),
                   'last_error': '',
                   'raw': {
-                      'submission': submission,
+                      'submission': final_submission,
                       'build5_no_registration': True,
                       'usesNonExemptEncryption': False,
+                      'reused_orphan_review_draft': True,
                   },
               },
           )
           release.status = 'in_review'
           release.save(update_fields=['status', 'updated_at'])
 
-          attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
-          if str(attached.get('id')) != str(b.external_build_id):
-              raise SystemExit(
-                  f"Version 1.0.0 is attached to wrong build: {attached.get('id')} != {b.external_build_id}"
-              )
-
-          detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
-          dattrs = detail.get('attributes', {})
-          if not dattrs.get('demoAccountRequired') or not dattrs.get('demoAccountName'):
-              raise SystemExit('App Review demo account details are missing.')
-
-          found = []
-          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
-              for sub in client.list_review_submissions(record['id'], state):
-                  item, _ = client._review_submission_matches(sub, version_id)
-                  if item:
-                      found.append((state, sub['id'], item.get('attributes', {}).get('state')))
-
-          if not found:
-              raise SystemExit('Build 5 submission did not reach WAITING_FOR_REVIEW or IN_REVIEW.')
-
-          state, submission_id, item_state = found[0]
           print('attached_build='+str(attached.get('id')))
           print('review_account='+str(dattrs.get('demoAccountName')))
-          print('review_submission_id='+str(submission_id))
-          print('review_state='+str(state))
-          print('review_item_state='+str(item_state))
+          print('review_submission_id='+str(final_submission['id']))
+          print('review_state='+str(final_state))
+          print('review_item_state='+str(final_item.get('attributes', {}).get('state')))
           PY

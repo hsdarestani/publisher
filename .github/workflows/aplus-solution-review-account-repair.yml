@@ -1,0 +1,51 @@
+name: Repair A+ Solution App Store review account
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-review-account-repair.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Repair Publisher username and inspect encrypted password
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          STATUS="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); a.review_username='store-review@aplus-solution.de'; a.save(update_fields=['review_username','updated_at']); p=a.get_review_password(); print('username_ok='+str(a.review_username=='store-review@aplus-solution.de')+'|password_present='+str(bool(p))+'|password_length='+str(len(p or '')))\"" \
+            | tail -n 1 | tr -d '\r')"
+          echo "$STATUS"
+          case "$STATUS" in
+            *"username_ok=True"*"password_present=True"*) ;;
+            *) echo 'Publisher review account still has no usable stored password.' >&2; exit 1 ;;
+          esac
+
+      - name: Dispatch Build 5 resubmission
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'aplus-solution-ios-build5-resubmit.yml',
+              ref: 'main'
+            });

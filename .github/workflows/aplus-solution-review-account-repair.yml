@@ -111,6 +111,6 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'aplus-solution-ios-build5-resubmit.yml',
+              workflow_id: 'aplus-solution-ios-build5-final.yml',
               ref: 'main'
             });

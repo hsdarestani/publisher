@@ -1,0 +1,407 @@
+name: A+ Solution iOS Build 6 Final
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-ios-build6-final.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APLUS_COMMIT: 902cd9ca4448c099f9516c65b86befc6622b743f
+  APP_VERSION: '1.0.0'
+  APP_BUILD: '6'
+
+jobs:
+  build-upload-resubmit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify exact App Review credential against public production login
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          REVIEW_SECRET_B64="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); assert a.review_username=='store-review@aplus-solution.de'; p=a.get_review_password(); assert p; print(base64.b64encode(p.encode()).decode())\"" \
+            | tail -n 1 | tr -d '\r')"
+          test -n "$REVIEW_SECRET_B64"
+          echo "::add-mask::$REVIEW_SECRET_B64"
+          REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          export REVIEW_PASSWORD
+          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @- \
+            https://solution.smarbiz.sbs/api/auth/login/
+          import json, os
+          print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          echo "reviewer_login_http=$CODE"
+          test "$CODE" = "200"
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/login.json'))
+          user=data.get('user') or {}
+          assert data.get('access') and data.get('refresh')
+          assert user.get('email') == 'store-review@aplus-solution.de'
+          assert user.get('role') == 'worker'
+          print('reviewer_login=verified')
+          PY
+
+      - name: Configure Publisher and queue signed Build 6
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Build, Job, MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          assert app.apple_account and app.apple_account.configured
+          assert app.review_username == 'store-review@aplus-solution.de'
+          assert app.get_review_password()
+          app.requires_login=True
+          app.review_notes=(
+              'A+ Solution is the internal workforce application used by A+ Solution GmbH for employee scheduling, '
+              'availability, OpenShifts, time tracking, absences, documents and internal communication. '
+              'The supplied App Review account is a dedicated active employee test account with no invitation step '
+              'and no two-factor authentication. Its exact credential was verified against the public production login '
+              'immediately before this submission. Build 6 also fixes the previously observed iPad WebView “Load failed” '
+              'condition by enforcing https://solution.smarbiz.sbs/api as the native iOS production API at build time and '
+              'failing the build if that endpoint is not compiled into the app bundle. There are no in-app purchases, '
+              'paid digital subscriptions or external purchase links in the app.'
+          )
+          cfg=dict(app.build_config or {})
+          cfg['ios_command']='bash frontend/scripts/build-publisher-ios-opaque.sh'
+          cfg['ios_artifact']='frontend/ios/build/export/*.ipa'
+          app.build_config=cfg
+          app.save(update_fields=['requires_login','review_notes','build_config','updated_at'])
+
+          release,_=Release.objects.get_or_create(
+              app=app,
+              version_name=os.environ['APP_VERSION'],
+              build_number=int(os.environ['APP_BUILD']),
+              defaults={
+                  'status':'building',
+                  'source_branch':'main',
+                  'source_commit':os.environ['APLUS_COMMIT'],
+                  'ios_release_type':'manual',
+                  'auto_submit':False,
+                  'release_notes':'iPad production API routing fix and verified App Review access.',
+              },
+          )
+          release.status='building'
+          release.source_branch='main'
+          release.source_commit=os.environ['APLUS_COMMIT']
+          release.ios_release_type='manual'
+          release.auto_submit=False
+          release.release_notes='iPad production API routing fix and verified App Review access.'
+          release.save(update_fields=['status','source_branch','source_commit','ios_release_type','auto_submit','release_notes','updated_at'])
+
+          submission=Submission.objects.filter(release=release,platform='ios').first()
+          if submission and submission.state in {'failed','rejected'}:
+              submission.state='not_submitted'
+              submission.last_error=''
+              submission.save(update_fields=['state','last_error','updated_at'])
+
+          build,_=Build.objects.get_or_create(release=release,platform='ios')
+          active=Job.objects.filter(build=build,type='build_ios',status__in=['queued','running']).exists()
+          if not (build.status=='succeeded' and build.artifact) and not active:
+              build.status='queued'
+              build.logs=''
+              build.finished_at=None
+              build.external_build_id=''
+              build.metadata={}
+              if build.artifact:
+                  build.artifact.delete(save=False)
+              build.artifact=''
+              build.artifact_size=0
+              build.artifact_checksum=''
+              build.save()
+              job=enqueue_job(
+                  'build_ios', app=app, release=release, build=build,
+                  payload={'source':'app-store-review-build-6-ipad-api-fix'},
+                  agent=True, platform='macos',
+              )
+              print('queued_build_ios='+str(job.id))
+          elif active:
+              print('build_ios=already_active')
+          else:
+              print('build_ios=already_succeeded')
+          print('release_id='+str(release.id))
+          print('source_commit='+release.source_commit)
+          print('auto_submit='+str(release.auto_submit))
+          PY
+
+      - name: Wake Cloud Mac for Build 6
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for signed Build 6 IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell -c \"import os; from apps.publisher.models import MobileApp,Release,Job; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD'])); b=r.builds.get(platform='ios'); f=Job.objects.filter(release=r,type='build_ios',status='failed').order_by('-created_at').first(); print('|'.join([b.status,'artifact' if b.artifact else '',f.type if f else '',(f.error or '')[:240] if f else '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Build 6 IPA state: $STATE"
+            case "$STATE" in
+              succeeded\|artifact*) exit 0 ;;
+              *\|build_ios\|*) echo "$STATE" >&2; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo 'Timed out waiting for Build 6 IPA.' >&2
+          exit 1
+
+      - name: Queue Build 6 upload to App Store Connect
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          release=Release.objects.get(app=app,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD']))
+          build=release.builds.get(platform='ios')
+          assert build.status=='succeeded' and build.artifact
+          if build.external_build_id:
+              print('upload_apple=already_processed')
+              print('apple_build_id='+build.external_build_id)
+          else:
+              active=Job.objects.filter(build=build,type='upload_apple',status__in=['queued','running']).first()
+              if active:
+                  print('upload_apple=already_active:'+str(active.id))
+              else:
+                  job=enqueue_job('upload_apple',app=app,release=release,build=build,agent=True,platform='macos')
+                  print('queued_upload_apple='+str(job.id))
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for Apple to process Build 6
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell -c \"import os; from apps.publisher.models import MobileApp,Release,Job; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD'])); b=r.builds.get(platform='ios'); f=Job.objects.filter(release=r,type='upload_apple',status='failed').order_by('-created_at').first(); print('|'.join([b.external_build_id or '',f.type if f else '',(f.error or '')[:240] if f else '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Build 6 Apple state: $STATE"
+            case "$STATE" in
+              [A-Za-z0-9]*\|*)
+                ID="${STATE%%|*}"
+                if [ -n "$ID" ]; then exit 0; fi
+                ;;
+            esac
+            if [[ "$STATE" == "|upload_apple|"* ]]; then echo "$STATE" >&2; exit 1; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for Apple processing.' >&2
+          exit 1
+
+      - name: Replace active Build 5 review with Build 6 and submit
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell" <<'PY'
+          import os, time
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          release=Release.objects.get(app=app,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD']))
+          build=release.builds.get(platform='ios')
+          assert build.status=='succeeded' and build.external_build_id
+          assert release.source_commit == '902cd9ca4448c099f9516c65b86befc6622b743f'
+
+          apple=AppleStoreClient(app.apple_account)
+          apple_app=apple.find_app(app.bundle_id)
+          version=apple.ensure_version(apple_app['id'],release.version_name)
+          version_id=str(version['id'])
+
+          old_active=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              for submission in apple.list_review_submissions(apple_app['id'],state):
+                  item,_=apple._review_submission_matches(submission,version_id)
+                  if item:
+                      old_active.append((submission['id'],state))
+          for submission_id,state in old_active:
+              print(f'canceling_previous_review={submission_id}:{state}')
+              apple.cancel_review_submission(submission_id)
+
+          if old_active:
+              for _ in range(30):
+                  still_active=False
+                  for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                      for submission in apple.list_review_submissions(apple_app['id'],state):
+                          item,_=apple._review_submission_matches(submission,version_id)
+                          if item:
+                              still_active=True
+                              break
+                      if still_active:
+                          break
+                  if not still_active:
+                      break
+                  time.sleep(2)
+              else:
+                  raise SystemExit('Previous App Review did not leave the active queue after cancellation.')
+
+          old_build_jobs=Job.objects.filter(
+              release__app=app,
+              release__version_name=release.version_name,
+              release__build_number__lt=release.build_number,
+              type='submit_apple',
+              status__in=['queued','running'],
+          )
+          if old_build_jobs.exists():
+              raise SystemExit('An older A+ Solution submit_apple job is still active; refusing a race.')
+
+          active=Job.objects.filter(release=release,type='submit_apple',status__in=['queued','running']).first()
+          if active:
+              print('submit_apple=already_active:'+str(active.id))
+          else:
+              job=enqueue_job('submit_apple',app=app,release=release,build=build)
+              print('queued_submit_apple='+str(job.id))
+          PY
+
+      - name: Wait for Build 6 review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell -c \"import os; from apps.publisher.models import MobileApp,Release,Submission,Job; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD'])); s=Submission.objects.filter(release=r,platform='ios').first(); f=Job.objects.filter(release=r,type='submit_apple',status='failed').order_by('-created_at').first(); print('|'.join([r.status,s.state if s else '',s.external_id if s else '',f.type if f else '',(f.error or '')[:240] if f else '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Build 6 review state: $STATE"
+            case "$STATE" in
+              in_review\|in_review\|*) exit 0 ;;
+              *\|submit_apple\|*) echo "$STATE" >&2; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo 'Timed out waiting for Build 6 review submission.' >&2
+          exit 1
+
+      - name: Verify Build 6 is the binary under Apple review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APP_VERSION='$APP_VERSION' -e APP_BUILD='$APP_BUILD' web python manage.py shell" <<'PY'
+          import os
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp,Release,Submission
+
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          release=Release.objects.get(app=app,version_name=os.environ['APP_VERSION'],build_number=int(os.environ['APP_BUILD']))
+          build=release.builds.get(platform='ios')
+          submission=Submission.objects.get(release=release,platform='ios')
+          apple=AppleStoreClient(app.apple_account)
+          apple_app=apple.find_app(app.bundle_id)
+          version=apple.find_editable_version(apple_app['id'],release.version_name)
+          assert version
+          version_id=str(version['id'])
+          attached=apple.request('GET',f'/appStoreVersions/{version_id}/build').get('data') or {}
+          assert str(attached.get('id')) == str(build.external_build_id), (attached.get('id'),build.external_build_id)
+
+          remote=apple.request('GET',f'/builds/{build.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption').get('data') or {}
+          attrs=remote.get('attributes',{})
+          assert attrs.get('processingState')=='VALID',attrs
+
+          detail=apple.request('GET',f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          dattrs=detail.get('attributes',{})
+          assert dattrs.get('demoAccountRequired') is True
+          assert dattrs.get('demoAccountName')=='store-review@aplus-solution.de'
+
+          active=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              for item in apple.list_review_submissions(apple_app['id'],state):
+                  target,_=apple._review_submission_matches(item,version_id)
+                  if target:
+                      active.append((item['id'],state))
+          assert active, 'No active App Review submission contains Build 6 version.'
+          assert release.status=='in_review'
+          assert submission.state=='in_review'
+          print('source_commit='+release.source_commit)
+          print('apple_build_id='+str(build.external_build_id))
+          print('processing_state='+str(attrs.get('processingState')))
+          print('attached_build='+str(attached.get('id')))
+          print('review_account='+str(dattrs.get('demoAccountName')))
+          print('review_submission_id='+str(submission.external_id))
+          print('active_review='+','.join(f'{sid}:{state}' for sid,state in active))
+          print('build6_review_verified=true')
+          PY

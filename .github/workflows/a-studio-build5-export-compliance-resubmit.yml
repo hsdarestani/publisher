@@ -1,0 +1,186 @@
+name: A+ Studio Build 5 Export Compliance Resubmit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build5-export-compliance-resubmit.yml'
+
+permissions:
+  contents: read
+
+env:
+  APP_VERSION: '1.0.0'
+  APP_BUILD: '5'
+
+jobs:
+  resubmit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for Publisher after deployment
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          ready=0
+          for i in $(seq 1 60); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"print('publisher-ready')\"" \
+              2>/dev/null | grep -q 'publisher-ready'; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo 'Publisher web service did not become ready.' >&2
+            exit 1
+          fi
+
+      - name: Set export compliance and resubmit Build 5
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          import time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Submission
+          from apps.publisher.review_contacts import apple_review_contact
+
+          b = Build.objects.get(
+              release__app__slug='a-studio',
+              release__version_name='1.0.0',
+              release__build_number=5,
+              platform='ios',
+          )
+          if b.status != 'succeeded' or not b.external_build_id:
+              raise SystemExit(f'Build 5 is not ready: {b.status} / {b.external_build_id!r}')
+
+          release = b.release
+          app = release.app
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = client.ensure_version(record['id'], '1.0.0')
+          version_id = str(version['id'])
+
+          # App Store Connect requires this Build resource attribute before the
+          # version can enter review. The native target already declares
+          # ITSAppUsesNonExemptEncryption=NO; mirror that answer on ASC Build 5.
+          client.set_build_uses_non_exempt_encryption(b.external_build_id, False)
+          build_remote = client.request(
+              'GET',
+              f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption',
+          ).get('data') or {}
+          battrs = build_remote.get('attributes', {})
+          if battrs.get('processingState') != 'VALID':
+              raise SystemExit(f"Apple Build 5 is not VALID: {battrs.get('processingState')}")
+          if battrs.get('usesNonExemptEncryption') is not False:
+              raise SystemExit('Apple Build 5 export-compliance value was not saved as false.')
+          print('apple_build_id='+str(b.external_build_id))
+          print('uses_non_exempt_encryption=false')
+          print('processing_state='+str(battrs.get('processingState')))
+
+          # Ensure the exact valid Build 5 and review metadata are attached.
+          client.attach_build(version_id, b.external_build_id)
+          client.set_review_details(version_id, app, contact=apple_review_contact(app) or None)
+          for loc in app.localizations.all():
+              client.set_localization(version_id, loc)
+
+          # Resolve a previous rejected item if Apple still exposes it as an
+          # unresolved issue. This is safe to retry and targets this version only.
+          for sub in client.list_review_submissions(record['id'], 'UNRESOLVED_ISSUES'):
+              for item in client.list_review_submission_items(sub['id']):
+                  if not client._item_targets_version(item, version_id):
+                      continue
+                  if item.get('attributes', {}).get('state') == 'REJECTED':
+                      body = {
+                          'data': {
+                              'type': 'reviewSubmissionItems',
+                              'id': item['id'],
+                              'attributes': {'resolved': True},
+                          }
+                      }
+                      client.request(
+                          'PATCH',
+                          f"/reviewSubmissionItems/{item['id']}",
+                          data=json.dumps(body),
+                      )
+                      print('resolved_previous_rejection_item='+str(item['id']))
+          time.sleep(2)
+
+          # submit_version is idempotent: it reuses READY_FOR_REVIEW and returns
+          # existing WAITING_FOR_REVIEW/IN_REVIEW submissions instead of creating
+          # a duplicate App Review slot.
+          result = client.submit_version(record['id'], version_id)
+          submission = result['submission']
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=release,
+              platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': submission['id'],
+                  'submitted_at': timezone.now(),
+                  'last_error': '',
+                  'raw': {
+                      'submission': submission,
+                      'build5_no_registration': True,
+                      'usesNonExemptEncryption': False,
+                  },
+              },
+          )
+          release.status = 'in_review'
+          release.save(update_fields=['status', 'updated_at'])
+
+          attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
+          if str(attached.get('id')) != str(b.external_build_id):
+              raise SystemExit(
+                  f"Version 1.0.0 is attached to wrong build: {attached.get('id')} != {b.external_build_id}"
+              )
+
+          detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          dattrs = detail.get('attributes', {})
+          if not dattrs.get('demoAccountRequired') or not dattrs.get('demoAccountName'):
+              raise SystemExit('App Review demo account details are missing.')
+
+          found = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  item, _ = client._review_submission_matches(sub, version_id)
+                  if item:
+                      found.append((state, sub['id'], item.get('attributes', {}).get('state')))
+
+          if not found:
+              raise SystemExit('Build 5 submission did not reach WAITING_FOR_REVIEW or IN_REVIEW.')
+
+          state, submission_id, item_state = found[0]
+          print('attached_build='+str(attached.get('id')))
+          print('review_account='+str(dattrs.get('demoAccountName')))
+          print('review_submission_id='+str(submission_id))
+          print('review_state='+str(state))
+          print('review_item_state='+str(item_state))
+          PY

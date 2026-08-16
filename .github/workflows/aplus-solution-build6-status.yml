@@ -1,0 +1,56 @@
+name: A+ Solution Build 6 Status
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build6-status.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Query Publisher Build 6 state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job,MobileApp,Release,Submission
+          a=MobileApp.objects.get(slug='a-plus-solution')
+          for number in (5,6):
+              r=Release.objects.filter(app=a,version_name='1.0.0',build_number=number).first()
+              print(f'=== BUILD {number} ===')
+              if not r:
+                  print('release=missing'); continue
+              print('release_status='+r.status)
+              print('source_commit='+str(r.source_commit))
+              print('auto_submit='+str(r.auto_submit))
+              for b in r.builds.filter(platform='ios'):
+                  print('build_status='+b.status)
+                  print('artifact='+str(bool(b.artifact)))
+                  print('external_build_id='+str(b.external_build_id or ''))
+              s=Submission.objects.filter(release=r,platform='ios').first()
+              if s:
+                  print('submission_state='+s.state)
+                  print('submission_external_id='+str(s.external_id or ''))
+              for j in Job.objects.filter(release=r).order_by('created_at'):
+                  print('job='+ '|'.join([str(j.id),j.type,j.status,str(j.progress),str(j.error or '')[:300].replace('\n',' ')]))
+                  if j.type in {'build_ios','upload_apple','submit_apple'} and j.logs:
+                      tail=j.logs[-1500:].replace('\n','\\n')
+                      print('log_tail='+tail)
+          PY

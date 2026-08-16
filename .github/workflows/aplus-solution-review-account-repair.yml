@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Repair Publisher username and inspect encrypted password
+      - name: Rotate reviewer credential in Publisher and A+ production
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -30,14 +30,38 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          STATUS="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); a.review_username='store-review@aplus-solution.de'; a.save(update_fields=['review_username','updated_at']); p=a.get_review_password(); print('username_ok='+str(a.review_username=='store-review@aplus-solution.de')+'|password_present='+str(bool(p))+'|password_length='+str(len(p or '')))\"" \
-            | tail -n 1 | tr -d '\r')"
-          echo "$STATUS"
-          case "$STATUS" in
-            *"username_ok=True"*"password_present=True"*) ;;
-            *) echo 'Publisher review account still has no usable stored password.' >&2; exit 1 ;;
-          esac
+          REVIEW_PASSWORD="$(openssl rand -base64 36 | tr -d '\n/+=' | head -c 30)"
+          test "${#REVIEW_PASSWORD}" -ge 24
+          echo "::add-mask::$REVIEW_PASSWORD"
+          REVIEW_B64="$(printf '%s' "$REVIEW_PASSWORD" | base64 -w0)"
+          echo "::add-mask::$REVIEW_B64"
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e REVIEW_B64='$REVIEW_B64' web python manage.py shell -c \"import base64,os; from apps.publisher.models import MobileApp; p=base64.b64decode(os.environ['REVIEW_B64']).decode(); a=MobileApp.objects.get(slug='a-plus-solution'); a.requires_login=True; a.review_username='store-review@aplus-solution.de'; a.set_review_password(p); a.save(update_fields=['requires_login','review_username','review_password_blob','updated_at']); assert a.get_review_password()==p; print('publisher_review_credential=rotated')\""
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "test -d /opt/aplussolution && cd /opt/aplussolution && docker compose exec -T -e REVIEW_B64='$REVIEW_B64' backend python manage.py shell -c \"import base64,os; from core.models import User,WorkerProfile; p=base64.b64decode(os.environ['REVIEW_B64']).decode(); u=User.objects.get(email='store-review@aplus-solution.de'); u.username=u.email; u.first_name='Store'; u.last_name='Reviewer'; u.role='worker'; u.is_active=True; u.is_staff=False; u.is_superuser=False; u.set_password(p); u.save(); w,_=WorkerProfile.objects.get_or_create(user=u,defaults={'employee_number':'STORE-REVIEW-001','employment_type':'minijob','monthly_hours':0,'tariff_hourly_rate':0,'extra_allowance':0,'ranking_points':0,'skills':[],'active':True}); w.active=True; w.save(update_fields=['active']); assert u.check_password(p); print('production_review_credential=rotated')\""
+
+          export REVIEW_PASSWORD
+          HTTP_CODE="$(python3 - <<'PY' | curl -sS --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 30 -o /tmp/aplus-login.json -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary @- \
+            https://solution.smarbiz.sbs/api/auth/login/
+          import json, os
+          print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          echo "reviewer_login_http=$HTTP_CODE"
+          test "$HTTP_CODE" = "200"
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/aplus-login.json'))
+          user=data.get('user') or {}
+          assert data.get('access') and data.get('refresh')
+          assert user.get('email') == 'store-review@aplus-solution.de'
+          assert user.get('role') == 'worker'
+          print('reviewer_login=verified')
+          PY
 
       - name: Dispatch Build 5 resubmission
         uses: actions/github-script@v7

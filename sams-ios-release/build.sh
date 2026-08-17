@@ -107,8 +107,10 @@ ARCHIVE_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CF
 /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$ARCHIVE_APP/Info.plist" | grep -Fx 'Sams Club Lounge'
 /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ARCHIVE_APP/Info.plist" | grep -Fx "$EXPECTED_VERSION"
 /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$ARCHIVE_APP/Info.plist" | grep -Fx "$EXPECTED_BUILD"
-codesign -d --entitlements :- "$ARCHIVE_APP" 2>"${RUNNER_TEMP:-/tmp}/sams-entitlements.plist"
-grep -Fq 'app.samsclublounge.de' "${RUNNER_TEMP:-/tmp}/sams-entitlements.plist"
+ENTITLEMENTS_PLIST="${RUNNER_TEMP:-/tmp}/sams-entitlements.plist"
+codesign -d --entitlements :- "$ARCHIVE_APP" >"$ENTITLEMENTS_PLIST" 2>/dev/null
+grep -Fq 'app.samsclublounge.de' "$ENTITLEMENTS_PLIST"
+grep -Fq '884MVA2MD5.de.aplussolution.samscard' "$ENTITLEMENTS_PLIST"
 
 EXPORT_PATH="${RUNNER_TEMP:-/tmp}/SAMSClubLoungeExport"
 EXPORT_OPTIONS="${RUNNER_TEMP:-/tmp}/SAMSExportOptions.plist"

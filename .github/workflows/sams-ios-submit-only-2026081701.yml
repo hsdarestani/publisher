@@ -1,0 +1,172 @@
+name: Submit Sams Club Lounge 1.0.4 only
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sams-ios-submit-only-2026081701.yml'
+
+permissions:
+  contents: read
+
+env:
+  SAMS_VERSION: '1.0.4'
+  SAMS_BUILD: '2026081701'
+  SAMS_BUNDLE_ID: de.aplussolution.samscard
+  SAMS_APPSTORE_ID: '6794268917'
+  SAMS_APPLE_BUILD_ID: bd63fc5b-e445-4526-a18a-53fb0162a3ca
+
+jobs:
+  submit-sams-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Attach exact processed Sams build and submit for review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T \
+              -e SAMS_VERSION='$SAMS_VERSION' \
+              -e SAMS_BUILD='$SAMS_BUILD' \
+              -e SAMS_BUNDLE_ID='$SAMS_BUNDLE_ID' \
+              -e SAMS_APPSTORE_ID='$SAMS_APPSTORE_ID' \
+              -e SAMS_APPLE_BUILD_ID='$SAMS_APPLE_BUILD_ID' \
+              web python manage.py shell" <<'PY'
+          import json, os
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.base import IntegrationError
+          from apps.publisher.models import Build, Submission
+
+          version = os.environ['SAMS_VERSION']
+          build_number = int(os.environ['SAMS_BUILD'])
+          bundle = os.environ['SAMS_BUNDLE_ID']
+          appstore_id = os.environ['SAMS_APPSTORE_ID']
+          apple_build_id = os.environ['SAMS_APPLE_BUILD_ID']
+
+          if (version, build_number, bundle, appstore_id, apple_build_id) != (
+              '1.0.4', 2026081701, 'de.aplussolution.samscard', '6794268917',
+              'bd63fc5b-e445-4526-a18a-53fb0162a3ca'
+          ):
+              raise SystemExit('Sams submit-only identity guard failed.')
+
+          b = Build.objects.get(
+              release__app__slug='sams-club-lounge',
+              release__version_name=version,
+              release__build_number=build_number,
+              platform='ios',
+          )
+          release = b.release
+          app = release.app
+          if (app.name, app.bundle_id, app.apple_app_id) != ('Sams Club Lounge', bundle, appstore_id):
+              raise SystemExit('Refusing non-Sams submission.')
+          if b.external_build_id != apple_build_id:
+              raise SystemExit(f'Publisher Apple build ID mismatch: {b.external_build_id!r}')
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(bundle)
+          if str(record['id']) != appstore_id or record.get('attributes',{}).get('name') != 'Sams Club Lounge':
+              raise SystemExit('App Store Connect resolved wrong app.')
+
+          # Hard-check that this exact processed build belongs to Sams and is VALID.
+          matches = [x for x in client.list_builds(record['id'], str(build_number), limit=20) if str(x.get('id')) == apple_build_id]
+          if len(matches) != 1:
+              raise SystemExit(f'Expected exact Sams Apple build once, got {len(matches)}')
+          apple_build = matches[0]
+          attrs = apple_build.get('attributes', {})
+          if attrs.get('processingState') != 'VALID':
+              raise SystemExit(f'Apple build is not VALID: {attrs.get("processingState")}')
+          print('SAMS_APPLE_BUILD_VALID=true')
+
+          # Encryption compliance is immutable after it has been set. Only set it
+          # when Apple still exposes it as unset; tolerate the specific idempotent 409.
+          if attrs.get('usesNonExemptEncryption') is None:
+              try:
+                  client.set_build_uses_non_exempt_encryption(apple_build_id, False)
+                  print('SAMS_ENCRYPTION_SET=false')
+              except IntegrationError as exc:
+                  msg = str(exc)
+                  if '409' in msg and 'You cannot update when the value is already set' in msg:
+                      print('SAMS_ENCRYPTION_ALREADY_SET=true')
+                  else:
+                      raise
+          else:
+              print('SAMS_ENCRYPTION_ALREADY_SET=true')
+
+          target = client.find_editable_version(record['id'], version)
+          if not target:
+              raise SystemExit('Sams App Store version 1.0.4 not found.')
+          target_id = target['id']
+
+          # Attach only if needed, and refuse to replace a different build.
+          attached = client.request('GET', f'/appStoreVersions/{target_id}/build').get('data')
+          if attached:
+              if str(attached.get('id')) != apple_build_id:
+                  raise SystemExit(f'Sams 1.0.4 already has a different build: {attached.get("id")}')
+              print('SAMS_BUILD_ALREADY_ATTACHED=true')
+          else:
+              client.attach_build(target_id, apple_build_id)
+              attached = client.request('GET', f'/appStoreVersions/{target_id}/build').get('data') or {}
+              if str(attached.get('id')) != apple_build_id:
+                  raise SystemExit('Exact Sams build did not attach to 1.0.4.')
+              print('SAMS_BUILD_ATTACHED=true')
+
+          locs = client.request('GET', f'/appStoreVersions/{target_id}/appStoreVersionLocalizations?limit=50').get('data', [])
+          if not locs:
+              raise SystemExit('Sams 1.0.4 localization metadata missing.')
+          print('SAMS_LOCALIZATION_COUNT='+str(len(locs)))
+
+          # Preserve App Review contact/demo information from 1.0.3 when any target
+          # fields are missing. Never overwrite populated 1.0.4 values.
+          source_versions = client.request('GET', f"/apps/{record['id']}/appStoreVersions?filter[versionString]=1.0.3&limit=10").get('data', [])
+          source_detail = None
+          if source_versions:
+              source_detail = client.request('GET', f"/appStoreVersions/{source_versions[0]['id']}/appStoreReviewDetail").get('data')
+          target_detail = client.request('GET', f'/appStoreVersions/{target_id}/appStoreReviewDetail').get('data')
+          allowed = ('contactFirstName','contactLastName','contactPhone','contactEmail','demoAccountName','demoAccountPassword','demoAccountRequired','notes')
+          if source_detail:
+              source_attrs = source_detail.get('attributes', {})
+              if target_detail:
+                  target_attrs = target_detail.get('attributes', {})
+                  patch = {k: source_attrs.get(k) for k in allowed if target_attrs.get(k) in (None, '') and source_attrs.get(k) not in (None, '')}
+                  if patch:
+                      body = {'data': {'type': 'appStoreReviewDetails', 'id': target_detail['id'], 'attributes': patch}}
+                      client.request('PATCH', f"/appStoreReviewDetails/{target_detail['id']}", data=json.dumps(body))
+              else:
+                  copied = {k: source_attrs.get(k) for k in allowed if source_attrs.get(k) not in (None, '')}
+                  body = {'data': {'type':'appStoreReviewDetails','attributes':copied,'relationships':{'appStoreVersion':{'data':{'type':'appStoreVersions','id':target_id}}}}}
+                  client.request('POST', '/appStoreReviewDetails', data=json.dumps(body))
+              print('SAMS_REVIEW_INFO_READY=true')
+
+          result = client.submit_version(record['id'], target_id)
+          submission = result['submission']
+          state = submission.get('attributes', {}).get('state', '')
+          Submission.objects.update_or_create(
+              app=app, release=release, platform='ios',
+              defaults={
+                  'state':'in_review',
+                  'external_id':submission['id'],
+                  'submitted_at':timezone.now(),
+                  'last_error':'',
+                  'raw':{'submission':submission,'sams_1_0_4_build':str(build_number),'apple_build_id':apple_build_id},
+              },
+          )
+          release.status='in_review'
+          release.save(update_fields=['status','updated_at'])
+          print('SAMS_REVIEW_SUBMISSION_ID='+str(submission['id']))
+          print('SAMS_REVIEW_STATE='+str(state))
+          print('SAMS_SUBMIT_REUSED='+str(bool(result.get('reused'))).lower())
+          print('SAMS_ALREADY_SUBMITTED='+str(bool(result.get('already_submitted'))).lower())
+          PY

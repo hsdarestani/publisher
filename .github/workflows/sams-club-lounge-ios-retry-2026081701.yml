@@ -1,0 +1,261 @@
+name: Retry Sams Club Lounge iOS 1.0.4 (2026081701)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sams-club-lounge-ios-retry-2026081701.yml'
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+env:
+  SAMS_SOURCE_COMMIT: a0767f01b2dba4aa54764ac49c30ff5845f2bbd6
+  SAMS_VERSION: '1.0.4'
+  SAMS_BUILD: '2026081701'
+  SAMS_BUNDLE_ID: de.aplussolution.samscard
+  SAMS_APPSTORE_ID: '6794268917'
+
+jobs:
+  retry-sams-ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Queue corrected Sams signed build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SAMS_SOURCE_COMMIT='$SAMS_SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import Build, Job, MobileApp, Release
+
+          commit = os.environ['SAMS_SOURCE_COMMIT']
+          app = MobileApp.objects.get(slug='sams-club-lounge')
+          if app.name != 'Sams Club Lounge' or app.bundle_id != 'de.aplussolution.samscard' or app.apple_app_id != '6794268917':
+              raise SystemExit('Refusing non-Sams Publisher app.')
+          if app.repository_url != 'https://github.com/hsdarestani/publisher.git':
+              raise SystemExit('Sams release source is not the isolated Publisher mirror.')
+          if app.build_config.get('ios_command') != 'bash sams-ios-release/build.sh':
+              raise SystemExit('Unexpected Sams iOS build entrypoint.')
+          if app.get_repository_token():
+              raise SystemExit('Sams isolated source must not use a private repository token.')
+
+          release = Release.objects.get(app=app, version_name='1.0.4', build_number=2026081701)
+          release.source_branch = 'main'
+          release.source_commit = commit
+          release.status = 'building'
+          release.save(update_fields=['source_branch','source_commit','status','updated_at'])
+
+          Job.objects.filter(
+              release=release,
+              type__in=['build_ios','upload_apple','submit_apple'],
+              status__in=['queued','running'],
+          ).update(status='cancelled', finished_at=timezone.now(), error='Superseded by xcarchive guard retry.')
+
+          build = Build.objects.get(release=release, platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status = 'queued'
+          build.agent = None
+          build.commit_sha = ''
+          build.artifact = ''
+          build.artifact_size = 0
+          build.artifact_checksum = ''
+          build.logs = ''
+          build.started_at = None
+          build.finished_at = None
+          build.external_build_id = ''
+          build.metadata = {}
+          build.save()
+
+          job = Job.objects.create(
+              type='build_ios', app=app, release=release, build=build,
+              payload={'source':'sams-xcarchive-guard-retry'},
+              available_to_agents=True, required_platform='macos',
+          )
+          print('SAMS_RETRY_SOURCE='+commit)
+          print('SAMS_BUILD_JOB='+str(job.pk))
+          PY
+
+      - name: Wake Cloud Mac for corrected build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for corrected Sams IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='sams-club-lounge',release__version_name='1.0.4',release__build_number=2026081701,platform='ios'); j=Job.objects.filter(build=b,type='build_ios').order_by('-created_at').first(); print(b.status+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"; ERROR="${DATA#*|}"
+            echo "Sams corrected build: $STATUS"
+            if [ "$STATUS" = "succeeded" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then
+              echo "Sams corrected build failed: $ERROR" >&2
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='build_ios').order_by('-created_at').first(); print(j.logs[-50000:] if j else '')\""
+              exit 1
+            fi
+            [ "$i" -lt 120 ] || { echo 'Timed out waiting for corrected Sams build.' >&2; exit 1; }
+            sleep 30
+          done
+
+      - name: Queue Sams App Store upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Build, Job
+          b = Build.objects.get(release__app__slug='sams-club-lounge', release__version_name='1.0.4', release__build_number=2026081701, platform='ios')
+          if b.status != 'succeeded':
+              raise SystemExit('Corrected Sams IPA is not ready.')
+          old = Job.objects.filter(build=b, type='upload_apple', status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if old:
+              print(f'SAMS_UPLOAD_JOB={old.pk}:{old.status}')
+          else:
+              job = Job.objects.create(
+                  type='upload_apple', app=b.release.app, release=b.release, build=b,
+                  payload={'source':'sams-xcarchive-guard-retry'},
+                  available_to_agents=True, required_platform='macos',
+              )
+              print(f'SAMS_UPLOAD_JOB={job.pk}:queued')
+          PY
+
+      - name: Wake Cloud Mac for Sams upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for Apple processing
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='sams-club-lounge',release__version_name='1.0.4',release__build_number=2026081701,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-'))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"; EXT="${DATA#*|}"
+            echo "Sams Apple processing: $STATUS / $EXT"
+            if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='upload_apple').order_by('-created_at').first(); print(j.error if j else ''); print(j.logs[-50000:] if j else '')\""
+              exit 1
+            fi
+            [ "$i" -lt 120 ] || { echo 'Timed out waiting for Apple processing.' >&2; exit 1; }
+            sleep 30
+          done
+
+      - name: Attach Sams build and submit 1.0.4 for review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Submission
+
+          b = Build.objects.get(release__app__slug='sams-club-lounge', release__version_name='1.0.4', release__build_number=2026081701, platform='ios')
+          if b.status != 'succeeded' or not b.external_build_id:
+              raise SystemExit(f'Sams build is not Apple-ready: {b.status}/{b.external_build_id!r}')
+          release = b.release
+          app = release.app
+          if app.name != 'Sams Club Lounge' or app.bundle_id != 'de.aplussolution.samscard' or app.apple_app_id != '6794268917':
+              raise SystemExit('Refusing to submit a non-Sams app.')
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          if str(record['id']) != '6794268917' or record.get('attributes',{}).get('name') != 'Sams Club Lounge':
+              raise SystemExit('App Store Connect resolved the wrong app.')
+
+          target = client.find_editable_version(record['id'], '1.0.4')
+          source = client.find_editable_version(record['id'], '1.0.3')
+          if not target:
+              raise SystemExit('Sams App Store version 1.0.4 is missing.')
+
+          client.set_build_uses_non_exempt_encryption(b.external_build_id, False)
+          client.attach_build(target['id'], b.external_build_id)
+
+          if source:
+              source_detail = client.request('GET', f"/appStoreVersions/{source['id']}/appStoreReviewDetail").get('data')
+              target_detail = client.request('GET', f"/appStoreVersions/{target['id']}/appStoreReviewDetail").get('data')
+              if source_detail:
+                  allowed = ('contactFirstName','contactLastName','contactPhone','contactEmail','demoAccountName','demoAccountPassword','demoAccountRequired','notes')
+                  attrs = {k:v for k,v in source_detail.get('attributes',{}).items() if k in allowed and v not in (None,'')}
+                  if target_detail:
+                      body = {'data':{'type':'appStoreReviewDetails','id':target_detail['id'],'attributes':attrs}}
+                      client.request('PATCH', f"/appStoreReviewDetails/{target_detail['id']}", data=json.dumps(body))
+                  else:
+                      body = {'data':{'type':'appStoreReviewDetails','attributes':attrs,'relationships':{'appStoreVersion':{'data':{'type':'appStoreVersions','id':target['id']}}}}}
+                      client.request('POST', '/appStoreReviewDetails', data=json.dumps(body))
+                  print('SAMS_REVIEW_INFO_CARRIED=true')
+
+          localizations = client.request('GET', f"/appStoreVersions/{target['id']}/appStoreVersionLocalizations?limit=50").get('data', [])
+          if not localizations:
+              raise SystemExit('Sams 1.0.4 has no App Store localization metadata.')
+          print('SAMS_LOCALIZATIONS='+str(len(localizations)))
+
+          result = client.submit_version(record['id'], target['id'])
+          submission = result['submission']
+          state = submission.get('attributes',{}).get('state','')
+          Submission.objects.update_or_create(
+              app=app, release=release, platform='ios',
+              defaults={
+                  'state':'in_review',
+                  'external_id':submission['id'],
+                  'submitted_at':timezone.now(),
+                  'last_error':'',
+                  'raw':{'submission':submission,'sams_1_0_4_retry':True},
+              },
+          )
+          release.status = 'in_review'
+          release.save(update_fields=['status','updated_at'])
+
+          attached = client.request('GET', f"/appStoreVersions/{target['id']}/build").get('data') or {}
+          if str(attached.get('id')) != str(b.external_build_id):
+              raise SystemExit('Sams 1.0.4 is not attached to the uploaded build.')
+          print('SAMS_EXTERNAL_BUILD_ID='+str(b.external_build_id))
+          print('SAMS_REVIEW_SUBMISSION_ID='+str(submission['id']))
+          print('SAMS_REVIEW_STATE='+str(state))
+          PY

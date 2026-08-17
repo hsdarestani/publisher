@@ -1,0 +1,64 @@
+name: Sams Club Lounge Publisher Diagnose
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sams-club-lounge-publisher-diagnose.yml'
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_BUNDLE_ID: de.aplussolution.samscard
+  EXPECTED_APP_NAME: Sams Club Lounge
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Read Sams Publisher record only
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+
+          bundle = 'de.aplussolution.samscard'
+          qs = MobileApp.objects.filter(bundle_id=bundle)
+          print('SAMS_MATCH_COUNT='+str(qs.count()))
+          for app in qs:
+              cfg = dict(app.build_config or {})
+              safe = {
+                  'id': app.pk,
+                  'slug': app.slug,
+                  'name': app.name,
+                  'platform': app.platform,
+                  'framework': app.framework,
+                  'status': app.status,
+                  'bundle_id': app.bundle_id,
+                  'apple_app_id': app.apple_app_id,
+                  'repository_url': app.repository_url,
+                  'default_branch': app.default_branch,
+                  'has_repository_token': bool(app.get_repository_token()),
+                  'apple_account_configured': bool(app.apple_account and app.apple_account.configured),
+                  'apple_team_id': app.apple_account.apple_team_id if app.apple_account else '',
+                  'build_config_keys': sorted(cfg.keys()),
+                  'ios_command': cfg.get('ios_command',''),
+                  'ios_artifact': cfg.get('ios_artifact',''),
+              }
+              print('SAMS_APP='+json.dumps(safe, sort_keys=True))
+          PY

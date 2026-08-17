@@ -1,0 +1,91 @@
+name: Sams iOS 1.0.4 Final Build Retry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sams-ios-retry2-build.yml'
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+env:
+  SOURCE_COMMIT: 14ced90a5d08eb8be3ece7c0edd10bdd6ee20911
+
+jobs:
+  build-sams:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Queue only Sams build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          app = MobileApp.objects.get(slug='sams-club-lounge')
+          if (app.name, app.bundle_id, app.apple_app_id) != ('Sams Club Lounge','de.aplussolution.samscard','6794268917'):
+              raise SystemExit('Sams identity guard failed.')
+          if app.repository_url != 'https://github.com/hsdarestani/publisher.git' or app.get_repository_token():
+              raise SystemExit('Sams isolated source guard failed.')
+          if app.build_config.get('ios_command') != 'bash sams-ios-release/build.sh':
+              raise SystemExit('Sams build command guard failed.')
+          release = Release.objects.get(app=app, version_name='1.0.4', build_number=2026081701)
+          release.source_commit = os.environ['SOURCE_COMMIT']
+          release.source_branch = 'main'
+          release.status = 'building'
+          release.save(update_fields=['source_commit','source_branch','status','updated_at'])
+          Job.objects.filter(release=release,type__in=['build_ios','upload_apple','submit_apple'],status__in=['queued','running']).update(status='cancelled',finished_at=timezone.now(),error='Superseded by final Sams entitlement-guard retry.')
+          build = Build.objects.get(release=release,platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status='queued'; build.agent=None; build.commit_sha=''; build.artifact=''; build.artifact_size=0
+          build.artifact_checksum=''; build.logs=''; build.started_at=None; build.finished_at=None
+          build.external_build_id=''; build.metadata={}; build.save()
+          job=Job.objects.create(type='build_ios',app=app,release=release,build=build,payload={'source':'sams-final-entitlement-guard-retry'},available_to_agents=True,required_platform='macos')
+          print('SAMS_BUILD_JOB='+str(job.pk))
+          print('SAMS_SOURCE_COMMIT='+release.source_commit)
+          PY
+      - name: Wake Cloud Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+      - name: Wait for IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='sams-club-lounge',release__version_name='1.0.4',release__build_number=2026081701,platform='ios'); j=Job.objects.filter(build=b,type='build_ios').order_by('-created_at').first(); print(b.status+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"; ERROR="${DATA#*|}"
+            echo "Sams IPA build: $STATUS"
+            [ "$STATUS" = succeeded ] && exit 0
+            if [ "$STATUS" = failed ]; then
+              echo "$ERROR" >&2
+              sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='build_ios').order_by('-created_at').first(); print(j.logs[-50000:] if j else '')\""
+              exit 1
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for Sams IPA.' >&2
+          exit 1

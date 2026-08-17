@@ -12,7 +12,7 @@ permissions:
   id-token: write
 
 env:
-  SAMS_SOURCE_COMMIT: 8d1a60a17bd46d24d1b6d4190995ea20f35161be
+  SAMS_SOURCE_COMMIT: f49a3bb6ac5ee627515c4b664f639905d19347a7
   SAMS_VERSION: '1.0.4'
   SAMS_BUILD: '2026081701'
   SAMS_BUNDLE_ID: de.aplussolution.samscard
@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Configure Sams Club Lounge in Publisher and queue signed build
+      - name: Configure isolated Sams source and queue signed build
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -49,7 +49,6 @@ jobs:
               -e SAMS_APPSTORE_ID='$SAMS_APPSTORE_ID' \
               web python manage.py shell" <<'PY'
           import os
-          import requests
           from django.utils import timezone
           from apps.publisher.models import Build, Job, MobileApp, Release, StoreAccount
           from apps.signing.services import ensure_ios_signing
@@ -62,6 +61,8 @@ jobs:
 
           if bundle != 'de.aplussolution.samscard' or appstore_id != '6794268917':
               raise SystemExit('Sams identity guard failed.')
+          if version != '1.0.4' or build_number != 2026081701:
+              raise SystemExit('Sams release version/build guard failed.')
 
           apple_accounts=StoreAccount.objects.filter(provider='apple',enabled=True,apple_team_id='884MVA2MD5')
           if apple_accounts.count()!=1:
@@ -69,22 +70,6 @@ jobs:
           apple=apple_accounts.get()
           if not apple.configured:
               raise SystemExit('Sams Apple account is not configured.')
-
-          token_source=MobileApp.objects.filter(repository_token_blob__gt='').order_by('pk').first()
-          if not token_source:
-              raise SystemExit('Publisher has no repository credential to access private source.')
-          token=token_source.get_repository_token()
-          probe=requests.get(
-              'https://api.github.com/repos/hsdarestani/apluscard',
-              headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json'},
-              timeout=30,
-          )
-          if probe.status_code != 200:
-              raise SystemExit(f'Private Sams source access failed with HTTP {probe.status_code}.')
-          repo=probe.json()
-          if repo.get('full_name') != 'hsdarestani/apluscard':
-              raise SystemExit('Repository credential resolved the wrong repository.')
-          print('SAMS_PRIVATE_REPO_ACCESS=ok')
 
           collisions=MobileApp.objects.filter(bundle_id=bundle).exclude(slug='sams-club-lounge')
           if collisions.exists():
@@ -100,20 +85,26 @@ jobs:
                   'status':'active',
                   'bundle_id':bundle,
                   'apple_app_id':appstore_id,
-                  'repository_url':'https://github.com/hsdarestani/apluscard.git',
+                  'repository_url':'https://github.com/hsdarestani/publisher.git',
                   'default_branch':'main',
                   'apple_account':apple,
                   'build_config':{
-                      'ios_command':'bash mobile/ci/build-ios-publisher.sh',
-                      'ios_artifact':'artifacts/sams-club-lounge.ipa',
+                      'ios_command':'bash sams-ios-release/build.sh',
+                      'ios_artifact':'sams-ios-release/artifacts/sams-club-lounge.ipa',
                   },
               },
           )
-          app.set_repository_token(token)
+          # Source is intentionally public and contains only the native Sams release shell.
+          # Clear any stale private-repository credential so Cloud Mac never touches another app source.
+          app.set_repository_token('')
           app.save(update_fields=['repository_token_blob','updated_at'])
 
-          if app.name!='Sams Club Lounge' or app.bundle_id!=bundle or app.repository_url!='https://github.com/hsdarestani/apluscard.git':
+          if app.name!='Sams Club Lounge' or app.bundle_id!=bundle:
               raise SystemExit('Publisher Sams app identity mismatch after setup.')
+          if app.repository_url!='https://github.com/hsdarestani/publisher.git':
+              raise SystemExit('Publisher Sams source repository mismatch.')
+          if app.build_config.get('ios_command')!='bash sams-ios-release/build.sh':
+              raise SystemExit('Publisher Sams build command mismatch.')
 
           profile=ensure_ios_signing(app)
           if profile.app_id != app.pk or not profile.profile_uuid:
@@ -132,7 +123,7 @@ jobs:
               },
           )
           Job.objects.filter(release=release,type__in=['build_ios','upload_apple','submit_apple'],status__in=['queued','running']).update(
-              status='cancelled',finished_at=timezone.now(),error='Superseded by Sams Club Lounge 1.0.4 release workflow.'
+              status='cancelled',finished_at=timezone.now(),error='Superseded by isolated Sams Club Lounge 1.0.4 release workflow.'
           )
           build,_=Build.objects.get_or_create(release=release,platform='ios')
           if build.artifact:
@@ -142,7 +133,7 @@ jobs:
           build.external_build_id=''; build.metadata={}; build.save()
           job=Job.objects.create(
               type='build_ios',app=app,release=release,build=build,
-              payload={'source':'sams-club-lounge-ios-1.0.4'},available_to_agents=True,required_platform='macos',
+              payload={'source':'sams-club-lounge-ios-1.0.4-isolated'},available_to_agents=True,required_platform='macos',
           )
           print('SAMS_APP_ID='+str(app.pk))
           print('SAMS_RELEASE_ID='+str(release.pk))
@@ -172,7 +163,7 @@ jobs:
             if [ "$STATUS" = "failed" ]; then
               echo "Sams build failed: $ERROR" >&2
               sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='build_ios').order_by('-created_at').first(); print(j.logs[-30000:] if j else '')\""
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='build_ios').order_by('-created_at').first(); print(j.logs[-40000:] if j else '')\""
               exit 1
             fi
             [ "$i" -lt 100 ] || { echo 'Timed out waiting for Sams iOS build.' >&2; exit 1; }
@@ -197,7 +188,7 @@ jobs:
           if old:
               print(f'SAMS_UPLOAD_JOB={old.pk}:{old.status}')
           else:
-              j=Job.objects.create(type='upload_apple',app=b.release.app,release=b.release,build=b,payload={'source':'sams-club-lounge-ios-1.0.4'},available_to_agents=True,required_platform='macos')
+              j=Job.objects.create(type='upload_apple',app=b.release.app,release=b.release,build=b,payload={'source':'sams-club-lounge-ios-1.0.4-isolated'},available_to_agents=True,required_platform='macos')
               print(f'SAMS_UPLOAD_JOB={j.pk}:queued')
           PY
 
@@ -223,7 +214,7 @@ jobs:
             if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then break; fi
             if [ "$STATUS" = "failed" ]; then
               sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='upload_apple').order_by('-created_at').first(); print(j.error if j else ''); print(j.logs[-30000:] if j else '')\""
+                "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job; j=Job.objects.filter(release__app__slug='sams-club-lounge',release__build_number=2026081701,type='upload_apple').order_by('-created_at').first(); print(j.error if j else ''); print(j.logs[-40000:] if j else '')\""
               exit 1
             fi
             [ "$i" -lt 100 ] || { echo 'Timed out waiting for Sams App Store processing.' >&2; exit 1; }

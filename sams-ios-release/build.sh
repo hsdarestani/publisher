@@ -46,8 +46,6 @@ npm install --no-audit --no-fund
 rm -rf ios
 npx cap add ios
 npx cap sync ios
-# The release mirror intentionally contains only the exact Sams SVG icon source.
-# Generate the native iOS icon/splash set directly from it.
 npx @capacitor/assets generate --ios --assetPath assets \
   --iconBackgroundColor '#09050f' --iconBackgroundColorDark '#09050f' \
   --splashBackgroundColor '#09050f' --splashBackgroundColorDark '#09050f'
@@ -102,9 +100,10 @@ xcodebuild \
 ARCHIVE_INFO="$ARCHIVE_PATH/Info.plist"
 [ -f "$ARCHIVE_INFO" ] || { echo "Archive Info.plist missing" >&2; exit 37; }
 ARCHIVE_APP_REL="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:ApplicationPath' "$ARCHIVE_INFO")"
-ARCHIVE_APP="$ARCHIVE_PATH/Products/Applications/$ARCHIVE_APP_REL"
+ARCHIVE_APP="$ARCHIVE_PATH/Products/$ARCHIVE_APP_REL"
 ARCHIVE_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$ARCHIVE_INFO")"
 [ "$ARCHIVE_BUNDLE_ID" = "$EXPECTED_BUNDLE_ID" ] || { echo "Archive has wrong bundle: $ARCHIVE_BUNDLE_ID" >&2; exit 38; }
+[ -f "$ARCHIVE_APP/Info.plist" ] || { echo "Archived app Info.plist missing: $ARCHIVE_APP/Info.plist" >&2; exit 40; }
 /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$ARCHIVE_APP/Info.plist" | grep -Fx 'Sams Club Lounge'
 /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ARCHIVE_APP/Info.plist" | grep -Fx "$EXPECTED_VERSION"
 /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$ARCHIVE_APP/Info.plist" | grep -Fx "$EXPECTED_BUILD"

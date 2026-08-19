@@ -2,6 +2,10 @@ name: Diagnose A+ Solution Publisher metadata
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-aplus-solution.yml'
   workflow_run:
     workflows: ['Validate and deploy A+ Publisher']
     types: [completed]
@@ -12,7 +16,7 @@ permissions:
 
 jobs:
   diagnose:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: production
     steps:

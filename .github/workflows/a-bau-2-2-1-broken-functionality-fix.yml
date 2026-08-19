@@ -1,0 +1,245 @@
+name: Build and resubmit A+Bau 2.2.1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-2-2-1-broken-functionality-fix.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-bau-2-2-1-broken-functionality-fix
+  cancel-in-progress: false
+
+jobs:
+  build-and-google:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 40
+    steps:
+      - name: Install transfer and Google auth dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install -q 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Create A+Bau 2.2.1 release and queue signed builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_release_v2 --app-version 2.2.1 --build-number 22002 --queue"
+
+          # Make the release notes describe this policy-review fix rather than the older feature release.
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
+          import os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.1', build_number=22002)
+          note = 'Startproblem beim Öffnen der App behoben. Der A+Bau Login und die native App-Oberfläche laden jetzt zuverlässig.'
+          release.release_notes = note
+          release.source_branch = 'main'
+          release.save(update_fields=['release_notes', 'source_branch', 'updated_at'])
+          app.localizations.filter(locale='de-DE').update(release_notes=note)
+          print('a_bau_221_release_ready=true')
+          PY
+
+      - name: Wait for signed Android AAB
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          ready=0
+          for attempt in $(seq 1 50); do
+            status="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); b=r.builds.filter(platform='android').first(); print(b.status if b else 'missing')\"" | tail -n 1 | tr -d '\r')"
+            echo "android_build_status=$status attempt=$attempt"
+            if [ "$status" = "succeeded" ]; then ready=1; break; fi
+            if [ "$status" = "failed" ]; then
+              "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); b=r.builds.get(platform='android'); print((b.logs or '')[-5000:])\"" || true
+              exit 1
+            fi
+            sleep 20
+          done
+          test "$ready" = "1"
+
+      - name: Retrieve signed AAB and Google credentials
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/google.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.select_related('google_account').get(slug='a-bau')
+          print(json.dumps(app.google_account.get_credentials()))
+          PY
+          chmod 600 /tmp/google.json
+
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/a-bau-22002.aab <<'PY'
+          import os, sys, django
+          from pathlib import Path
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.1', build_number=22002)
+          build = release.builds.get(platform='android')
+          assert build.status == 'succeeded' and build.artifact, build.status
+          sys.stdout.buffer.write(Path(build.artifact.path).read_bytes())
+          PY
+
+          EXPECTED_SHA="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); print(r.builds.get(platform='android').artifact_checksum)\"" | tail -n 1 | tr -d '\r')"
+          ACTUAL_SHA="$(sha256sum /tmp/a-bau-22002.aab | awk '{print $1}')"
+          test -n "$EXPECTED_SHA" && test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+          echo "signed_aab_sha256=$ACTUAL_SHA"
+
+      - name: Verify signed AAB contains executable A+Bau startup bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, zipfile
+          from pathlib import Path
+          path = Path('/tmp/a-bau-22002.aab')
+          with zipfile.ZipFile(path) as z:
+              names = set(z.namelist())
+              index_name = next((n for n in names if n.endswith('/assets/public/index.html')), None)
+              bundle_name = next((n for n in names if n.endswith('/assets/public/app.bundle.js')), None)
+              config_name = next((n for n in names if n.endswith('/assets/capacitor.config.json')), None)
+              raw_app = [n for n in names if n.endswith('/assets/public/app.js')]
+              assert index_name and bundle_name and config_name, (index_name, bundle_name, config_name)
+              assert not raw_app, raw_app
+              index = z.read(index_name).decode('utf-8', 'replace')
+              bundle = z.read(bundle_name).decode('utf-8', 'replace')
+              config = json.loads(z.read(config_name))
+              assert config.get('appName') == 'A+Bau', config
+              assert '<title>A+Bau</title>' in index and 'src="app.bundle.js"' in index
+              assert 'KAYI Haustechnik' not in index and 'Natives Baustellen-Aufmaß' not in index
+              assert not re.search(r"from\s+['\"]@capacitor/core['\"]", bundle)
+              assert 'Anmelden' in bundle and 'A+Bau' in bundle
+              print('SIGNED_AAB_STARTUP_VERIFY=SUCCESS')
+              print('embedded_index=' + index_name)
+              print('embedded_bundle=' + bundle_name)
+          PY
+
+      - name: Submit fixed 2.2.1 to Google Play production
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.auth.transport.requests import AuthorizedSession, Request
+          from google.oauth2 import service_account
+
+          info = json.loads(Path('/tmp/google.json').read_text())
+          pkg = 'de.kayihaustechnik.app'
+          qpkg = quote(pkg, safe='._-')
+          version_code = '22002'
+          creds = service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(Request())
+          s = AuthorizedSession(creds)
+          api = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          upload = 'https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+
+          def body(r):
+              try: return json.dumps(r.json(), ensure_ascii=False)[:2500]
+              except Exception: return ' '.join(r.text.split())[:2500]
+
+          er = s.post(f'{api}/applications/{qpkg}/edits', json={}, timeout=60)
+          print(f'play_edit_probe=HTTP_{er.status_code}')
+          if not er.ok: raise RuntimeError(body(er))
+          edit = er.json()['id']
+          try:
+              lr = s.get(f'{api}/applications/{qpkg}/edits/{edit}/bundles', timeout=60)
+              if not lr.ok: raise RuntimeError('bundle list: ' + body(lr))
+              existing = next((b for b in lr.json().get('bundles', []) if str(b.get('versionCode')) == version_code), None)
+              if not existing:
+                  ur = s.post(
+                      f'{upload}/applications/{qpkg}/edits/{edit}/bundles',
+                      params={'uploadType':'media'},
+                      data=Path('/tmp/a-bau-22002.aab').read_bytes(),
+                      headers={'Content-Type':'application/octet-stream'},
+                      timeout=600,
+                  )
+                  print(f'aab_upload=HTTP_{ur.status_code}')
+                  if not ur.ok: raise RuntimeError('AAB upload: ' + body(ur))
+                  assert str(ur.json().get('versionCode')) == version_code, ur.json()
+              else:
+                  print('bundle_reused=true')
+
+              notes = [{'language':'de-DE','text':'Startproblem beim Öffnen der App behoben. Der A+Bau Login und die native App-Oberfläche laden jetzt zuverlässig.'}]
+              tr = s.put(
+                  f'{api}/applications/{qpkg}/edits/{edit}/tracks/production',
+                  json={'track':'production','releases':[{
+                      'name':'2.2.1 (22002)',
+                      'versionCodes':[version_code],
+                      'status':'completed',
+                      'releaseNotes':notes,
+                  }]},
+                  timeout=120,
+              )
+              print(f'production_track=HTTP_{tr.status_code}')
+              if not tr.ok: raise RuntimeError('track: ' + body(tr))
+
+              vr = s.post(f'{api}/applications/{qpkg}/edits/{edit}:validate', json={}, timeout=120)
+              print(f'edit_validate=HTTP_{vr.status_code}')
+              if not vr.ok: raise RuntimeError('validate: ' + body(vr))
+
+              cr = s.post(f'{api}/applications/{qpkg}/edits/{edit}:commit', json={}, timeout=120)
+              print(f'edit_commit=HTTP_{cr.status_code}')
+              if not cr.ok: raise RuntimeError('commit: ' + body(cr))
+              print('GOOGLE_PLAY_22002_RESUBMIT=SUCCESS')
+          except Exception:
+              try: s.delete(f'{api}/applications/{qpkg}/edits/{edit}', timeout=60)
+              except Exception: pass
+              raise
+          PY
+
+      - name: Record Google resubmission in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Submission; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); b=r.builds.get(platform='android'); Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review','external_id':'22002','submitted_at':timezone.now(),'last_error':'','raw':{'package_name':a.package_name,'track':'production','version_code':'22002','artifact_sha256':b.artifact_checksum or '','reason':'Broken Functionality startup fix','publisher_path':'github-hosted-runner'}}); r.status='in_review'; r.save(update_fields=['status','updated_at']); print('publisher_google_22002_recorded=true')\""
+
+      - name: Cleanup temporary credentials and AAB
+        if: always()
+        run: rm -f /tmp/google.json /tmp/a-bau-22002.aab

@@ -1,0 +1,26 @@
+{
+  "checked_at": "2026-08-19T06:09:36.832613+00:00",
+  "google_play": {
+    "edit_http": 200,
+    "production_releases": [
+      {
+        "name": "2.2.0 (22001)",
+        "status": "completed",
+        "versionCodes": [
+          "22001"
+        ]
+      }
+    ],
+    "track_http": 200,
+    "version_22002_present": false
+  },
+  "publisher": {
+    "builds": {
+      "android": "succeeded",
+      "ios": "succeeded"
+    },
+    "release_exists": true,
+    "release_status": "ready",
+    "submissions": {}
+  }
+}

@@ -1,0 +1,111 @@
+name: Verify A+Bau 2.2.1 resubmission
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-2-2-1-verify.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a-bau-2-2-1-broken-functionality-fix
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install -q 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+      - name: Read Publisher and Google Play state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/publisher-state.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          a=MobileApp.objects.get(slug='a-bau')
+          r=Release.objects.filter(app=a,version_name='2.2.1',build_number=22002).first()
+          out={'release_exists':bool(r)}
+          if r:
+              out['release_status']=r.status
+              out['builds']={b.platform:b.status for b in r.builds.all()}
+              out['submissions']={s.platform:s.state for s in Submission.objects.filter(app=a,release=r)}
+          print(json.dumps(out,sort_keys=True))
+          PY
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/google.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
+          from apps.publisher.models import MobileApp
+          a=MobileApp.objects.select_related('google_account').get(slug='a-bau')
+          print(json.dumps(a.google_account.get_credentials()))
+          PY
+          chmod 600 /tmp/google.json
+          python - <<'PY' > /tmp/play-state.json
+          import json
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.auth.transport.requests import AuthorizedSession,Request
+          from google.oauth2 import service_account
+          info=json.loads(Path('/tmp/google.json').read_text())
+          pkg='de.kayihaustechnik.app'; qpkg=quote(pkg,safe='._-')
+          c=service_account.Credentials.from_service_account_info(info,scopes=['https://www.googleapis.com/auth/androidpublisher']); c.refresh(Request()); s=AuthorizedSession(c)
+          api='https://androidpublisher.googleapis.com/androidpublisher/v3'
+          er=s.post(f'{api}/applications/{qpkg}/edits',json={},timeout=60)
+          out={'edit_http':er.status_code,'version_22002_present':False}
+          if er.ok:
+              eid=er.json()['id']
+              try:
+                  tr=s.get(f'{api}/applications/{qpkg}/edits/{eid}/tracks/production',timeout=60)
+                  out['track_http']=tr.status_code
+                  if tr.ok:
+                      rels=tr.json().get('releases') or []
+                      safe=[]
+                      for r in rels:
+                          codes=[str(v) for v in r.get('versionCodes') or []]
+                          safe.append({'name':r.get('name'),'status':r.get('status'),'versionCodes':codes})
+                          if '22002' in codes:
+                              out['version_22002_present']=True
+                              out['version_22002_status']=r.get('status')
+                      out['production_releases']=safe
+              finally:
+                  s.delete(f'{api}/applications/{qpkg}/edits/{eid}',timeout=60)
+          print(json.dumps(out,sort_keys=True))
+          PY
+          mkdir -p status
+          python - <<'PY'
+          import json,datetime,pathlib
+          pub=json.loads(pathlib.Path('/tmp/publisher-state.json').read_text())
+          play=json.loads(pathlib.Path('/tmp/play-state.json').read_text())
+          result={'checked_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'publisher':pub,'google_play':play}
+          pathlib.Path('status/a-bau-2.2.1-google.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+      - name: Commit verification result
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git add status/a-bau-2.2.1-google.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau 2.2.1 Google Play state'
+          git push
+      - name: Cleanup
+        if: always()
+        run: rm -f /tmp/google.json /tmp/publisher-state.json /tmp/play-state.json

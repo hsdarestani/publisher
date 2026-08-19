@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   diagnose:
@@ -18,7 +19,7 @@ jobs:
       - name: Install SSH tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
 
-      - name: Print non-secret A+ Solution store metadata
+      - name: Read non-secret A+ Solution store metadata
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -27,5 +28,30 @@ jobs:
           set -euo pipefail
           test -n "$HOST" && test -n "$PASS"
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.filter(slug='a-plus-solution').select_related('google_account','apple_account').first(); print('app_exists=', bool(a)); print('name=', a.name if a else ''); print('package_name=', a.package_name if a else ''); print('bundle_id=', a.bundle_id if a else ''); print('google_app_id=', a.google_app_id if a else ''); print('apple_app_id=', a.apple_app_id if a else ''); g=a.google_account if a else None; p=a.apple_account if a else None; print('google_account=', g.name if g else ''); print('google_project_id=', g.credential_project_id if g else ''); print('google_configured=', g.configured if g else False); print('apple_account=', p.name if p else ''); print('apple_organization=', p.organization if p else ''); print('apple_team_id=', p.apple_team_id if p else ''); print('apple_key_id=', p.apple_key_id if p else ''); print('apple_configured=', p.configured if p else False); print('android_signing=', hasattr(a, 'android_signing') if a else False); print('ios_profile=', hasattr(a, 'ios_provisioning_profile') if a else False)\""
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; a=MobileApp.objects.filter(slug='a-plus-solution').select_related('google_account','apple_account').first(); print('app_exists=', bool(a)); print('name=', a.name if a else ''); print('package_name=', a.package_name if a else ''); print('bundle_id=', a.bundle_id if a else ''); print('google_app_id=', a.google_app_id if a else ''); print('apple_app_id=', a.apple_app_id if a else ''); g=a.google_account if a else None; p=a.apple_account if a else None; print('google_account=', g.name if g else ''); print('google_project_id=', g.credential_project_id if g else ''); print('google_configured=', g.configured if g else False); print('apple_account=', p.name if p else ''); print('apple_organization=', p.organization if p else ''); print('apple_team_id=', p.apple_team_id if p else ''); print('apple_key_id=', p.apple_key_id if p else ''); print('apple_configured=', p.configured if p else False); print('android_signing=', hasattr(a, 'android_signing') if a else False); print('ios_profile=', hasattr(a, 'ios_provisioning_profile') if a else False)\"")"
+          printf '%s\n' "$OUTPUT" | tee /tmp/aplus-solution-metadata.txt
+
+      - name: Publish safe diagnostic result
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/aplus-solution-metadata.txt', 'utf8').trim();
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 70,
+              state: 'closed',
+              body: [
+                'Automated safe diagnostic for the production `a-plus-solution` Publisher record.',
+                '',
+                '```text',
+                output,
+                '```',
+                '',
+                'This report intentionally excludes private keys, passwords, service-account JSON, certificates, provisioning-profile bytes, and tokens.',
+                '',
+                `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ].join('\n')
+            });

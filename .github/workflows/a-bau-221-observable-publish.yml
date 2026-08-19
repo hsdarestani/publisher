@@ -67,7 +67,7 @@ jobs:
               assert 'Anmelden' in js and 'A+Bau' in js
               print('SIGNED_AAB_STARTUP_VERIFY=SUCCESS')
           PY
-      - name: Upload and commit 22002 to production
+      - name: Upload and stage 22002 on production
         run: |
           python - <<'PY'
           import json
@@ -99,11 +99,12 @@ jobs:
               tr=s.put(f'{api}/applications/{q}/edits/{eid}/tracks/production',json={'track':'production','releases':[{'name':'2.2.1 (22002)','versionCodes':[code],'status':'completed','releaseNotes':notes}]},timeout=120)
               print(f'track_update=HTTP_{tr.status_code}')
               if not tr.ok:raise RuntimeError('track '+body(tr))
-              vr=s.post(f'{api}/applications/{q}/edits/{eid}:validate',json={},timeout=120); print(f'validate=HTTP_{vr.status_code}')
+              review_params={'changesNotSentForReview':'true'}
+              vr=s.post(f'{api}/applications/{q}/edits/{eid}:validate',params=review_params,json={},timeout=120); print(f'validate=HTTP_{vr.status_code}')
               if not vr.ok:raise RuntimeError('validate '+body(vr))
-              cr=s.post(f'{api}/applications/{q}/edits/{eid}:commit',json={},timeout=120); print(f'commit=HTTP_{cr.status_code}')
+              cr=s.post(f'{api}/applications/{q}/edits/{eid}:commit',params=review_params,json={},timeout=120); print(f'commit=HTTP_{cr.status_code}')
               if not cr.ok:raise RuntimeError('commit '+body(cr))
-              print('GOOGLE_PLAY_22002_RESUBMIT=SUCCESS')
+              print('GOOGLE_PLAY_22002_STAGED_FOR_MANUAL_REVIEW=SUCCESS')
           except Exception:
               try:s.delete(f'{api}/applications/{q}/edits/{eid}',timeout=60)
               except:pass
@@ -122,7 +123,7 @@ jobs:
           finally:
               s.delete(f'{api}/applications/{q}/edits/{v}',timeout=60)
           PY
-      - name: Record resubmission in Publisher
+      - name: Record staged submission in Publisher
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -137,9 +138,9 @@ jobs:
           os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup()
           from apps.publisher.models import MobileApp,Release,Submission
           a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); b=r.builds.get(platform='android')
-          Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'in_review','external_id':'22002','submitted_at':timezone.now(),'last_error':'','raw':{'package_name':a.package_name,'track':'production','version_code':'22002','artifact_sha256':b.artifact_checksum or '','reason':'Broken Functionality startup fix','publisher_path':'github-hosted-runner'}})
-          r.status='in_review'; r.save(update_fields=['status','updated_at'])
-          print('publisher_google_22002_recorded=true')
+          Submission.objects.update_or_create(app=a,release=r,platform='android',defaults={'state':'ready_for_review','external_id':'22002','submitted_at':timezone.now(),'last_error':'','raw':{'package_name':a.package_name,'track':'production','version_code':'22002','artifact_sha256':b.artifact_checksum or '','reason':'Broken Functionality startup fix','publisher_path':'github-hosted-runner','manual_review_required':True}})
+          r.status='ready'; r.save(update_fields=['status','updated_at'])
+          print('publisher_google_22002_ready_for_manual_review=true')
           PY
       - name: Cleanup
         if: always()

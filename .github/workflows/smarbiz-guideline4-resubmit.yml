@@ -1,3 +1,4 @@
+# Operational retry after installing workflow-run status reporting.
 name: Resubmit Smarbiz After Guideline 4 Fix
 
 on:

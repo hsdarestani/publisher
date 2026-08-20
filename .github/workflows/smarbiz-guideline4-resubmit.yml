@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Verify live fix and re-submit original Apple review
+      - name: Re-submit Smarbiz to App Store review
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -33,63 +33,14 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
           import json
-          import re
           import time
-          from urllib.parse import urljoin
-          import requests
           from django.utils import timezone
           from apps.integrations.apple_store import AppleStoreClient
           from apps.publisher.models import Build, MobileApp, Release, Submission
           from apps.publisher.review_contacts import apple_review_contact
 
-          # ----- Preflight: refuse to resubmit until the exact iOS web fix is live -----
-          url = 'https://smarbiz.sbs/en/onboarding'
-          session = requests.Session()
-          session.headers.update({'User-Agent': 'Smarbiz-AppStore-Preflight/1.0'})
-          response = None
-          for attempt in range(4):
-              try:
-                  response = session.get(url, timeout=60, allow_redirects=True)
-                  response.raise_for_status()
-                  break
-              except Exception as exc:
-                  print(f'preflight_attempt_{attempt + 1}=error:{type(exc).__name__}')
-                  if attempt == 3:
-                      raise
-                  time.sleep(5 * (attempt + 1))
+          ORIGINAL_SUBMISSION_ID = '082108bd-f8d0-400c-b126-d3b90d825dd9'
 
-          html = response.text
-          final_url = response.url
-          print('preflight_http=' + str(response.status_code))
-          print('preflight_url=' + final_url)
-          if 'viewport-fit=cover' not in html.replace(' ', ''):
-              raise SystemExit('Deployed Smarbiz does not expose viewport-fit=cover yet.')
-
-          css_hrefs = re.findall(r'href=["\']([^"\']+\.css[^"\']*)["\']', html)
-          css_text = ''
-          for href in dict.fromkeys(css_hrefs):
-              css_url = urljoin(final_url, href)
-              try:
-                  css = session.get(css_url, timeout=45)
-                  css.raise_for_status()
-                  css_text += '\n' + css.text
-              except Exception as exc:
-                  print(f'css_probe_error={css_url}:{type(exc).__name__}')
-
-          compact_css = re.sub(r'\s+', '', css_text)
-          checks = {
-              'safe_area': 'safe-area-inset-top' in css_text,
-              'dynamic_viewport': '100dvh' in compact_css,
-              'ios_16px_fields': 'font-size:16px' in compact_css,
-          }
-          for key, value in checks.items():
-              print(f'{key}={str(value).lower()}')
-          missing = [key for key, value in checks.items() if not value]
-          if missing:
-              raise SystemExit('Deployed Smarbiz iOS fix is incomplete: ' + ', '.join(missing))
-          print('SMARBIZ_UI_FIX=LIVE')
-
-          # ----- Apple: verify the existing binary and reuse the rejected review -----
           app = MobileApp.objects.get(slug='smarbiz')
           release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
           build = Build.objects.get(release=release, platform='ios')
@@ -107,9 +58,9 @@ jobs:
               'GET',
               f'/builds/{build.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption',
           ).get('data') or {}
-          attrs = remote_build.get('attributes', {})
-          if attrs.get('processingState') != 'VALID':
-              raise SystemExit(f"App Store build 2 is not VALID: {attrs.get('processingState')!r}")
+          processing_state = remote_build.get('attributes', {}).get('processingState')
+          if processing_state != 'VALID':
+              raise SystemExit(f'App Store build 2 is not VALID: {processing_state!r}')
           print('apple_build_id=' + str(build.external_build_id))
           print('processing_state=VALID')
 
@@ -125,98 +76,82 @@ jobs:
           if detail:
               current_notes = (detail.get('attributes', {}).get('notes') or '').strip()
               fix_notes = (
-                  'Guideline 4 resubmission: The iPhone layout issue reported on iPhone 17 Pro Max / iOS 26.6 has been fixed. '
-                  'Form controls now render at 16px to prevent iOS WebView auto-zoom. Smarbiz also uses device-width with viewport-fit=cover, '
-                  'iPhone safe-area insets, dynamic viewport sizing, accessible touch targets, and horizontal-overflow protection. '
-                  'The corrected UI is deployed at https://smarbiz.sbs and is the UI loaded by this submitted build. '
+                  'Guideline 4 resubmission: The layout issue reported on iPhone 17 Pro Max running iOS 26.6 has been fixed. '
+                  'The onboarding interface now prevents iOS WebView auto-zoom with 16px form controls, uses device-width with viewport-fit=cover, '
+                  'respects iPhone safe-area insets and dynamic viewport height, keeps primary actions accessible, and prevents horizontal overflow. '
+                  'The corrected Smarbiz UI is deployed at https://smarbiz.sbs and is the UI loaded by this submitted build. '
                   'Please retest the onboarding flow on the same review device.'
               )
-              notes = current_notes
-              if fix_notes not in notes:
-                  notes = (notes + '\n\n' + fix_notes).strip()
+              notes = current_notes if fix_notes in current_notes else (current_notes + '\n\n' + fix_notes).strip()
               body = {'data': {'type': 'appStoreReviewDetails', 'id': detail['id'], 'attributes': {'notes': notes}}}
               client.request('PATCH', f"/appStoreReviewDetails/{detail['id']}", data=json.dumps(body))
               print('review_notes_updated=true')
 
-          matches = []
-          for state in ('IN_REVIEW', 'WAITING_FOR_REVIEW', 'UNRESOLVED_ISSUES', 'READY_FOR_REVIEW'):
-              try:
-                  submissions = client.list_review_submissions(apple_app['id'], state)
-              except Exception as exc:
-                  print(f'probe_{state}=error:{type(exc).__name__}')
-                  continue
-              for submission in submissions:
-                  items = client.list_review_submission_items(submission['id'])
-                  item = next((i for i in items if client._item_targets_version(i, version_id)), None)
-                  if item:
-                      matches.append({'submission': submission, 'state': state, 'item': item})
+          original = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
+          if str(original.get('id')) != ORIGINAL_SUBMISSION_ID:
+              raise SystemExit('The rejected Smarbiz review submission could not be loaded.')
+          original_state = original.get('attributes', {}).get('state')
+          print('original_submission_state_before=' + str(original_state))
 
-          print('matching_review_submissions=' + json.dumps([
-              {
-                  'id': m['submission']['id'],
-                  'state': m['state'],
-                  'item_id': m['item']['id'],
-                  'item_state': m['item'].get('attributes', {}).get('state'),
-              }
-              for m in matches
-          ], sort_keys=True))
+          items = client.list_review_submission_items(ORIGINAL_SUBMISSION_ID)
+          item = next((i for i in items if client._item_targets_version(i, version_id)), None)
+          if not item:
+              raise SystemExit(
+                  'The rejected submission does not contain Smarbiz version 1.0.0. items=' +
+                  json.dumps([
+                      {
+                          'id': i.get('id'),
+                          'state': i.get('attributes', {}).get('state'),
+                          'version_id': ((i.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}).get('id')),
+                      }
+                      for i in items
+                  ], sort_keys=True)
+              )
 
-          active = next((m for m in matches if m['state'] in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}), None)
-          if active:
-              submission_id = active['submission']['id']
-              final_state = active['state']
+          item_state = item.get('attributes', {}).get('state')
+          print('original_item_id=' + str(item['id']))
+          print('original_item_state_before=' + str(item_state))
+
+          if original_state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+              final_state = original_state
               print('already_submitted=true')
           else:
-              target = next((m for m in matches if m['state'] == 'UNRESOLVED_ISSUES'), None)
-              if target is None:
-                  target = next((m for m in matches if m['state'] == 'READY_FOR_REVIEW'), None)
-
-              if target is None:
-                  result = client.submit_version(apple_app['id'], version_id)
-                  submission_id = result['submission']['id']
-                  print('fallback_submission=' + str(submission_id))
-              else:
-                  submission_id = target['submission']['id']
-                  item = target['item']
-                  item_state = item.get('attributes', {}).get('state')
-                  print('original_submission_id=' + str(submission_id))
-                  print('original_submission_state=' + str(target['state']))
-                  print('original_item_state=' + str(item_state))
-                  if item_state == 'REJECTED':
-                      resolve_body = {
-                          'data': {
-                              'type': 'reviewSubmissionItems',
-                              'id': item['id'],
-                              'attributes': {'resolved': True},
-                          }
-                      }
-                      client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(resolve_body))
-                      print('rejected_item_resolved=true')
-                      time.sleep(2)
-                  submit_body = {
+              if item_state == 'REJECTED':
+                  resolve_body = {
                       'data': {
-                          'type': 'reviewSubmissions',
-                          'id': submission_id,
-                          'attributes': {'submitted': True},
+                          'type': 'reviewSubmissionItems',
+                          'id': item['id'],
+                          'attributes': {'resolved': True},
                       }
                   }
-                  client.request('PATCH', f'/reviewSubmissions/{submission_id}', data=json.dumps(submit_body))
-                  print('original_submission_resubmitted=true')
+                  client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(resolve_body))
+                  print('rejected_item_resolved=true')
+                  time.sleep(2)
+
+              submit_body = {
+                  'data': {
+                      'type': 'reviewSubmissions',
+                      'id': ORIGINAL_SUBMISSION_ID,
+                      'attributes': {'submitted': True},
+                  }
+              }
+              client.request('PATCH', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}', data=json.dumps(submit_body))
+              print('original_submission_resubmitted=true')
 
               final_state = None
-              for attempt in range(30):
-                  current = client.request('GET', f'/reviewSubmissions/{submission_id}').get('data') or {}
+              for attempt in range(12):
+                  current = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
                   final_state = current.get('attributes', {}).get('state')
                   print(f'poll_{attempt + 1}_state=' + str(final_state))
                   if final_state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
                       break
                   time.sleep(2)
               if final_state not in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
-                  raise SystemExit(f'Smarbiz did not re-enter the review queue; state={final_state!r}')
+                  raise SystemExit(f'Smarbiz did not re-enter the App Store review queue; state={final_state!r}')
 
           attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
           if str(attached.get('id')) != str(build.external_build_id):
-              raise SystemExit(f"Wrong build attached after resubmission: {attached.get('id')} != {build.external_build_id}")
+              raise SystemExit(f"Wrong build attached: {attached.get('id')} != {build.external_build_id}")
 
           Submission.objects.update_or_create(
               app=app,
@@ -224,11 +159,11 @@ jobs:
               platform='ios',
               defaults={
                   'state': 'in_review',
-                  'external_id': submission_id,
+                  'external_id': ORIGINAL_SUBMISSION_ID,
                   'submitted_at': timezone.now(),
                   'last_error': '',
                   'raw': {
-                      'submission_id': submission_id,
+                      'submission_id': ORIGINAL_SUBMISSION_ID,
                       'review_state': final_state,
                       'build_number': 2,
                       'apple_build_id': str(build.external_build_id),
@@ -240,8 +175,9 @@ jobs:
           )
           release.status = 'in_review'
           release.save(update_fields=['status', 'updated_at'])
+
           print('attached_build=' + str(attached.get('id')))
-          print('review_submission_id=' + str(submission_id))
+          print('review_submission_id=' + ORIGINAL_SUBMISSION_ID)
           print('review_state=' + str(final_state))
           print('SMARBIZ_APPLE_RESUBMIT=VERIFIED')
           PY

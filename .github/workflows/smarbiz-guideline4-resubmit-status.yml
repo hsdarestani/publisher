@@ -1,0 +1,47 @@
+name: Record Smarbiz Guideline 4 Resubmit Status
+
+on:
+  workflow_run:
+    workflows: ['Resubmit Smarbiz After Guideline 4 Fix']
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write workflow result to repository status file
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          path='status/smarbiz-guideline4-resubmit.json'
+          timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          payload="$(jq -n \
+            --arg status "$CONCLUSION" \
+            --arg run_id "$RUN_ID" \
+            --arg run_number "$RUN_NUMBER" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg run_url "$RUN_URL" \
+            --arg updated_at "$timestamp" \
+            '{status:$status,run_id:($run_id|tonumber),run_number:($run_number|tonumber),head_sha:$head_sha,run_url:$run_url,updated_at:$updated_at}')"
+          encoded="$(printf '%s' "$payload" | base64 -w0)"
+          existing_sha="$(gh api "repos/$GITHUB_REPOSITORY/contents/$path" --jq .sha 2>/dev/null || true)"
+          if [ -n "$existing_sha" ]; then
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+              -f message="Update Smarbiz App Store resubmission status" \
+              -f content="$encoded" \
+              -f sha="$existing_sha" >/dev/null
+          else
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+              -f message="Record Smarbiz App Store resubmission status" \
+              -f content="$encoded" >/dev/null
+          fi

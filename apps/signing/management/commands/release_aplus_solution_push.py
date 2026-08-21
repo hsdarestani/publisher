@@ -115,6 +115,29 @@ class Command(BaseReleaseCommand):
         self.stdout.write("apple_bundle_id=registered")
         return item
 
+    def _store_records(self, app):
+        # Do not call GooglePlayClient.test(package_name) while a release is active.
+        # That connectivity probe opens and deletes a temporary Play Edit, which can
+        # invalidate the real edit used by a concurrent bundle/listing upload.
+        result = {
+            "google": {
+                "ready": bool(app.google_account and app.google_account.configured),
+                "message": "Google Play account is configured; transactional Edit probe is skipped during active release publishing.",
+            },
+            "apple": {"ready": False, "message": "account missing"},
+        }
+        if app.apple_account and app.apple_account.configured:
+            try:
+                record = AppleStoreClient(app.apple_account).find_app(app.bundle_id)
+                result["apple"] = {
+                    "ready": True,
+                    "message": "App Store Connect app record found.",
+                    "id": record["id"],
+                }
+            except Exception as exc:
+                result["apple"] = {"ready": False, "message": str(exc)}
+        return result
+
     def _report_aplus(self, app, release):
         records = self._store_records(app)
         self.stdout.write("--- aplus-solution-release-status ---")

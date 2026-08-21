@@ -6,11 +6,11 @@ on:
       app_version:
         description: A+Bau version
         required: false
-        default: '2.2.0'
+        default: '2.2.2'
       build_number:
         description: Store build number
         required: false
-        default: '22001'
+        default: '22003'
   pull_request:
     paths:
       - '.github/workflows/a-bau-release.yml'
@@ -57,8 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     env:
-      APP_VERSION: ${{ inputs.app_version || '2.2.0' }}
-      BUILD_NUMBER: ${{ inputs.build_number || '22001' }}
+      APP_VERSION: ${{ inputs.app_version || '2.2.2' }}
+      BUILD_NUMBER: ${{ inputs.build_number || '22003' }}
     steps:
       - name: Wait for A+Bau Publisher command in production
         env:

@@ -25,15 +25,17 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--apply', action='store_true')
+        parser.add_argument('--apple-only', action='store_true', help='Provision only Apple push capability/profile; skip Publisher Google/Firebase probing.')
 
     def handle(self, *args, **options):
         app = MobileApp.objects.filter(package_name=APP_ID).first() or MobileApp.objects.filter(bundle_id=APP_ID).first()
         if not app:
             raise CommandError(f'Publisher app {APP_ID} not found.')
         apply = bool(options['apply'])
-        self.stdout.write(f'app={app.slug} apply={str(apply).lower()}')
+        apple_only = bool(options.get('apple_only'))
+        self.stdout.write(f'app={app.slug} apply={str(apply).lower()} apple_only={str(apple_only).lower()}')
         apple = self._apple(app, apply)
-        firebase = self._firebase(app, apply)
+        firebase = 'skipped_external_config' if apple_only else self._firebase(app, apply)
         self.stdout.write(f'apple_push_capability={apple}')
         self.stdout.write(f'firebase_android={firebase}')
         self.stdout.write('server_apns_key=external_required')
@@ -170,7 +172,6 @@ class Command(BaseCommand):
                 json={'displayName': 'A+ Solution', 'packageName': APP_ID},
             )
             if not response.ok:
-                # A Google Cloud project may exist without Firebase being added.
                 add = self._request(credentials, 'POST', f'{FIREBASE_API}/projects/{project_id}:addFirebase', json={})
                 self.stdout.write(f'firebase_add_project={add.status_code if add.ok else self._error_status(add)}')
                 if add.ok:

@@ -1,0 +1,90 @@
+name: Provision A+ Solution push providers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/signing/management/commands/provision_aplus_solution_push.py'
+      - '.github/workflows/provision-aplus-solution-push.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help provision_aplus_solution_push >/dev/null
+
+  apply-production:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Apply provider provisioning in Publisher production
+        id: provision
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_aplus_solution_push >/dev/null 2>&1"; then
+              break
+            fi
+            sleep 5
+          done
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_aplus_solution_push --apply")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update readiness issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.provision.outputs.output }}
+        run: |
+          set -euo pipefail
+          TITLE='A+ Solution push provider provisioning'
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'Automated non-secret provisioning result.'
+            echo
+            echo '```text'
+            printf '%s\n' "$REPORT"
+            echo '```'
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          NUMBER="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "A+ Solution push provider provisioning") | .number' | head -n1)"
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
+            gh issue reopen "$NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
+          fi

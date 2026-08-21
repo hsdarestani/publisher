@@ -64,7 +64,7 @@ class Command(BaseCommand):
         bundle = next((item for item in bundles if item.get('attributes', {}).get('identifier') == APP_ID), None)
         if not bundle:
             return 'bundle_missing'
-        capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities?limit=200").get('data', [])
+        capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities").get('data', [])
         enabled = any(item.get('attributes', {}).get('capabilityType') == 'PUSH_NOTIFICATIONS' for item in capabilities)
         if not enabled and not apply:
             return 'missing'

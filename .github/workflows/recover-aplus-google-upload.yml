@@ -1,0 +1,44 @@
+name: Recover A+ Solution Google upload
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-aplus-google-upload.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Recover stale Google upload and requeue
+        id: recover
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "from apps.publisher.models import MobileApp,Release; from apps.publisher.job_recovery import recover_stale_internal_jobs; app=MobileApp.objects.get(package_name=\"de.aplussolution.workforce\"); rel=Release.objects.get(app=app,version_name=\"1.0.2\",build_number=8); print(\"recovered_google=\", recover_stale_internal_jobs(app=app, release=rel, job_types={\"upload_google\"}, stale_after_minutes=1))" && docker compose exec -T web python manage.py release_aplus_solution_push --app-version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --publish')"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update release status issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.recover.outputs.output }}
+        run: |
+          set -euo pipefail
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body "Result: **Google retry queued**\n\n\`\`\`text\n$OUTPUT\n\`\`\`\n\nRun: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

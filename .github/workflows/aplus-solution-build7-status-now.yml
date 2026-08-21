@@ -1,0 +1,57 @@
+name: A+ Solution Build 7 Status Now
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build7-status-now.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Query Build 7
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job, MobileApp, Release, Submission
+          a=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(id=22)
+          print('release='+r.status)
+          print('version='+r.version_name)
+          print('build='+str(r.build_number))
+          print('source='+r.source_commit)
+          for platform in ('android','ios'):
+              b=r.builds.get(platform=platform)
+              print(f'{platform}_build={b.status}')
+              print(f'{platform}_artifact={bool(b.artifact)}')
+              print(f'{platform}_external={b.external_build_id or ""}')
+              for j in Job.objects.filter(build=b).order_by('-created_at')[:4]:
+                  print(f'{platform}_job={j.type}|{j.status}|{(j.error or "")[:350].replace(chr(10)," ")}')
+          for platform in ('android','ios'):
+              s=Submission.objects.filter(release=r,platform=platform).first()
+              print(f'{platform}_submission={s.state if s else ""}')
+              print(f'{platform}_submission_id={s.external_id if s else ""}')
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          BODY=$(printf 'A+ Solution 1.0.1 Build 7 live status.\n\n```text\n%s\n```\n\nStatus probe: %s/%s/actions/runs/%s' "$OUT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/74" -f body="$BODY" -f state=open >/dev/null

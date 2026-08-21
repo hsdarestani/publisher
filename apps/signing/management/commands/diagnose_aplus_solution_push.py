@@ -31,6 +31,14 @@ class Command(BaseCommand):
         self.stdout.write(f'app_name={app.name}')
         self.stdout.write(f'app_slug={app.slug}')
         self.stdout.write(f'repository={app.repository_url or "missing"}')
+        self.stdout.write(f'framework={app.framework}')
+        config = dict(app.build_config or {})
+        self.stdout.write(f'build_config_keys={",".join(sorted(config.keys())) or "none"}')
+        self.stdout.write(f'build_env_keys={",".join(sorted((config.get("env") or {}).keys())) or "none"}')
+        self.stdout.write(f'android_command={config.get("android_command") or "default"}')
+        self.stdout.write(f'android_artifact={config.get("android_artifact") or "default"}')
+        self.stdout.write(f'ios_command={config.get("ios_command") or "default"}')
+        self.stdout.write(f'ios_artifact={config.get("ios_artifact") or "default"}')
         self.stdout.write(f'google_account={"configured" if app.google_account and app.google_account.configured else "missing"}')
         self.stdout.write(f'apple_account={"configured" if app.apple_account and app.apple_account.configured else "missing"}')
         if app.google_account:
@@ -41,6 +49,7 @@ class Command(BaseCommand):
         latest = Release.objects.filter(app=app).order_by('-build_number', '-created_at').first()
         self.stdout.write(f'latest_release={latest.version_name if latest else "none"}')
         self.stdout.write(f'latest_build_number={latest.build_number if latest else 0}')
+        self.stdout.write(f'latest_source_commit={latest.source_commit if latest and latest.source_commit else "missing"}')
 
         profile = IOSProvisioningProfile.objects.filter(app=app).first()
         self.stdout.write(f'ios_profile={"present" if profile else "missing"}')

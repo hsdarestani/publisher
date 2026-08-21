@@ -51,4 +51,4 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_aplus_solution_push --apply --apple-only"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --queue --publish"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --app-version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --queue --publish"

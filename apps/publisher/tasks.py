@@ -75,6 +75,61 @@ def handle_sync_store_status(job):
     return result
 
 
+def _publish_existing_google_version(client, app, release):
+    """Commit a version code that Google already accepted during an earlier partial edit.
+
+    Google permanently consumes an Android versionCode as soon as the bundle upload
+    succeeds, even if a later listing/media request causes that Edit to fail. A retry
+    must therefore create a fresh Edit and attach the already-uploaded versionCode to
+    the target track instead of uploading the same AAB again.
+    """
+    edit = client._open_edit(app.package_name)
+    version_code = str(release.build_number)
+    try:
+        try:
+            bundles = client._edit_request(
+                edit,
+                "GET",
+                f"/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/bundles",
+            )
+        except Exception:
+            bundles = {}
+        release_notes = []
+        for loc in app.localizations.all():
+            text = loc.release_notes or release.release_notes
+            if text:
+                release_notes.append({"language": loc.locale, "text": text[:500]})
+        track_release = {
+            "name": release.version_name,
+            "versionCodes": [version_code],
+            "status": "completed" if float(release.android_rollout) >= 1 else "inProgress",
+        }
+        if float(release.android_rollout) < 1:
+            track_release["userFraction"] = float(release.android_rollout)
+        if release_notes:
+            track_release["releaseNotes"] = release_notes
+        track_body = {"track": release.android_track, "releases": [track_release]}
+        client._edit_request(
+            edit,
+            "PUT",
+            f"/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks/{client._q(release.android_track)}",
+            json_body=track_body,
+        )
+        client._validate_edit(edit)
+        committed = client._commit_edit(edit)
+        return {
+            "edit": committed,
+            "bundle": {"versionCode": int(version_code), "reused": True},
+            "version_code": version_code,
+            "endpoint": edit.endpoint,
+            "existing_bundles": bundles.get("bundles", []) if isinstance(bundles, dict) else [],
+            "reused_existing_version_code": True,
+        }
+    except Exception:
+        client._safe_delete_edit(edit)
+        raise
+
+
 def handle_upload_google(job):
     from apps.integrations.google_play import GooglePlayClient
     release = job.release
@@ -84,7 +139,12 @@ def handle_upload_google(job):
     build = job.build or release.builds.filter(platform="android", status="succeeded").first()
     if not build: raise RuntimeError("No successful Android build found.")
     client = GooglePlayClient(release.app.google_account)
-    result = client.publish_release(release.app, release, build, release.app.localizations.all(), release.app.assets.all(), submit=True)
+    try:
+        result = client.publish_release(release.app, release, build, release.app.localizations.all(), release.app.assets.all(), submit=True)
+    except Exception as exc:
+        if "already been used" not in str(exc).lower():
+            raise
+        result = _publish_existing_google_version(client, release.app, release)
     Submission.objects.update_or_create(app=release.app, release=release, platform="android", defaults={"state": "in_review", "submitted_at": timezone.now(), "raw": result})
     release.status = "in_review"; release.readiness_snapshot = check; release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
     return result
@@ -113,9 +173,6 @@ def handle_submit_apple(job):
     record = client.find_app(app.bundle_id)
     version = client.ensure_version(record["id"], release.version_name)
 
-    # App-level declarations are cheap, deterministic API writes and are required
-    # for review eligibility. Apply them before asynchronous media processing so
-    # a slow screenshot never hides or delays compliance progress.
     app_compliance = apply_app_store_compliance(
         client,
         record["id"],

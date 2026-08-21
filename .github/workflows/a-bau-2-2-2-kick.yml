@@ -34,9 +34,25 @@ jobs:
           sudo apt-get install -y -qq sshpass >/dev/null
           PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
           mkdir -p status
+
+          ready=0
+          for attempt in $(seq 1 90); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_safe >/dev/null 2>&1"; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" != "1" ]; then
+            echo 'bootstrap_a_bau_safe was not deployed' > status/a-bau-2.2.2-kick.log
+            cat status/a-bau-2.2.2-kick.log
+            exit 2
+          fi
+
           set +e
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version 2.2.2 --build-number 22003 --queue" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22003 --queue --publish" \
             > status/a-bau-2.2.2-kick.log 2>&1
           rc=$?
           set -e

@@ -7,6 +7,10 @@ on:
   workflow_run:
     workflows: ['Validate and deploy A+ Publisher']
     types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cloud-macos.yml'
 
 permissions:
   contents: read

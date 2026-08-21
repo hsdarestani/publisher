@@ -18,7 +18,7 @@ class Command(BaseReleaseCommand):
     help = "Build and publish the A+ Solution native-push release without replacing existing Store credentials."
 
     def add_arguments(self, parser):
-        parser.add_argument("--version", default="1.0.2")
+        parser.add_argument("--app-version", default="1.0.2")
         parser.add_argument("--build-number", type=int, default=8)
         parser.add_argument("--source-commit", default="")
         parser.add_argument("--queue", action="store_true")
@@ -71,7 +71,7 @@ class Command(BaseReleaseCommand):
         source_commit = str(options.get("source_commit") or "").strip()
         release, _ = Release.objects.update_or_create(
             app=app,
-            version_name=options["version"],
+            version_name=options["app_version"],
             build_number=options["build_number"],
             defaults={
                 "source_branch": "main",

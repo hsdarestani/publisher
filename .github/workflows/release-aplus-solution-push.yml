@@ -1,0 +1,124 @@
+name: Release A+ Solution native push
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/signing/management/commands/release_aplus_solution_push.py'
+      - '.github/workflows/release-aplus-solution-push.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate release command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help release_aplus_solution_push >/dev/null
+
+  release-production:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 55
+    steps:
+      - name: Build, upload and submit A+ Solution 1.0.2
+        id: release
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          SSH=(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ServerAliveInterval=20 -o ServerAliveCountMax=4 root@"$HOST")
+
+          for i in $(seq 1 120); do
+            if "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help release_aplus_solution_push >/dev/null 2>&1"; then
+              break
+            fi
+            sleep 5
+          done
+
+          PROVISION="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_aplus_solution_push --apply" 2>&1 || true)"
+          printf '%s\n' "$PROVISION"
+
+          INITIAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --queue --publish" 2>&1 || true)"
+          printf '%s\n' "$INITIAL"
+          FINAL="$INITIAL"
+          RESULT=running
+
+          for i in $(seq 1 90); do
+            if printf '%s' "$FINAL" | grep -q 'submission_android=in_review' && printf '%s' "$FINAL" | grep -q 'submission_ios=in_review'; then
+              RESULT=submitted
+              break
+            fi
+            if printf '%s' "$FINAL" | grep -Eq 'job=(build_android|build_ios|upload_google|upload_apple|submit_apple):failed'; then
+              RESULT=failed
+              break
+            fi
+            sleep 30
+            FINAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --publish" 2>&1 || true)"
+            printf '%s\n' "$FINAL"
+          done
+
+          {
+            echo 'result<<EOF'
+            echo "$RESULT"
+            echo EOF
+            echo 'provision<<EOF'
+            printf '%s\n' "$PROVISION"
+            echo EOF
+            echo 'final<<EOF'
+            printf '%s\n' "$FINAL"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release status issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.release.outputs.result }}
+          PROVISION: ${{ steps.release.outputs.provision }}
+          FINAL: ${{ steps.release.outputs.final }}
+        run: |
+          set -euo pipefail
+          TITLE='A+ Solution 1.0.2 native push release'
+          BODY_FILE="$(mktemp)"
+          {
+            echo "Result: **$RESULT**"
+            echo
+            echo 'Provider provisioning:'
+            echo '```text'
+            printf '%s\n' "$PROVISION"
+            echo '```'
+            echo
+            echo 'Latest Publisher status:'
+            echo '```text'
+            printf '%s\n' "$FINAL"
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          NUMBER="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "A+ Solution 1.0.2 native push release") | .number' | head -n1)"
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
+            gh issue reopen "$NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
+          fi

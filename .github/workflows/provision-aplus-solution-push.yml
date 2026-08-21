@@ -88,3 +88,5 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
           fi
+
+# Triggered after A+ Solution push credentials were configured in August 2026.

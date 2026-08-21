@@ -1,0 +1,144 @@
+name: Resubmit A+Bau 2.2.2 after splash fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-2-2-2-splash-resubmit.yml'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: a-bau-2-2-2-splash-resubmit
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install SSH helper
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Queue fresh Publisher builds from current A+Bau main
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version 2.2.2 --build-number 22003 --queue"
+
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
+          import os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.2', build_number=22003)
+          note = 'Startproblem beim Öffnen der App behoben. A+Bau lädt jetzt zuverlässig auf iPhone und iPad; zusätzlich sind die neuesten Baustellen- und Kundenfunktionen enthalten.'
+          release.release_notes = note
+          release.source_branch = 'main'
+          release.save(update_fields=['release_notes', 'source_branch', 'updated_at'])
+          app.localizations.filter(locale='de-DE').update(release_notes=note)
+          print('a_bau_222_release_notes_ready=true')
+          PY
+
+      - name: Wake Publisher Linux and macOS agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Build, upload and submit through Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          success=0
+          for attempt in $(seq 1 90); do
+            echo "=== Publisher pass $attempt ==="
+            OUTPUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version 2.2.2 --build-number 22003 --queue --publish")"
+            printf '%s\n' "$OUTPUT"
+
+            # bootstrap_a_bau rewrites the default localization on every pass; keep
+            # the App Review-facing note pinned to the startup fix.
+            "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.2',build_number=22003); n='Startproblem beim Öffnen der App behoben. A+Bau lädt jetzt zuverlässig auf iPhone und iPad; zusätzlich sind die neuesten Baustellen- und Kundenfunktionen enthalten.'; r.release_notes=n; r.save(update_fields=['release_notes','updated_at']); a.localizations.filter(locale='de-DE').update(release_notes=n)\""
+
+            if printf '%s\n' "$OUTPUT" | grep -q 'job=upload_google:succeeded' && \
+               printf '%s\n' "$OUTPUT" | grep -q 'job=submit_apple:succeeded'; then
+              success=1
+              break
+            fi
+            sleep 30
+          done
+          test "$success" = "1"
+
+      - name: Record final Publisher release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          mkdir -p status
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-2.2.2-release.json <<'PY'
+          import json, os, django
+          from django.utils import timezone
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          app = MobileApp.objects.get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.2', build_number=22003)
+          out = {
+              'checked_at': timezone.now().isoformat(),
+              'release': {'version': release.version_name, 'build': release.build_number, 'status': release.status},
+              'builds': {b.platform: {'status': b.status, 'external_build_id': b.external_build_id or ''} for b in release.builds.all()},
+              'jobs': [{'type': j.type, 'status': j.status, 'error': j.error or ''} for j in release.jobs.order_by('created_at')],
+              'submissions': {s.platform: {'state': s.state, 'external_id': s.external_id or ''} for s in Submission.objects.filter(app=app, release=release)},
+              'source_branch': release.source_branch,
+              'release_notes': release.release_notes,
+          }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+          cat status/a-bau-2.2.2-release.json
+
+      - name: Commit release receipt
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-2.2.2-release.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau 2.2.2 store resubmission'
+          git push origin HEAD:main

@@ -122,3 +122,5 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
           fi
+
+# Manual retrigger after Publisher production confirmed healthy and push credentials were configured.

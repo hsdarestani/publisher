@@ -1,0 +1,61 @@
+name: Probe A+Bau 2.2.2 live release state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-2-2-2-live-probe.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Read live Publisher state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          mkdir -p status
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-2.2.2-live.json <<'PY'
+          import json, os, django
+          from django.utils import timezone
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-bau')
+          release=Release.objects.filter(app=app,version_name='2.2.2',build_number=22003).first()
+          out={'checked_at':timezone.now().isoformat(),'release_exists':bool(release)}
+          if release:
+              out['release_status']=release.status
+              out['builds']={b.platform:{'status':b.status,'external_build_id':b.external_build_id or ''} for b in release.builds.all()}
+              out['jobs']=[{'type':j.type,'status':j.status,'error':j.error or ''} for j in release.jobs.order_by('created_at')]
+              out['submissions']={s.platform:{'state':s.state,'external_id':s.external_id or ''} for s in Submission.objects.filter(app=app,release=release)}
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+          cat status/a-bau-2.2.2-live.json
+      - name: Commit live state
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-2.2.2-live.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau 2.2.2 live release state'
+          git push origin HEAD:main

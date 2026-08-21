@@ -104,13 +104,13 @@ jobs:
           print('reviewer_login=verified')
           PY
 
-      - name: Dispatch Build 5 resubmission
+      - name: Dispatch current A+ Solution store release
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'aplus-solution-ios-build5-final.yml',
+              workflow_id: 'aplus-solution-current-release.yml',
               ref: 'main'
             });

@@ -31,6 +31,26 @@ jobs:
           sudo apt-get update -qq >/dev/null
           sudo apt-get install -y -qq sshpass >/dev/null
 
+      - name: Wait for length-safe A+Bau Publisher command
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          for attempt in $(seq 1 90); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_safe >/dev/null 2>&1"; then
+              echo 'bootstrap_a_bau_safe=deployed'
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Length-safe A+Bau bootstrap did not deploy in time.' >&2
+          exit 2
+
       - name: Queue fresh Publisher builds from current A+Bau main
         env:
           HOST: ${{ secrets.HOST }}
@@ -43,7 +63,7 @@ jobs:
           PORT="${SSH_PORT:-22}"
           export SSHPASS="$PASS"
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version 2.2.2 --build-number 22003 --queue"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22003 --queue"
 
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
@@ -83,11 +103,9 @@ jobs:
           success=0
           for attempt in $(seq 1 90); do
             echo "=== Publisher pass $attempt ==="
-            OUTPUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau --app-version 2.2.2 --build-number 22003 --queue --publish")"
+            OUTPUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22003 --queue --publish")"
             printf '%s\n' "$OUTPUT"
 
-            # bootstrap_a_bau rewrites the default localization on every pass; keep
-            # the App Review-facing note pinned to the startup fix.
             "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -c \"import os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.2',build_number=22003); n='Startproblem beim Öffnen der App behoben. A+Bau lädt jetzt zuverlässig auf iPhone und iPad; zusätzlich sind die neuesten Baustellen- und Kundenfunktionen enthalten.'; r.release_notes=n; r.save(update_fields=['release_notes','updated_at']); a.localizations.filter(locale='de-DE').update(release_notes=n)\""
 
             if printf '%s\n' "$OUTPUT" | grep -q 'job=upload_google:succeeded' && \

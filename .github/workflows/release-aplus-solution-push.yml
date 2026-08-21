@@ -56,16 +56,16 @@ jobs:
             sleep 5
           done
 
-          PROVISION="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_aplus_solution_push --apply" 2>&1 || true)"
+          PROVISION="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_aplus_solution_push --apply --apple-only" 2>&1 || true)"
           printf '%s\n' "$PROVISION"
 
-          INITIAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --queue --publish" 2>&1 || true)"
+          INITIAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --app-version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --queue --publish" 2>&1 || true)"
           printf '%s\n' "$INITIAL"
           FINAL="$INITIAL"
           RESULT=running
 
           for i in $(seq 1 90); do
-            if printf '%s' "$FINAL" | grep -q 'submission_android=in_review' && printf '%s' "$FINAL" | grep -q 'submission_ios=in_review'; then
+            if printf '%s' "$FINAL" | grep -Eq 'submission_android=(in_review|submitted|live|published)' && printf '%s' "$FINAL" | grep -Eq 'submission_ios=(in_review|submitted|live|published)'; then
               RESULT=submitted
               break
             fi
@@ -74,7 +74,7 @@ jobs:
               break
             fi
             sleep 30
-            FINAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --publish" 2>&1 || true)"
+            FINAL="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py release_aplus_solution_push --app-version 1.0.2 --build-number 8 --source-commit 168716ecb75b984f30f00ce831d939327d913eb7 --publish" 2>&1 || true)"
             printf '%s\n' "$FINAL"
           done
 
@@ -91,6 +91,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Publish release status issue
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ steps.release.outputs.result }}
@@ -101,16 +102,16 @@ jobs:
           TITLE='A+ Solution 1.0.2 native push release'
           BODY_FILE="$(mktemp)"
           {
-            echo "Result: **$RESULT**"
+            echo "Result: **${RESULT:-unknown}**"
             echo
             echo 'Provider provisioning:'
             echo '```text'
-            printf '%s\n' "$PROVISION"
+            printf '%s\n' "${PROVISION:-no output}"
             echo '```'
             echo
             echo 'Latest Publisher status:'
             echo '```text'
-            printf '%s\n' "$FINAL"
+            printf '%s\n' "${FINAL:-no output}"
             echo '```'
             echo
             echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -122,5 +123,3 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
           fi
-
-# Manual retrigger after Publisher production confirmed healthy and push credentials were configured.

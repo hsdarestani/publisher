@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   validate:
@@ -41,6 +42,7 @@ jobs:
     environment: production
     steps:
       - name: Probe Publisher production without exposing credentials
+        id: probe
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -56,5 +58,37 @@ jobs:
             fi
             sleep 5
           done
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py diagnose_aplus_solution_push --probe-firebase"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py diagnose_aplus_solution_push --probe-firebase")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish safe readiness report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.probe.outputs.output }}
+        run: |
+          set -euo pipefail
+          TITLE='A+ Solution native push readiness'
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'Automated non-secret native push readiness report.'
+            echo
+            echo '```text'
+            printf '%s\n' "$REPORT"
+            echo '```'
+            echo
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          NUMBER="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "A+ Solution native push readiness") | .number' | head -n1)"
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"
+            gh issue reopen "$NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
+          fi

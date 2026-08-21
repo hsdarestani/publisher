@@ -37,6 +37,21 @@ jobs:
     environment: production
     timeout-minutes: 55
     steps:
+      - name: Publish watcher start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE='A+ Solution 1.0.2 native push release'
+          BODY="Result: **watching**\n\nAndroid and iOS build 8 are queued; upload/submit watcher is running.\n\nRun: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          NUMBER="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "$TITLE in:title" --json number,title --jq '.[] | select(.title == "A+ Solution 1.0.2 native push release") | .number' | head -n1)"
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            gh issue reopen "$NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi
+
       - name: Build, upload and submit A+ Solution 1.0.2
         id: release
         env:

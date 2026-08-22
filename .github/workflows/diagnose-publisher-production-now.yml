@@ -1,0 +1,53 @@
+name: Diagnose Publisher production now
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-publisher-production-now.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read production container status and logs
+        id: diag
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && echo '=== PS ===' && docker compose ps && echo '=== WEB ===' && docker compose logs --tail=160 web && echo '=== WORKER ===' && docker compose logs --tail=120 worker" 2>&1 || true)"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.diag.outputs.output }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo '### Publisher production diagnostic'
+            echo
+            echo '```text'
+            printf '%s\n' "$OUTPUT" | tail -n 260
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 2 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

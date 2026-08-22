@@ -1,0 +1,51 @@
+name: Diagnose Smarbiz Source
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/smarbiz-source-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Read non-secret Smarbiz source config
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='smarbiz')
+          print('repository_url=' + app.repository_url)
+          print('default_branch=' + app.default_branch)
+          print('latest_commit_sha=' + app.latest_commit_sha)
+          print('bundle_id=' + app.bundle_id)
+          print('package_name=' + app.package_name)
+          print('build_config=' + json.dumps(app.build_config, sort_keys=True))
+          for rel in app.releases.order_by('-created_at')[:5]:
+              print('release=' + json.dumps({
+                  'version': rel.version_name,
+                  'build_number': rel.build_number,
+                  'status': rel.status,
+                  'source_branch': rel.source_branch,
+                  'source_commit': rel.source_commit,
+              }, sort_keys=True))
+          PY

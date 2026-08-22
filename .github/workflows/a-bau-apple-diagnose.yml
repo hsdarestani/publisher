@@ -9,7 +9,7 @@ on:
       - 'apps/signing/management/commands/diagnose_a_bau_apple.py'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   diagnose:
@@ -17,6 +17,10 @@ jobs:
     environment: production
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Wait for diagnostic command in Publisher production
         env:
           HOST: ${{ secrets.HOST }}
@@ -43,5 +47,18 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
+          mkdir -p status
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py diagnose_a_bau_apple"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py diagnose_a_bau_apple" \
+            | tee status/a-bau-apple-diagnose.txt
+
+      - name: Commit diagnostic snapshot
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Diagnostic Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-apple-diagnose.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau Apple review diagnosis'
+          git push origin HEAD:main

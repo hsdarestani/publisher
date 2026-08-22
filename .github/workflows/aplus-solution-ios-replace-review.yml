@@ -1,0 +1,140 @@
+name: Replace A+ Solution iOS review with 1.0.2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-ios-replace-review.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  replace-review:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Cancel 1.0.1 review and submit 1.0.2
+        id: replace
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          SCRIPT_B64="$(base64 -w0 <<'PY'
+          import time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Release, Job
+          from apps.publisher.tasks import run_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          release = Release.objects.get(app=app, version_name='1.0.2', build_number=8)
+          build = release.builds.get(platform='ios')
+          if build.status != 'succeeded' or not build.external_build_id:
+              raise RuntimeError(f'iOS build is not ready: status={build.status} external_id={build.external_build_id!r}')
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          app_id = record['id']
+
+          versions = client.list_versions(app_id)
+          old = next((v for v in versions if v.get('attributes', {}).get('versionString') == '1.0.1'), None)
+          exact = next((v for v in versions if v.get('attributes', {}).get('versionString') == '1.0.2'), None)
+          print(f'app_id={app_id}')
+          print(f'build_external_id={build.external_build_id}')
+          print(f'old_version_id={old["id"] if old else "missing"}')
+          print(f'exact_1_0_2={exact["id"] if exact else "missing"}')
+
+          cancelled = []
+          if old:
+              for submission in client.list_review_submissions(app_id, 'WAITING_FOR_REVIEW'):
+                  item, _ = client._review_submission_matches(submission, old['id'])
+                  if item:
+                      result = client.cancel_review_submission(submission['id'])
+                      cancelled.append(submission['id'])
+                      print(f'cancelled_submission={submission["id"]} state={result.get("attributes", {}).get("state")}')
+
+          if not exact and old:
+              deadline = time.time() + 180
+              while time.time() < deadline:
+                  current = next(
+                      (v for v in client.list_versions(app_id) if v['id'] == old['id']),
+                      None,
+                  )
+                  state = (current or {}).get('attributes', {}).get('appStoreState') or (current or {}).get('attributes', {}).get('appVersionState')
+                  print(f'old_version_state={state}')
+                  if state in {'PREPARE_FOR_SUBMISSION', 'READY_FOR_REVIEW', 'DEVELOPER_REJECTED', 'METADATA_REJECTED', 'REJECTED'}:
+                      break
+                  time.sleep(10)
+
+          version = client.ensure_version(app_id, '1.0.2')
+          print(f'target_version_id={version["id"]}')
+          print(f'target_version_string={version.get("attributes", {}).get("versionString")}')
+          print(f'target_version_state={version.get("attributes", {}).get("appStoreState") or version.get("attributes", {}).get("appVersionState")}')
+
+          # Remove only stale queued/running submit jobs for this exact release. The
+          # new synchronous job below is the single source of truth for this retry.
+          Job.objects.filter(
+              app=app,
+              release=release,
+              type='submit_apple',
+              status__in=['queued', 'running'],
+          ).update(status='cancelled', finished_at=timezone.now(), error='Superseded by 1.0.2 review replacement workflow.')
+
+          job = Job.objects.create(
+              type='submit_apple',
+              app=app,
+              release=release,
+              build=build,
+              payload={'source': 'aplus-solution-ios-replace-review'},
+              available_to_agents=False,
+          )
+          run_job.apply(args=[job.pk]).get()
+          job.refresh_from_db()
+          print(f'submit_job={job.pk}')
+          print(f'submit_status={job.status}')
+          if job.error:
+              print(f'submit_error={job.error}')
+          if job.status != 'succeeded':
+              raise RuntimeError(job.error or f'submit_apple ended as {job.status}')
+
+          submission = release.submissions.filter(platform='ios').order_by('-updated_at').first()
+          print(f'submission_state={submission.state if submission else "missing"}')
+          print(f'submission_external_id={submission.external_id if submission else "missing"}')
+          print(f'cancelled_count={len(cancelled)}')
+          PY
+          )"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$SCRIPT_B64' | base64 -d | docker compose exec -T web python manage.py shell")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.replace.outputs.output }}
+        run: |
+          set -euo pipefail
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'Result: **iOS 1.0.2 review replacement**'
+            echo
+            echo '```text'
+            printf '%s\n' "${OUTPUT:-workflow failed before output capture}"
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

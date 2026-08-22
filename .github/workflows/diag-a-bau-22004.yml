@@ -1,0 +1,53 @@
+name: Diagnose A+Bau 22004 store state
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: ${{ github.event.pull_request.user.login == 'hsdarestani' && github.event.pull_request.title == '[diag] A+Bau 22004 store state' && github.head_ref == 'diag/a-bau-22004' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe Publisher production and App Store Connect
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T web python - <<'PY'
+            import os, django
+            os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+            django.setup()
+            from apps.publisher.models import MobileApp, Release, Submission
+            from apps.integrations.apple_store import AppleStoreClient
+            app=MobileApp.objects.get(slug='a-bau')
+            rel=Release.objects.filter(app=app,version_name='2.2.2',build_number=22004).first()
+            print('RELEASE_EXISTS', bool(rel))
+            if rel:
+                print('RELEASE', rel.status, rel.version_name, rel.build_number)
+                for b in rel.builds.order_by('platform'):
+                    print('BUILD', b.platform, b.status, b.external_build_id or '-')
+                for j in rel.jobs.order_by('created_at'):
+                    print('JOB', j.type, j.status, (j.error or '')[:500].replace('\n',' '))
+                for s in Submission.objects.filter(app=app,release=rel):
+                    print('SUBMISSION', s.platform, s.state, s.external_id or '-')
+            c=AppleStoreClient(app.apple_account)
+            aa=c.find_app(app.bundle_id)
+            v=c.find_editable_version(aa['id'],'2.2.2')
+            print('APPLE_VERSION', v['id'] if v else '-', ((v or {}).get('attributes',{}).get('appStoreState') or (v or {}).get('attributes',{}).get('appVersionState') or '-'))
+            for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','REJECTED'):
+                try:
+                    vals=c.list_review_submissions(aa['id'],state)
+                    print('APPLE_REVIEW',state,len(vals),','.join(x.get('id','') for x in vals))
+                except Exception as exc:
+                    print('APPLE_REVIEW_ERROR',state,type(exc).__name__,str(exc)[:500])
+            PY

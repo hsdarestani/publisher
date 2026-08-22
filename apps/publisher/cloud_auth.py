@@ -18,7 +18,10 @@ _GITHUB_JWKS = PyJWKClient(f"{_GITHUB_OIDC_ISSUER}/.well-known/jwks")
 _AGENT_CONFIG = {
     "macos": {
         "name": "A+ Cloud Mac · GitHub Actions",
-        "workflows": [".github/workflows/cloud-macos.yml@"],
+        "workflows": [
+            ".github/workflows/cloud-macos.yml@",
+            ".github/workflows/run-aplus-ios-rebuild-agent.yml@",
+        ],
         "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},
     },

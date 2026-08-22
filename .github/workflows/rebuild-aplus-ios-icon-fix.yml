@@ -1,0 +1,57 @@
+name: Rebuild A+ Solution iOS after icon fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rebuild-aplus-ios-icon-fix.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  queue-ios-rebuild:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Reset only iOS build and queue fixed source
+        id: queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          SOURCE_COMMIT='9aac72aea0c1afce8a70a3d7d86bf9d1ed71aa59'
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from django.utils import timezone; from apps.publisher.models import MobileApp,Release,Build,Job; from apps.publisher.github_actions import wake_cloud_agent; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name='1.0.2',build_number=8); r.source_commit='$SOURCE_COMMIT'; r.status='building'; r.save(update_fields=['source_commit','status','updated_at']); b=Build.objects.get(release=r,platform='ios'); b.artifact.delete(save=False) if b.artifact else None; b.status='queued'; b.artifact=''; b.external_build_id=''; b.logs=''; b.save(update_fields=['status','artifact','external_build_id','logs','updated_at']); Job.objects.filter(release=r,type__in=['build_ios','upload_apple','submit_apple'],status__in=['queued','running']).update(status='failed',finished_at=timezone.now(),error='Superseded by opaque AppIcon rebuild'); j=Job.objects.create(type='build_ios',app=a,release=r,build=b,payload={'source':'opaque-appicon-fix'},available_to_agents=True,required_platform='macos'); print('source_commit=',r.source_commit); print('ios_build=',b.status,'job=',j.pk); print('mac_wake=',wake_cloud_agent('macos'))\"")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update release issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.queue.outputs.output }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'Result: **iOS rebuild queued after AppIcon alpha fix**'
+            echo
+            echo 'Android remains untouched and in Google Play review.'
+            echo
+            echo '```text'
+            printf '%s\n' "$OUTPUT"
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

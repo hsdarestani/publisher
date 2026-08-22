@@ -116,3 +116,4 @@ jobs:
         run: exit 1
 
 # Manual wake 2026-08-22 for A+ Solution iOS upload.
+# Wake opaque AppIcon rebuild job 499.

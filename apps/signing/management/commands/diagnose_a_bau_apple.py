@@ -9,7 +9,7 @@ from apps.publisher.models import MobileApp
 
 
 APP_SLUG = "a-bau"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.2"
 
 
 class Command(BaseCommand):
@@ -27,7 +27,7 @@ class Command(BaseCommand):
             self.stdout.write(f"{label}=ERROR {error}")
             return None
         compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self.stdout.write(f"{label}={compact[:12000]}")
+        self.stdout.write(f"{label}={compact[:20000]}")
         return payload
 
     def handle(self, *args, **options):
@@ -45,7 +45,7 @@ class Command(BaseCommand):
         self._print_call(
             client,
             "app_store_version",
-            f"/apps/{apple_id}/appStoreVersions?filter[versionString]={APP_VERSION}&limit=10",
+            f"/apps/{apple_id}/appStoreVersions?filter[versionString]={APP_VERSION}&include=build&limit=10",
         )
 
         probes = [
@@ -58,28 +58,38 @@ class Command(BaseCommand):
         for label, path in probes:
             self._print_call(client, label, path)
 
-        ready = []
-        for state in ("READY_FOR_REVIEW", "WAITING_FOR_REVIEW", "IN_REVIEW"):
+        submissions = []
+        for state in (
+            "READY_FOR_REVIEW",
+            "WAITING_FOR_REVIEW",
+            "IN_REVIEW",
+            "UNRESOLVED_ISSUES",
+            "CANCELING",
+            "COMPLETING",
+            "COMPLETE",
+        ):
             payload = self._print_call(
                 client,
                 f"review_submissions_{state.lower()}",
                 f"/apps/{apple_id}/reviewSubmissions?filter[state]={state}&limit=200",
             )
-            if state == "READY_FOR_REVIEW" and payload:
-                ready = payload.get("data", [])
+            if payload:
+                submissions.extend(payload.get("data", []))
 
-        for submission in ready:
+        seen = set()
+        for submission in submissions:
             submission_id = submission.get("id")
-            if not submission_id:
+            if not submission_id or submission_id in seen:
                 continue
+            seen.add(submission_id)
             self._print_call(
                 client,
                 f"review_submission_items_{submission_id}",
-                f"/reviewSubmissions/{submission_id}/items?include=appStoreVersion&limit=200",
+                f"/reviewSubmissions/{submission_id}/items?fields[reviewSubmissionItems]=state,appStoreVersion&include=appStoreVersion&limit=200",
             )
 
         self._print_call(
             client,
             "review_submissions_all",
-            f"/apps/{apple_id}/reviewSubmissions?limit=200",
+            f"/apps/{apple_id}/reviewSubmissions?include=items&limit=200",
         )

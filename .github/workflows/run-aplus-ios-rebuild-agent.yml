@@ -1,0 +1,58 @@
+name: Run A+ Solution iOS rebuild agent
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/run-aplus-ios-rebuild-agent.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+jobs:
+  macos-agent:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+      - name: Wait for Publisher health
+        run: |
+          curl --fail --silent --show-error --retry 18 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 https://publisher.smarbiz.sbs/healthz/
+      - name: Build and upload queued A+ Solution iOS work
+        id: agent
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '3'
+        run: |
+          set -o pipefail
+          python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/aplus-ios-agent.log
+      - name: Publish one-shot result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'Result: **one-shot macOS agent completed**'
+            echo
+            echo '```text'
+            tail -n 200 /tmp/aplus-ios-agent.log 2>/dev/null || true
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

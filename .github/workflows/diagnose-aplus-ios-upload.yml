@@ -1,0 +1,54 @@
+name: Diagnose A+ Solution iOS upload
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-aplus-ios-upload.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read latest Apple upload jobs from Publisher
+        id: diag
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp,Release,Job; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name='1.0.2',build_number=8); qs=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at')[:5]; [print('---JOB---',j.pk,j.status,'error=',j.error,'\\nLOGS\\n', (j.logs or '')[-12000:]) for j in qs]\"")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.diag.outputs.output }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'A+ Solution iOS upload diagnostic'
+            echo
+            echo '```text'
+            printf '%s\n' "$OUTPUT"
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

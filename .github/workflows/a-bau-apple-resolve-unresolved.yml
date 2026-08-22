@@ -1,0 +1,143 @@
+name: Resolve rejected A+Bau item and resubmit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-apple-resolve-unresolved.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  resubmit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Apple unresolved issue and resubmit build 22004
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          export SSHPASS="$PASS"
+          mkdir -p status
+          for i in $(seq 1 60); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python -c 'import django'" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" \
+            | tee status/a-bau-apple-resubmit.txt <<'PY'
+          import json, os, time, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Release, Submission
+          from django.utils import timezone
+
+          APP_VERSION='2.2.2'
+          BUILD_NUMBER=22004
+          app=MobileApp.objects.select_related('apple_account').get(slug='a-bau')
+          rel=Release.objects.get(app=app, version_name=APP_VERSION, build_number=BUILD_NUMBER)
+          build=rel.builds.filter(platform='ios', status='succeeded').order_by('-updated_at').first()
+          if not build or not build.external_build_id:
+              raise SystemExit('ERROR no processed iOS build id for 22004')
+
+          c=AppleStoreClient(app.apple_account)
+          aa=c.find_app(app.bundle_id)
+          app_id=aa['id']
+          version=c.find_editable_version(app_id, APP_VERSION)
+          if not version:
+              raise SystemExit('ERROR App Store version 2.2.2 not found')
+          version_id=version['id']
+          print('APP', app_id)
+          print('VERSION', version_id, version.get('attributes',{}).get('appStoreState') or version.get('attributes',{}).get('appVersionState'))
+          print('BUILD', build.external_build_id)
+
+          # Keep the corrected binary attached before resolving the rejected review item.
+          c.attach_build(version_id, build.external_build_id)
+
+          unresolved=c.list_review_submissions(app_id, 'UNRESOLVED_ISSUES')
+          print('UNRESOLVED_COUNT', len(unresolved))
+          selected=None
+          selected_item=None
+          for sub in unresolved:
+              items=c.list_review_submission_items(sub['id'])
+              print('UNRESOLVED', sub['id'], json.dumps(items, separators=(',',':')))
+              for item in items:
+                  reln=item.get('relationships',{}).get('appStoreVersion',{}).get('data')
+                  if reln and str(reln.get('id')) == str(version_id):
+                      selected=sub
+                      selected_item=item
+                      break
+              if selected:
+                  break
+
+          if selected:
+              item_state=selected_item.get('attributes',{}).get('state')
+              print('TARGET_UNRESOLVED', selected['id'], selected_item['id'], item_state)
+              if item_state == 'REJECTED':
+                  body={'data':{'type':'reviewSubmissionItems','id':selected_item['id'],'attributes':{'resolved':True}}}
+                  updated=c.request('PATCH', f"/reviewSubmissionItems/{selected_item['id']}", data=json.dumps(body))['data']
+                  print('ITEM_RESOLVED', updated['id'], updated.get('attributes',{}).get('state'))
+              elif item_state not in {'READY_FOR_REVIEW','ACCEPTED','APPROVED'}:
+                  print('ITEM_STATE_BEFORE_RESUBMIT', item_state)
+
+              submit_body={'data':{'type':'reviewSubmissions','id':selected['id'],'attributes':{'submitted':True}}}
+              final=c.request('PATCH', f"/reviewSubmissions/{selected['id']}", data=json.dumps(submit_body))['data']
+              print('RESUBMIT_RESPONSE', selected['id'], final.get('attributes',{}).get('state'))
+              submission_id=selected['id']
+          else:
+              # If Apple has already moved the rejected submission out of unresolved state,
+              # use the normal idempotent submit path rather than creating another slot.
+              result=c.submit_version(app_id, version_id)
+              submission_id=result['submission']['id']
+              print('NORMAL_SUBMIT', submission_id, result['submission'].get('attributes',{}).get('state'))
+
+          state='UNKNOWN'
+          for _ in range(30):
+              data=c.request('GET', f'/reviewSubmissions/{submission_id}')['data']
+              state=data.get('attributes',{}).get('state','UNKNOWN')
+              print('POLL', state)
+              if state in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
+                  break
+              time.sleep(2)
+
+          if state not in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
+              raise SystemExit(f'ERROR submission did not enter review queue; state={state}')
+
+          Submission.objects.update_or_create(
+              app=app, release=rel, platform='ios',
+              defaults={'state':'in_review','external_id':submission_id,'submitted_at':timezone.now(),'raw':{'apple_state':state,'resolved_unresolved_issue':True}},
+          )
+          rel.status='in_review'
+          rel.save(update_fields=['status','updated_at'])
+          print('SUCCESS', state, submission_id)
+          PY
+
+      - name: Commit Apple resubmission receipt
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-apple-resubmit.txt || true
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau Apple resubmission result'
+          git push origin HEAD:main

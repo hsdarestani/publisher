@@ -114,3 +114,5 @@ jobs:
       - name: Enforce cloud Mac result
         if: steps.cloud.outcome == 'failure'
         run: exit 1
+
+# Manual wake 2026-08-22 for A+ Solution iOS upload.

@@ -41,8 +41,7 @@ jobs:
             sleep 5
           done
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python -" \
-            | tee status/a-bau-apple-resubmit.txt <<'PY'
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY' | tee status/a-bau-apple-resubmit.txt
           import json, os, time, django
           os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
           django.setup()
@@ -69,7 +68,6 @@ jobs:
           print('VERSION', version_id, version.get('attributes',{}).get('appStoreState') or version.get('attributes',{}).get('appVersionState'))
           print('BUILD', build.external_build_id)
 
-          # Keep the corrected binary attached before resolving the rejected review item.
           c.attach_build(version_id, build.external_build_id)
 
           unresolved=c.list_review_submissions(app_id, 'UNRESOLVED_ISSUES')
@@ -103,8 +101,6 @@ jobs:
               print('RESUBMIT_RESPONSE', selected['id'], final.get('attributes',{}).get('state'))
               submission_id=selected['id']
           else:
-              # If Apple has already moved the rejected submission out of unresolved state,
-              # use the normal idempotent submit path rather than creating another slot.
               result=c.submit_version(app_id, version_id)
               submission_id=result['submission']['id']
               print('NORMAL_SUBMIT', submission_id, result['submission'].get('attributes',{}).get('state'))

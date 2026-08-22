@@ -1,0 +1,10 @@
+31 objects imported automatically (use -v 2 for details).
+
+repository_url=https://github.com/hsdarestani/BrandFlowAI
+default_branch=main
+latest_commit_sha=87ed4734446f85480424c75fa27d72e45daffa0e
+bundle_id=de.aplussolution.smarbiz
+package_name=de.aplussolution.smarbiz
+build_config={"android_artifact": "apps/mobile/artifacts/smarbiz-release.aab", "android_command": "bash apps/mobile/scripts/build-android.sh", "env": {"REQUIRE_ANDROID_SIGNING": "1"}, "ios_artifact": "apps/mobile/artifacts/smarbiz.ipa", "ios_command": "bash apps/mobile/scripts/build-ios.sh"}
+release={"build_number": 2, "source_branch": "main", "source_commit": "", "status": "in_review", "version": "1.0.0"}
+release={"build_number": 1, "source_branch": "main", "source_commit": "", "status": "uploaded", "version": "1.0.0"}

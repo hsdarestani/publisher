@@ -1,0 +1,43 @@
+name: Record Smarbiz iPad Resubmit Status
+
+on:
+  workflow_run:
+    workflows: ["Resubmit Smarbiz After iPad Guideline 4 Fix"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Persist workflow result
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p status
+          cat > status/smarbiz-ipad-resubmit.json <<EOF
+          {
+            "status": "$CONCLUSION",
+            "run_id": $RUN_ID,
+            "run_number": $RUN_NUMBER,
+            "head_sha": "$HEAD_SHA",
+            "run_url": "$RUN_URL"
+          }
+          EOF
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add status/smarbiz-ipad-resubmit.json
+          git diff --cached --quiet && exit 0
+          git commit -m "record Smarbiz iPad resubmit status"
+          git push

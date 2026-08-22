@@ -1,0 +1,153 @@
+name: Resubmit A+Bau iOS 2.2.2 build 22004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-2-2-2-build-22004-resubmit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: a-bau-ios-222-22004-resubmit
+  cancel-in-progress: false
+
+jobs:
+  resubmit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install SSH helper
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 60); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_safe >/dev/null 2>&1"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 2
+
+      - name: Queue fresh A+Bau 2.2.2 build 22004
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22004 --queue"
+
+      - name: Wake build agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Advance Apple submission until accepted by App Store Connect
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          ok=0
+          for n in $(seq 1 120); do
+            echo "=== publish pass $n ==="
+            OUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22004 --publish" || true)"
+            printf '%s\n' "$OUT"
+            if printf '%s\n' "$OUT" | grep -q 'job=submit_apple:succeeded'; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+          test "$ok" = "1"
+
+      - name: Verify Apple state and record receipt
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          mkdir -p status
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-2.2.2-build-22004-apple.json <<'PY'
+          import json, os, django
+          from django.utils import timezone
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          app = MobileApp.objects.get(slug='a-bau')
+          rel = Release.objects.get(app=app, version_name='2.2.2', build_number=22004)
+          client = AppleStoreClient(app.apple_account)
+          apple_app = client.find_app(app.bundle_id)
+          version = client.find_editable_version(apple_app['id'], '2.2.2')
+          version_state = None
+          version_id = None
+          if version:
+              version_id = version['id']
+              attrs = version.get('attributes', {})
+              version_state = attrs.get('appStoreState') or attrs.get('appVersionState')
+          review_states = {}
+          for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','REJECTED'):
+              try:
+                  review_states[state] = [x.get('id') for x in client.list_review_submissions(apple_app['id'], state)]
+              except Exception as exc:
+                  review_states[state] = [f'ERROR:{type(exc).__name__}:{exc}']
+          out = {
+              'checked_at': timezone.now().isoformat(),
+              'release': {'version': rel.version_name, 'build': rel.build_number, 'status': rel.status},
+              'builds': {b.platform: {'status': b.status, 'external_build_id': b.external_build_id or ''} for b in rel.builds.all()},
+              'jobs': [{'type': j.type, 'status': j.status, 'error': j.error or ''} for j in rel.jobs.order_by('created_at')],
+              'submissions': {s.platform: {'state': s.state, 'external_id': s.external_id or ''} for s in Submission.objects.filter(app=app, release=rel)},
+              'apple_version_id': version_id,
+              'apple_version_state': version_state,
+              'apple_review_submissions': review_states,
+          }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+          cat status/a-bau-2.2.2-build-22004-apple.json
+
+      - name: Commit receipt
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-2.2.2-build-22004-apple.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau 2.2.2 build 22004 Apple resubmission'
+          git push origin HEAD:main

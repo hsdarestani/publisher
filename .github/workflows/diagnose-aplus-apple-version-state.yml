@@ -1,0 +1,54 @@
+name: Diagnose A+ Solution Apple version state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-aplus-apple-version-state.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Inspect App Store versions and review submissions
+        id: diag
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import MobileApp; from apps.integrations.apple_store import AppleStoreClient; a=MobileApp.objects.get(slug='a-plus-solution'); c=AppleStoreClient(a.apple_account); app=c.find_app(a.bundle_id); print('APP',app['id'],app.get('attributes',{})); versions=c.list_versions(app['id'],limit=50); [print('VERSION',v['id'],v.get('attributes',{})) for v in versions]; states=['READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES','COMPLETE']; [print('SUBMISSION',s,c.list_review_submissions(app['id'],s)) for s in states]\"")"
+          printf '%s\n' "$OUTPUT"
+          {
+            echo 'output<<EOF'
+            printf '%s\n' "$OUTPUT"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUT: ${{ steps.diag.outputs.output }}
+        run: |
+          BODY_FILE="$(mktemp)"
+          {
+            echo 'A+ Solution App Store version-state diagnostic'
+            echo
+            echo '```text'
+            printf '%s\n' "$OUTPUT"
+            echo '```'
+            echo
+            echo "Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$BODY_FILE"
+          gh issue edit 79 --repo "$GITHUB_REPOSITORY" --body-file "$BODY_FILE"

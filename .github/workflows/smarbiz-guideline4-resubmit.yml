@@ -1,4 +1,4 @@
-name: Resubmit Smarbiz After Guideline 4 Fix
+name: Resubmit Smarbiz After iPad Guideline 4 Fix
 
 on:
   workflow_dispatch:
@@ -9,19 +9,60 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   resubmit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment: production
     steps:
+      - name: Wait until the iPad layout fix is live
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIVE=0
+          for attempt in $(seq 1 60); do
+            echo "production_preflight_attempt=$attempt"
+            HTML=$(curl --fail --silent --show-error --max-time 20 \
+              --resolve smarbiz.sbs:443:91.107.157.75 \
+              https://smarbiz.sbs/de/onboarding || true)
+            if [ -n "$HTML" ]; then
+              mapfile -t CSS_PATHS < <(printf '%s' "$HTML" | grep -oE '/_next/static/css/[^"? ]+\.css' | sort -u)
+              COMPILED=''
+              for path in "${CSS_PATHS[@]:-}"; do
+                [ -n "$path" ] || continue
+                COMPILED+="$(curl --fail --silent --show-error --max-time 20 \
+                  --resolve smarbiz.sbs:443:91.107.157.75 \
+                  "https://smarbiz.sbs$path" || true)"
+              done
+              MINIFIED=$(printf '%s' "$COMPILED" | tr -d '[:space:]')
+              HAS_IPAD_BREAKPOINT=0
+              HAS_16PX_FIELDS=0
+              HAS_HORIZONTAL_GUARD=0
+              printf '%s' "$MINIFIED" | grep -q '@media(max-width:1180px)' && HAS_IPAD_BREAKPOINT=1 || true
+              printf '%s' "$MINIFIED" | grep -q 'font-size:16px' && HAS_16PX_FIELDS=1 || true
+              printf '%s' "$MINIFIED" | grep -q 'overflow-x:hidden' && HAS_HORIZONTAL_GUARD=1 || true
+              echo "ipad_breakpoint=$HAS_IPAD_BREAKPOINT fields_16px=$HAS_16PX_FIELDS horizontal_guard=$HAS_HORIZONTAL_GUARD css_files=${#CSS_PATHS[@]}"
+              if [ "$HAS_IPAD_BREAKPOINT" = 1 ] && [ "$HAS_16PX_FIELDS" = 1 ] && [ "$HAS_HORIZONTAL_GUARD" = 1 ]; then
+                LIVE=1
+                break
+              fi
+            fi
+            sleep 15
+          done
+          test "$LIVE" = 1 || {
+            echo 'The new iPad responsive CSS is not live; refusing to resubmit.'
+            exit 1
+          }
+          echo 'SMARBIZ_IPAD_UI_FIX=LIVE'
+
       - name: Install SSH client
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Re-submit Smarbiz to App Store review
+      - name: Re-submit the original rejected App Store review
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -76,38 +117,34 @@ jobs:
           if detail:
               current_notes = (detail.get('attributes', {}).get('notes') or '').strip()
               fix_notes = (
-                  'Guideline 4 resubmission: The layout issue reported on iPhone 17 Pro Max running iOS 26.6 has been fixed. '
-                  'The onboarding interface now prevents iOS WebView auto-zoom with 16px form controls, uses device-width with viewport-fit=cover, '
-                  'respects iPhone safe-area insets and dynamic viewport height, keeps primary actions accessible, and prevents horizontal overflow. '
-                  'The corrected Smarbiz UI is deployed at https://smarbiz.sbs and is the UI loaded by this submitted build. '
-                  'Please retest the onboarding flow on the same review device.'
+                  'Guideline 4 iPad resubmission (Aug 22): The layout issue reported on iPad Air 11-inch (M3) running iPadOS 26.6 has been fixed. '
+                  'The previous iOS responsive hardening applied only to phone widths. It now covers common iPad widths through 1180 CSS px. '
+                  'Form controls render at 16px on iPad to prevent WebKit focus auto-zoom; the onboarding shell, header, conversation area and footer are constrained to the viewport; '
+                  'horizontal overflow is blocked; and the long German primary action can shrink/wrap without being clipped. '
+                  'The corrected hosted Smarbiz UI is live at https://smarbiz.sbs and is the interface loaded by this submitted Build 2. '
+                  'Please retest the onboarding flow on the same iPad Air 11-inch (M3) review device.'
               )
               notes = current_notes if fix_notes in current_notes else (current_notes + '\n\n' + fix_notes).strip()
-              body = {'data': {'type': 'appStoreReviewDetails', 'id': detail['id'], 'attributes': {'notes': notes}}}
+              body = {
+                  'data': {
+                      'type': 'appStoreReviewDetails',
+                      'id': detail['id'],
+                      'attributes': {'notes': notes},
+                  }
+              }
               client.request('PATCH', f"/appStoreReviewDetails/{detail['id']}", data=json.dumps(body))
               print('review_notes_updated=true')
 
           original = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
           if str(original.get('id')) != ORIGINAL_SUBMISSION_ID:
-              raise SystemExit('The rejected Smarbiz review submission could not be loaded.')
+              raise SystemExit('The original Smarbiz review submission could not be loaded.')
           original_state = original.get('attributes', {}).get('state')
           print('original_submission_state_before=' + str(original_state))
 
           items = client.list_review_submission_items(ORIGINAL_SUBMISSION_ID)
           item = next((i for i in items if client._item_targets_version(i, version_id)), None)
           if not item:
-              raise SystemExit(
-                  'The rejected submission does not contain Smarbiz version 1.0.0. items=' +
-                  json.dumps([
-                      {
-                          'id': i.get('id'),
-                          'state': i.get('attributes', {}).get('state'),
-                          'version_id': ((i.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}).get('id')),
-                      }
-                      for i in items
-                  ], sort_keys=True)
-              )
-
+              raise SystemExit('The original review submission no longer contains Smarbiz version 1.0.0.')
           item_state = item.get('attributes', {}).get('state')
           print('original_item_id=' + str(item['id']))
           print('original_item_state_before=' + str(item_state))
@@ -124,7 +161,11 @@ jobs:
                           'attributes': {'resolved': True},
                       }
                   }
-                  client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(resolve_body))
+                  client.request(
+                      'PATCH',
+                      f"/reviewSubmissionItems/{item['id']}",
+                      data=json.dumps(resolve_body),
+                  )
                   print('rejected_item_resolved=true')
                   time.sleep(2)
 
@@ -135,11 +176,15 @@ jobs:
                       'attributes': {'submitted': True},
                   }
               }
-              client.request('PATCH', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}', data=json.dumps(submit_body))
+              client.request(
+                  'PATCH',
+                  f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}',
+                  data=json.dumps(submit_body),
+              )
               print('original_submission_resubmitted=true')
 
               final_state = None
-              for attempt in range(12):
+              for attempt in range(15):
                   current = client.request('GET', f'/reviewSubmissions/{ORIGINAL_SUBMISSION_ID}').get('data') or {}
                   final_state = current.get('attributes', {}).get('state')
                   print(f'poll_{attempt + 1}_state=' + str(final_state))
@@ -151,7 +196,7 @@ jobs:
 
           attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
           if str(attached.get('id')) != str(build.external_build_id):
-              raise SystemExit(f"Wrong build attached: {attached.get('id')} != {build.external_build_id}")
+              raise SystemExit(f"Wrong build attached after resubmission: {attached.get('id')} != {build.external_build_id}")
 
           Submission.objects.update_or_create(
               app=app,
@@ -167,8 +212,10 @@ jobs:
                       'review_state': final_state,
                       'build_number': 2,
                       'apple_build_id': str(build.external_build_id),
-                      'guideline_4_layout_fix': True,
-                      'same_binary_web_ui_fix': True,
+                      'guideline_4_ipad_layout_fix': True,
+                      'review_device': 'iPad Air 11-inch (M3)',
+                      'review_os': 'iPadOS 26.6',
+                      'same_binary_hosted_ui_fix': True,
                       'resubmitted_original_review': True,
                   },
               },
@@ -179,5 +226,33 @@ jobs:
           print('attached_build=' + str(attached.get('id')))
           print('review_submission_id=' + ORIGINAL_SUBMISSION_ID)
           print('review_state=' + str(final_state))
-          print('SMARBIZ_APPLE_RESUBMIT=VERIFIED')
+          print('SMARBIZ_IPAD_APPLE_RESUBMIT=VERIFIED')
           PY
+
+      - name: Mark resubmission success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          curl --fail --silent --show-error -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+            -d '{"state":"success","context":"smarbiz/ipad-app-review","description":"iPad fix live; original review resubmitted"}' >/dev/null
+
+      - name: Mark resubmission failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          curl --silent --show-error -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+            -d '{"state":"failure","context":"smarbiz/ipad-app-review","description":"iPad fix/resubmission verification failed"}' >/dev/null || true

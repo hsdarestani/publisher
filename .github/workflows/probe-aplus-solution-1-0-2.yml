@@ -60,3 +60,5 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
           fi
+
+# Manual retrigger 2026-08-22 for final iOS upload/submit.

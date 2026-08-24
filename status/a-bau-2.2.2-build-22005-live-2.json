@@ -1,0 +1,23 @@
+{
+  "builds": {
+    "ios": {
+      "external_build_id": "",
+      "logs_tail": "OOLTIME INVOICES REGRESSION COMPAT 2026-08-21: exact ToolTime invoice list + legacy payment/dunning contracts reconciled.\nA+BAU TOOLTIME PROJECTS EXACT PARITY 2026-08-21: project list, modal creation, ToolTime sorting/paging, columns and row actions installed.\nA+BAU TOOLTIME APPOINTMENT SIDEBAR NAV FIX 2026-08-21: duplicate Kalender/Karte/Liste groups removed and one visible canonical submenu installed.\nKAYI TOOLTIME PROJECT DETAIL SAFE PARITY 2026-08-21: ToolTime project detail restored while B&O, Room Planner, finance and field hooks stay intact.\nA+BAU FINAL ROOM PLANNER + FIELD FLOW GUARD 2026-08-21: restored modern 3D routes in 1 rebuild template(s).\nA+BAU FINAL ROOM PLANNER + FIELD FLOW GUARD 2026-08-21: restored project-detail finance/row/B&O/field contracts.\nA+BAU FINAL ROOM PLANNER + FIELD FLOW GUARD 2026-08-21: Room Planner Pro, technician voice/KI/signature/PDF and regression coverage preserved.\nApp Store iPad scanner fallback installed: RoomPlan on LiDAR + manual native measurement on non-LiDAR iOS.\nA+Bau source tree assembled with ToolTime-parity commercial documents, German fiscal compliance, AI/3D advantages and stable operational UX.\nCollecting Pillow\n  Downloading pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl.metadata (9.1 kB)\nDownloading pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl (4.8 MB)\n   \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 4.8/4.8 MB 102.6 MB/s  0:00:00\nInstalling collected packages: Pillow\nSuccessfully installed Pillow-12.3.0\nA+Bau native store shell prepared: A+Bau branding + esbuild startup bundle configured.\nadded 97 packages in 5s\n> kayi-native-app@2.2.1 build\n> node scripts/build.mjs && esbuild www/app.js --bundle --format=esm --platform=browser --target=es2020 --outfile=www/app.bundle.js && rm www/app.js\nKAYI native web shell verified.\n  www/app.bundle.js  22.5kb\n\u26a1 Done in 6ms\n\u2714 Adding native Xcode project in ios in 23.47ms\n\u2714 add in 23.88ms\n\u2714 Copying web assets from www to ios/App/App/public in 3.68ms\n\u2714 Creating capacitor.config.json in ios/App/App in 357.71\u03bcs\n\u2714 copy ios in 12.86ms\n\u2714 Updating iOS plugins in 445.58\u03bcs\n[info] All Capacitor plugins have a Package.swift file and will be included in Package.swift\n[info] Writing Package.swift\n[info] Found 1 Capacitor plugin for ios:\n       @kayi/room-scanner@1.0.0\n\u2714 update ios in 12.97ms\n[success] ios platform added!\nFollow the Developer Workflow guide to get building:\nhttps://capacitorjs.com/docs/basics/workflow\n\u2714 Copying web assets from www to ios/App/App/public in 3.16ms",
+      "status": "running"
+    }
+  },
+  "checked_at": "2026-08-24T11:39:00.691548+00:00",
+  "jobs": [
+    {
+      "error": "",
+      "id": 705,
+      "status": "running",
+      "type": "build_ios",
+      "updated_at": "2026-08-24T11:39:00.613625+00:00"
+    }
+  ],
+  "release_exists": true,
+  "release_status": "building",
+  "review_notes": "A+Bau ist eine B2B-App f\u00fcr Handwerks- und Baubetriebe. Bitte die im App Review / App Access Feld hinterlegten Demo-Zugangsdaten verwenden. Wichtiger Hinweis f\u00fcr Guideline 2.1(a): Der Button 'Scannen' bleibt auf allen unterst\u00fctzten iPhone- und iPad-Ger\u00e4ten aktiv. Auf Ger\u00e4ten mit LiDAR wird Apple RoomPlan ge\u00f6ffnet. Auf Ger\u00e4ten ohne LiDAR, insbesondere iPad Air 11-inch (M3), \u00f6ffnet derselbe Button ein natives manuelles Raumaufma\u00df f\u00fcr L\u00e4nge, Breite und H\u00f6he. Dieses Aufma\u00df kann gespeichert und zum Projekt hochgeladen werden; ein USDZ-Modell ist im manuellen Modus nicht erforderlich. Testweg: anmelden \u2192 'Raum scannen' \u2192 beliebiges Demo-Projekt \u2192 'Scannen'. Kamera und Mikrofon werden nur nach einer aktiven Aktion angefragt. Optionale KI-Funktionen ben\u00f6tigen eine separate Einwilligung. Kontol\u00f6schung: https://kayi.smarbiz.sbs/konto-loeschen/ \u00b7 Datenschutz: https://kayi.smarbiz.sbs/datenschutz/ \u00b7 Support: https://kayi.smarbiz.sbs/support/.",
+  "submissions": {}
+}

@@ -1,0 +1,29 @@
+{
+  "builds": {
+    "ios": {
+      "external_build_id": "",
+      "logs_tail": "ld/Release-iphoneos/App.build/App.app.xcent --generate-entitlement-der /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app\nRegisterExecutionPolicyException /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app (in target 'App' from project 'App')\n    cd /var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/aplus-publisher-agent/job-705/repo/native/ios/App\n    builtin-RegisterExecutionPolicyException /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app\nValidate /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app (in target 'App' from project 'App')\n    cd /var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/aplus-publisher-agent/job-705/repo/native/ios/App\n    builtin-validationUtility /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app -validate-for-store -shallow-bundle -infoplist-subpath Info.plist\nTouch /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app (in target 'App' from project 'App')\n    cd /var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/aplus-publisher-agent/job-705/repo/native/ios/App\n    /usr/bin/touch -c /Users/runner/Library/Developer/Xcode/DerivedData/App-aqtqjdhwvwpnijgocliksklfgmgs/Build/Intermediates.noindex/ArchiveIntermediates/App/InstallationBuildProductsLocation/Applications/App.app\n** ARCHIVE SUCCEEDED **\n2026-08-24 11:41:20.328 xcodebuild[14771:42912] [MT] IDEDistribution: -[IDEDistributionLogging _createLoggingBundleAtPath:]: Created bundle at path \"/var/folders/df/djsxfhc17x95674wsm_g8s980000gn/T/App_2026-08-24_11-41-20.318.xcdistributionlogs\".\nExported App to: /Users/runner/work/_temp/a-bau-export\n** EXPORT SUCCEEDED **\nA+Bau iOS Publisher build ready: 2.2.2 (22005); bundled startup verified\nIPA ready: artifacts/a-bau.ipa",
+      "status": "succeeded"
+    }
+  },
+  "checked_at": "2026-08-24T11:44:43.572753+00:00",
+  "jobs": [
+    {
+      "error": "",
+      "id": 705,
+      "status": "succeeded",
+      "type": "build_ios",
+      "updated_at": "2026-08-24T11:42:11.791344+00:00"
+    },
+    {
+      "error": "",
+      "id": 706,
+      "status": "running",
+      "type": "upload_apple",
+      "updated_at": "2026-08-24T11:43:30.519650+00:00"
+    }
+  ],
+  "release_exists": true,
+  "release_status": "ready",
+  "submissions": {}
+}

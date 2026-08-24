@@ -1,5 +1,5 @@
-# probe revision 2
-name: Probe A+Bau 2.2.2 live release state
+# probe revision 3 - build 22005 iPad scanner fix
+name: Probe A+Bau 2.2.2 build 22005 live release state
 
 on:
   workflow_dispatch:
@@ -33,15 +33,15 @@ jobs:
           PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
           mkdir -p status
           sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-2.2.2-live.json <<'PY'
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-2.2.2-build-22005-live.json <<'PY'
           import json, os, django
           from django.utils import timezone
           os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
           django.setup()
           from apps.publisher.models import MobileApp, Release, Submission
           app=MobileApp.objects.get(slug='a-bau')
-          release=Release.objects.filter(app=app,version_name='2.2.2',build_number=22003).first()
-          out={'checked_at':timezone.now().isoformat(),'release_exists':bool(release)}
+          release=Release.objects.filter(app=app,version_name='2.2.2',build_number=22005).first()
+          out={'checked_at':timezone.now().isoformat(),'release_exists':bool(release),'review_notes':app.review_notes}
           if release:
               out['release_status']=release.status
               out['builds']={b.platform:{'status':b.status,'external_build_id':b.external_build_id or ''} for b in release.builds.all()}
@@ -49,14 +49,14 @@ jobs:
               out['submissions']={s.platform:{'state':s.state,'external_id':s.external_id or ''} for s in Submission.objects.filter(app=app,release=release)}
           print(json.dumps(out,indent=2,sort_keys=True))
           PY
-          cat status/a-bau-2.2.2-live.json
+          cat status/a-bau-2.2.2-build-22005-live.json
       - name: Commit live state
         run: |
           set -euo pipefail
           git config user.name 'A+ Publisher Release Bot'
           git config user.email 'app@aplus-solution.de'
           git pull --rebase origin main
-          git add status/a-bau-2.2.2-live.json
+          git add status/a-bau-2.2.2-build-22005-live.json
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'chore: record A+Bau 2.2.2 live release state'
+          git commit -m 'chore: record A+Bau 2.2.2 build 22005 live state'
           git push origin HEAD:main

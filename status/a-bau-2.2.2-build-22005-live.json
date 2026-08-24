@@ -1,0 +1,20 @@
+{
+  "builds": {
+    "ios": {
+      "external_build_id": "",
+      "status": "running"
+    }
+  },
+  "checked_at": "2026-08-24T11:35:32.020022+00:00",
+  "jobs": [
+    {
+      "error": "",
+      "status": "running",
+      "type": "build_ios"
+    }
+  ],
+  "release_exists": true,
+  "release_status": "building",
+  "review_notes": "A+Bau ist eine B2B-App f\u00fcr Handwerks- und Baubetriebe. Bitte die im App Review / App Access Feld hinterlegten Demo-Zugangsdaten verwenden. Wichtiger Hinweis f\u00fcr Guideline 2.1(a): Der Button 'Scannen' bleibt auf allen unterst\u00fctzten iPhone- und iPad-Ger\u00e4ten aktiv. Auf Ger\u00e4ten mit LiDAR wird Apple RoomPlan ge\u00f6ffnet. Auf Ger\u00e4ten ohne LiDAR, insbesondere iPad Air 11-inch (M3), \u00f6ffnet derselbe Button ein natives manuelles Raumaufma\u00df f\u00fcr L\u00e4nge, Breite und H\u00f6he. Dieses Aufma\u00df kann gespeichert und zum Projekt hochgeladen werden; ein USDZ-Modell ist im manuellen Modus nicht erforderlich. Testweg: anmelden \u2192 'Raum scannen' \u2192 beliebiges Demo-Projekt \u2192 'Scannen'. Kamera und Mikrofon werden nur nach einer aktiven Aktion angefragt. Optionale KI-Funktionen ben\u00f6tigen eine separate Einwilligung. Kontol\u00f6schung: https://kayi.smarbiz.sbs/konto-loeschen/ \u00b7 Datenschutz: https://kayi.smarbiz.sbs/datenschutz/ \u00b7 Support: https://kayi.smarbiz.sbs/support/.",
+  "submissions": {}
+}

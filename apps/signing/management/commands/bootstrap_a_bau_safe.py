@@ -15,6 +15,23 @@ class Command(BaseCommand):
 
     help = "Create/update and publish A+Bau with length-safe store localization."
 
+    def _upsert_app(self, app):
+        app = super()._upsert_app(app)
+        app.review_notes = (
+            "A+Bau ist eine B2B-App für Handwerks- und Baubetriebe. Bitte die im App Review / App Access Feld hinterlegten "
+            "Demo-Zugangsdaten verwenden. Wichtiger Hinweis für Guideline 2.1(a): Der Button 'Scannen' bleibt auf allen "
+            "unterstützten iPhone- und iPad-Geräten aktiv. Auf Geräten mit LiDAR wird Apple RoomPlan geöffnet. Auf Geräten ohne "
+            "LiDAR, insbesondere iPad Air 11-inch (M3), öffnet derselbe Button ein natives manuelles Raumaufmaß für Länge, Breite "
+            "und Höhe. Dieses Aufmaß kann gespeichert und zum Projekt hochgeladen werden; ein USDZ-Modell ist im manuellen Modus "
+            "nicht erforderlich. Testweg: anmelden → 'Raum scannen' → beliebiges Demo-Projekt → 'Scannen'. Kamera und Mikrofon werden "
+            "nur nach einer aktiven Aktion angefragt. Optionale KI-Funktionen benötigen eine separate Einwilligung. "
+            "Kontolöschung: https://kayi.smarbiz.sbs/konto-loeschen/ · Datenschutz: https://kayi.smarbiz.sbs/datenschutz/ · "
+            "Support: https://kayi.smarbiz.sbs/support/."
+        )
+        app.save(update_fields=["review_notes"])
+        self.stdout.write("review_notes=ipad_non_lidar_fallback")
+        return app
+
     def _upsert_localization(self, app):
         full = (
             "A+Bau verbindet Büro und Baustelle in einem klaren digitalen Arbeitsablauf.\n\n"
@@ -40,7 +57,16 @@ class Command(BaseCommand):
                 "full_description": full,
                 "keywords": "Handwerk,Bau,Auftrag,Zeiterfassung,Aufmaß,Baustelle,Rechnung,Termin,Projekt",
                 "promotional_text": "Von der Baustelle bis zur Rechnung: A+Bau verbindet Einsätze, Freigaben, Aufmaß, Finanzen und Büroarbeit in einem Ablauf.",
-                "release_notes": "Startproblem beim Öffnen behoben. A+Bau lädt jetzt zuverlässig auf iPhone und iPad; dazu kommen die neuesten Baustellen- und Kundenfunktionen.",
+                "release_notes": "Raumaufmaß auf iPad verbessert: 'Scannen' bleibt jetzt auch ohne LiDAR aktiv und öffnet dort ein manuelles Aufmaß. Auf LiDAR-Geräten wird weiterhin Apple RoomPlan verwendet.",
             },
         )
         self.stdout.write("localization=ready length_safe=true")
+
+    def _upsert_release(self, app, version, build_number):
+        release = super()._upsert_release(app, version, build_number)
+        release.release_notes = (
+            "App-Store-Fix für iPad ohne LiDAR: Scannen bleibt aktiv und bietet ein natives manuelles Raumaufmaß; "
+            "LiDAR-Geräte verwenden weiterhin Apple RoomPlan."
+        )
+        release.save(update_fields=["release_notes", "updated_at"])
+        return release

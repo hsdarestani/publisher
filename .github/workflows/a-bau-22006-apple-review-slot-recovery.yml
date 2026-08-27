@@ -11,11 +11,10 @@ permissions:
   contents: read
   issues: write
 
-environment: production
-
 jobs:
   recover-and-submit:
     runs-on: ubuntu-latest
+    environment: production
     timeout-minutes: 25
     steps:
       - name: Install SSH helper
@@ -87,7 +86,6 @@ jobs:
                   preserved.append(row)
 
           if not cancelled:
-              # This is still safe: a matching non-empty READY draft may already exist.
               matching = [x for x in preserved if x['targets_22006']]
               if not matching:
                   raise SystemExit('No empty READY_FOR_REVIEW draft was available to free an Apple review slot, and no existing draft targets 22006')

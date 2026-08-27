@@ -80,14 +80,37 @@ jobs:
               aa = c.find_app(app.bundle_id)
               out['apple_app_found'] = True
               version = c.find_editable_version(aa['id'], '2.2.2')
-              out['apple_version_id'] = version['id'] if version else None
+              version_id = version['id'] if version else None
+              out['apple_version_id'] = version_id
               out['apple_version_state'] = ((version or {}).get('attributes',{}).get('appStoreState') or (version or {}).get('attributes',{}).get('appVersionState'))
               states = {}
               for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','REJECTED','UNRESOLVED_ISSUES'):
                   try:
-                      states[state] = [x.get('id') for x in c.list_review_submissions(aa['id'], state)]
+                      submissions = c.list_review_submissions(aa['id'], state)
+                      values = []
+                      for sub in submissions:
+                          row = {
+                              'id': sub.get('id'),
+                              'state': (sub.get('attributes') or {}).get('state'),
+                          }
+                          if state == 'READY_FOR_REVIEW':
+                              try:
+                                  items = c.list_review_submission_items(sub['id'])
+                                  row['items'] = [
+                                      {
+                                          'id': item.get('id'),
+                                          'state': (item.get('attributes') or {}).get('state'),
+                                          'version_id': (((item.get('relationships') or {}).get('appStoreVersion') or {}).get('data') or {}).get('id'),
+                                          'targets_22006_version': bool(version_id and c._item_targets_version(item, version_id)),
+                                      }
+                                      for item in items
+                                  ]
+                              except Exception as exc:
+                                  row['items_error'] = f'{type(exc).__name__}: {str(exc)[:300]}'
+                          values.append(row)
+                      states[state] = values
                   except Exception as exc:
-                      states[state] = [f'ERROR:{type(exc).__name__}']
+                      states[state] = [{'error': f'{type(exc).__name__}: {str(exc)[:300]}'}]
               out['apple_review_submissions'] = states
           except Exception as exc:
               out['apple_app_found'] = False

@@ -1,0 +1,118 @@
+name: Probe A+Bau 2.2.2 build 22006 live state
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22006-live-recovery-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Install SSH helper
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Read Publisher and Apple live state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$PASS"
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          mkdir -p status
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/live-22006.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app = MobileApp.objects.select_related('apple_account').get(slug='a-bau')
+          rel = Release.objects.filter(app=app, version_name='2.2.2', build_number=22006).first()
+          out = {
+              'release_exists': bool(rel),
+              'bundle_id': app.bundle_id,
+              'review_credentials': bool(app.review_username and app.get_review_password()),
+              'apple_account_configured': bool(app.apple_account and app.apple_account.configured),
+          }
+          if rel:
+              out['release_status'] = rel.status
+              out['builds'] = {
+                  b.platform: {
+                      'status': b.status,
+                      'artifact': bool(b.artifact),
+                      'external_build_id': b.external_build_id or '',
+                      'logs_tail': (b.logs or '')[-1200:],
+                  }
+                  for b in rel.builds.all()
+              }
+              out['jobs'] = [
+                  {
+                      'id': j.id,
+                      'type': j.type,
+                      'status': j.status,
+                      'error': (j.error or '')[-700:],
+                  }
+                  for j in rel.jobs.order_by('created_at')
+              ]
+              out['submissions'] = {
+                  s.platform: {'state': s.state, 'external_id': s.external_id or ''}
+                  for s in Submission.objects.filter(app=app, release=rel)
+              }
+          try:
+              c = AppleStoreClient(app.apple_account)
+              aa = c.find_app(app.bundle_id)
+              out['apple_app_found'] = True
+              version = c.find_editable_version(aa['id'], '2.2.2')
+              out['apple_version_id'] = version['id'] if version else None
+              out['apple_version_state'] = ((version or {}).get('attributes',{}).get('appStoreState') or (version or {}).get('attributes',{}).get('appVersionState'))
+              states = {}
+              for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','REJECTED','UNRESOLVED_ISSUES'):
+                  try:
+                      states[state] = [x.get('id') for x in c.list_review_submissions(aa['id'], state)]
+                  except Exception as exc:
+                      states[state] = [f'ERROR:{type(exc).__name__}']
+              out['apple_review_submissions'] = states
+          except Exception as exc:
+              out['apple_app_found'] = False
+              out['apple_probe_error'] = f'{type(exc).__name__}: {str(exc)[:500]}'
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+          cat status/live-22006.json
+
+      - name: Update live status issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f status/live-22006.json ]; then
+            {
+              echo 'A+Bau 2.2.2 (22006) live Publisher / Apple state:'
+              echo
+              echo '```json'
+              cat status/live-22006.json
+              echo '```'
+              echo
+              echo "Probe run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            } > /tmp/issue-body.md
+          else
+            echo "Probe failed before a status payload was produced. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /tmp/issue-body.md
+          fi
+          gh issue edit 81 --repo "$GITHUB_REPOSITORY" --body-file /tmp/issue-body.md

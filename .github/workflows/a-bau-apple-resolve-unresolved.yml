@@ -1,4 +1,4 @@
-# retry 2
+# retry 3
 name: Resolve rejected A+Bau item and resubmit
 
 on:
@@ -21,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve Apple unresolved issue and resubmit build 22004
+      - name: Resolve Apple unresolved issue and resubmit build 22006
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -51,12 +51,12 @@ jobs:
           from django.utils import timezone
 
           APP_VERSION='2.2.2'
-          BUILD_NUMBER=22004
+          BUILD_NUMBER=22006
           app=MobileApp.objects.select_related('apple_account').get(slug='a-bau')
           rel=Release.objects.get(app=app, version_name=APP_VERSION, build_number=BUILD_NUMBER)
           build=rel.builds.filter(platform='ios', status='succeeded').order_by('-updated_at').first()
           if not build or not build.external_build_id:
-              raise SystemExit('ERROR no processed iOS build id for 22004')
+              raise SystemExit('ERROR no processed iOS build id for 22006')
 
           c=AppleStoreClient(app.apple_account)
           aa=c.find_app(app.bundle_id)

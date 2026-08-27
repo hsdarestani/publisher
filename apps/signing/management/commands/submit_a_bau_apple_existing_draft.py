@@ -9,7 +9,7 @@ from apps.publisher.models import MobileApp
 
 
 APP_SLUG = "a-bau"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.2"
 
 
 class Command(BaseCommand):

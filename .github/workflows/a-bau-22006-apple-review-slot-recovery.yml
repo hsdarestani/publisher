@@ -1,0 +1,219 @@
+name: Recover A+Bau 2.2.2 build 22006 Apple review slot and submit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22006-apple-review-slot-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+environment: production
+
+jobs:
+  recover-and-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install SSH helper
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$PASS"
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_bau_safe >/dev/null"
+
+      - name: Cancel only empty Apple READY_FOR_REVIEW drafts
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          mkdir -p status
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/cleanup.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app = MobileApp.objects.select_related('apple_account').get(slug='a-bau')
+          rel = Release.objects.get(app=app, version_name='2.2.2', build_number=22006)
+          build = rel.builds.get(platform='ios')
+          if build.status != 'succeeded' or not build.artifact or not build.external_build_id:
+              raise SystemExit(f'iOS 22006 is not safely uploaded/build-ready: status={build.status} artifact={bool(build.artifact)} external={build.external_build_id!r}')
+
+          client = AppleStoreClient(app.apple_account)
+          apple_app = client.find_app(app.bundle_id)
+          version = client.find_editable_version(apple_app['id'], '2.2.2')
+          if not version:
+              raise SystemExit('Apple App Store version 2.2.2 was not found')
+          version_id = version['id']
+
+          before = []
+          cancelled = []
+          preserved = []
+          for submission in client.list_review_submissions(apple_app['id'], 'READY_FOR_REVIEW'):
+              items = client.list_review_submission_items(submission['id'])
+              row = {
+                  'id': submission['id'],
+                  'item_count': len(items),
+                  'targets_22006': any(client._item_targets_version(item, version_id) for item in items),
+              }
+              before.append(row)
+              if not items:
+                  client.cancel_review_submission(submission['id'])
+                  cancelled.append(submission['id'])
+              else:
+                  preserved.append(row)
+
+          if not cancelled:
+              # This is still safe: a matching non-empty READY draft may already exist.
+              matching = [x for x in preserved if x['targets_22006']]
+              if not matching:
+                  raise SystemExit('No empty READY_FOR_REVIEW draft was available to free an Apple review slot, and no existing draft targets 22006')
+
+          print(json.dumps({
+              'release_status': rel.status,
+              'ios_build_status': build.status,
+              'apple_external_build_id': build.external_build_id,
+              'apple_version_id': version_id,
+              'ready_before': before,
+              'cancelled_empty_ready_submissions': cancelled,
+              'preserved_nonempty_ready_submissions': preserved,
+          }, indent=2, sort_keys=True))
+          PY
+          cat status/cleanup.json
+
+      - name: Ask Publisher to submit existing uploaded build 22006
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          ok=0
+          : > status/publish.log
+          for n in $(seq 1 60); do
+            echo "=== publish pass $n ===" | tee -a status/publish.log
+            OUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_bau_safe --app-version 2.2.2 --build-number 22006 --publish" || true)"
+            printf '%s\n' "$OUT" | tee -a status/publish.log
+            if printf '%s\n' "$OUT" | grep -q 'job=submit_apple:succeeded'; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          test "$ok" = "1"
+
+      - name: Verify 22006 is actually submitted to Apple review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/final.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app = MobileApp.objects.select_related('apple_account').get(slug='a-bau')
+          rel = Release.objects.get(app=app, version_name='2.2.2', build_number=22006)
+          client = AppleStoreClient(app.apple_account)
+          apple_app = client.find_app(app.bundle_id)
+          version = client.find_editable_version(apple_app['id'], '2.2.2')
+          version_id = version['id'] if version else None
+
+          matches = []
+          states = {}
+          for state in ('READY_FOR_REVIEW', 'WAITING_FOR_REVIEW', 'IN_REVIEW', 'UNRESOLVED_ISSUES'):
+              rows = []
+              for sub in client.list_review_submissions(apple_app['id'], state):
+                  items = []
+                  try:
+                      items = client.list_review_submission_items(sub['id'])
+                  except Exception:
+                      pass
+                  targets = bool(version_id and any(client._item_targets_version(item, version_id) for item in items))
+                  row = {'id': sub['id'], 'state': state, 'item_count': len(items), 'targets_22006': targets}
+                  rows.append(row)
+                  if targets and state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+                      matches.append(row)
+              states[state] = rows
+
+          jobs = [
+              {'id': j.id, 'type': j.type, 'status': j.status, 'error': (j.error or '')[-1000:]}
+              for j in rel.jobs.order_by('created_at')
+          ]
+          local_submissions = {
+              s.platform: {'state': s.state, 'external_id': s.external_id or ''}
+              for s in Submission.objects.filter(app=app, release=rel)
+          }
+          result = {
+              'release_status': rel.status,
+              'apple_version_id': version_id,
+              'apple_version_state': ((version or {}).get('attributes', {}).get('appStoreState') or (version or {}).get('attributes', {}).get('appVersionState')),
+              'matching_submitted_review': matches,
+              'apple_review_submissions': states,
+              'publisher_submissions': local_submissions,
+              'latest_jobs': jobs[-8:],
+          }
+          print(json.dumps(result, indent=2, sort_keys=True))
+          if not matches:
+              raise SystemExit('Build 22006 is not WAITING_FOR_REVIEW or IN_REVIEW yet')
+          PY
+          cat status/final.json
+
+      - name: Record recovery result in issue 81
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'A+Bau 2.2.2 (22006) Apple review-slot recovery:'
+            echo
+            if [ -f status/cleanup.json ]; then
+              echo '### Safe cleanup'
+              echo '```json'
+              cat status/cleanup.json
+              echo '```'
+            fi
+            if [ -f status/final.json ]; then
+              echo '### Final Apple state'
+              echo '```json'
+              cat status/final.json
+              echo '```'
+            fi
+            echo
+            echo "Recovery run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > /tmp/recovery.md
+          gh issue edit 81 --repo "$GITHUB_REPOSITORY" --body-file /tmp/recovery.md

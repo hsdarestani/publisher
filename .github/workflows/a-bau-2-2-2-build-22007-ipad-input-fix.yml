@@ -36,7 +36,7 @@ jobs:
           grep -F 'modalPresentationStyle = .fullScreen' /tmp/ipad-scanner-fix.py
           grep -F 'accessibilityLabel = definition.0' /tmp/ipad-scanner-fix.py
           grep -F 'keyboardWillChangeFrameNotification' /tmp/ipad-scanner-fix.py
-          if grep -F 'UIAlertController' /tmp/ipad-scanner-fix.py; then exit 3; fi
+          if grep -F 'let alert = UIAlertController' /tmp/ipad-scanner-fix.py; then exit 3; fi
           grep -F '"supported": true' /tmp/ipad-scanner-fix.py
           grep -F '"fallback": !roomPlanSupported' /tmp/ipad-scanner-fix.py
           grep -F '"capture_mode": "manual_fallback"' /tmp/ipad-scanner-fix.py

@@ -1,0 +1,60 @@
+name: Kick latest A+ Solution store release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kick-aplus-solution-latest-20260829.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Point current store release at latest production commit
+        shell: bash
+        env:
+          APLUS_COMMIT: 0500ae6623e423cda171010c31caa69be438aa71
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path('.github/workflows/aplus-solution-current-release.yml')
+          text = path.read_text()
+          lines = text.splitlines()
+          target = f"  APLUS_COMMIT: '{os.environ['APLUS_COMMIT']}'"
+          replaced = False
+          for i, line in enumerate(lines):
+              if line.startswith('  APLUS_COMMIT:'):
+                  lines[i] = target
+                  replaced = True
+                  break
+          if not replaced:
+              raise SystemExit('APLUS_COMMIT env line not found')
+          path.write_text('\n'.join(lines) + '\n')
+          PY
+
+          rm -f .github/workflows/kick-aplus-solution-latest-20260829.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/aplus-solution-current-release.yml .github/workflows/kick-aplus-solution-latest-20260829.yml
+          git commit -m 'Release latest A+ Solution production build to stores'
+          git push
+
+      - name: Dispatch current A+ Solution store release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run aplus-solution-current-release.yml --ref main
+          echo 'A+ Solution current store release dispatched.'

@@ -133,8 +133,8 @@ jobs:
           set -euo pipefail
           git config user.name 'A+ Publisher Release Bot'
           git config user.email 'app@aplus-solution.de'
-          git pull --rebase origin main
           git add status/a-bau-apple-resubmit.txt || true
           if git diff --cached --quiet; then exit 0; fi
           git commit -m 'chore: record A+Bau Apple resubmission result'
+          git pull --rebase origin main
           git push origin HEAD:main

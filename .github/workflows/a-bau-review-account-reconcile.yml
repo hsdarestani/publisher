@@ -1,0 +1,97 @@
+name: Reconcile A+Bau store review account
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-review-account-reconcile.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-bau-review-account-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Reconcile Publisher credential with production demo account
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+
+          REVIEW_JSON="$(
+            cd /opt/aplus-publisher
+            docker compose exec -T web python - <<'PY'
+          import json
+          import os
+          import django
+
+          os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+          django.setup()
+
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug="a-bau")
+          password = app.get_review_password()
+          assert app.review_username and password, "Publisher review credentials are missing"
+          print(json.dumps({"username": app.review_username, "password": password}))
+          PY
+          )"
+
+          REVIEW_USER="$(REVIEW_JSON="$REVIEW_JSON" python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ["REVIEW_JSON"])["username"])
+          PY
+          )"
+          REVIEW_PASS="$(REVIEW_JSON="$REVIEW_JSON" python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ["REVIEW_JSON"])["password"])
+          PY
+          )"
+          unset REVIEW_JSON
+          export REVIEW_USER REVIEW_PASS
+
+          cd /opt/kayi
+          docker compose exec -T -e REVIEW_USER -e REVIEW_PASS web python manage.py shell <<'PY'
+          import os
+          from django.contrib.auth import authenticate, get_user_model
+
+          username = os.environ["REVIEW_USER"]
+          password = os.environ["REVIEW_PASS"]
+          User = get_user_model()
+          user = User.objects.get(username=username)
+          user.is_active = True
+          user.set_password(password)
+          user.save(update_fields=["is_active", "password"])
+          assert authenticate(username=username, password=password) is not None
+          print("A+Bau store review account is active and authentication is verified.")
+          PY
+
+          unset REVIEW_USER REVIEW_PASS
+          REMOTE
+
+      - name: Record non-secret verification receipt
+        run: |
+          {
+            echo "package=de.kayihaustechnik.app"
+            echo "username=demo"
+            echo "credential_source=Publisher encrypted review credential"
+            echo "production_authentication=verified"
+            echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } | tee /tmp/a-bau-review-account-status.txt

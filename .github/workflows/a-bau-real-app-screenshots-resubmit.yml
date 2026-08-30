@@ -1,0 +1,366 @@
+name: Fix A+Bau App Store screenshots and resubmit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-real-app-screenshots-resubmit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_URL: https://kayi.smarbiz.sbs/
+  APP_VERSION: '2.2.2'
+  BUILD_NUMBER: '22007'
+
+jobs:
+  fix-metadata:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install browser and SSH tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+          npm install --no-save playwright@1.55.0 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+
+      - name: Read App Review credentials without logging them
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" > /tmp/a-bau-review.json <<'PY'
+          import json, os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='a-bau')
+          user = app.review_username or ''
+          password = app.get_review_password() or ''
+          if not user or not password:
+              raise SystemExit('A+Bau review credentials are missing')
+          print(json.dumps({'username': user, 'password': password}))
+          PY
+          REVIEW_USER="$(jq -r .username /tmp/a-bau-review.json)"
+          REVIEW_PASS="$(jq -r .password /tmp/a-bau-review.json)"
+          echo "::add-mask::$REVIEW_USER"
+          echo "::add-mask::$REVIEW_PASS"
+          printf 'REVIEW_USER=%s\n' "$REVIEW_USER" >> "$GITHUB_ENV"
+          printf 'REVIEW_PASS=%s\n' "$REVIEW_PASS" >> "$GITHUB_ENV"
+          rm -f /tmp/a-bau-review.json
+
+      - name: Capture current authenticated A+Bau UI
+        run: |
+          set -euo pipefail
+          mkdir -p screenshots
+          cat > /tmp/capture-a-bau.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
+          const base = process.env.APP_URL;
+          const username = process.env.REVIEW_USER;
+          const password = process.env.REVIEW_PASS;
+
+          async function firstVisible(page, selectors) {
+            for (const selector of selectors) {
+              const loc = page.locator(selector).first();
+              try {
+                if (await loc.isVisible({ timeout: 500 })) return loc;
+              } catch (_) {}
+            }
+            return null;
+          }
+
+          async function dismissOverlays(page) {
+            const labels = [/Alle akzeptieren/i, /Akzeptieren/i, /^OK$/i, /Schließen/i, /Später/i];
+            for (const label of labels) {
+              const btn = page.getByRole('button', { name: label }).first();
+              try { if (await btn.isVisible({ timeout: 250 })) await btn.click(); } catch (_) {}
+            }
+          }
+
+          async function login(page) {
+            const candidates = [base, new URL('/login/', base).href, new URL('/accounts/login/', base).href];
+            let passwordInput = null;
+            for (const url of candidates) {
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+              await dismissOverlays(page);
+              passwordInput = await firstVisible(page, [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[autocomplete="current-password"]'
+              ]);
+              if (passwordInput) break;
+              const body = (await page.locator('body').innerText().catch(() => '')).toLowerCase();
+              if (body.includes('raum scannen') || body.includes('projekte') || body.includes('dashboard')) return;
+            }
+
+            if (!passwordInput) throw new Error(`Could not find A+Bau login or authenticated UI at ${base}`);
+            const userInput = await firstVisible(page, [
+              'input[type="email"]',
+              'input[name="email"]',
+              'input[name="username"]',
+              'input[autocomplete="username"]',
+              'input[type="text"]'
+            ]);
+            if (!userInput) throw new Error('Could not find username/email field');
+            await userInput.fill(username);
+            await passwordInput.fill(password);
+
+            const submit = await firstVisible(page, [
+              'button[type="submit"]',
+              'input[type="submit"]',
+              'button:has-text("Anmelden")',
+              'button:has-text("Login")',
+              'button:has-text("Einloggen")'
+            ]);
+            if (!submit) throw new Error('Could not find login submit button');
+            await Promise.all([
+              page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {}),
+              submit.click(),
+            ]);
+            await page.waitForTimeout(1800);
+            await dismissOverlays(page);
+
+            const stillPassword = await firstVisible(page, ['input[type="password"]']);
+            if (stillPassword) {
+              const text = await page.locator('body').innerText().catch(() => '');
+              throw new Error(`A+Bau review login did not complete. Page text: ${text.slice(0, 300)}`);
+            }
+          }
+
+          async function capture(name, viewport, dpr) {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              viewport,
+              deviceScaleFactor: dpr,
+              isMobile: true,
+              hasTouch: true,
+              locale: 'de-DE',
+            });
+            const page = await context.newPage();
+            await login(page);
+            await page.waitForTimeout(1200);
+
+            // Prefer the real room-scan/product screen when it exists, because it
+            // is the exact functionality Apple reviewed in earlier submissions.
+            const scanTarget = page.getByText(/Raum scannen|Raumscan/i).first();
+            try {
+              if (await scanTarget.isVisible({ timeout: 1000 })) {
+                await scanTarget.click();
+                await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+                await page.waitForTimeout(1000);
+              }
+            } catch (_) {}
+
+            await dismissOverlays(page);
+            const bodyText = await page.locator('body').innerText().catch(() => '');
+            if (/passwort|password/i.test(bodyText) && /anmelden|login/i.test(bodyText)) {
+              throw new Error('Refusing to publish a login-screen screenshot');
+            }
+            if (bodyText.trim().length < 30) throw new Error('Authenticated A+Bau screen appears empty');
+
+            await page.screenshot({ path: name, fullPage: false, scale: 'device' });
+            await browser.close();
+          }
+
+          await capture('screenshots/a-bau-iphone65-current.png', { width: 428, height: 926 }, 3);
+          await capture('screenshots/a-bau-ipad13-current.png', { width: 1032, height: 1376 }, 2);
+
+          for (const file of ['screenshots/a-bau-iphone65-current.png', 'screenshots/a-bau-ipad13-current.png']) {
+            const size = fs.statSync(file).size;
+            if (size < 50000) throw new Error(`${file} is unexpectedly small (${size} bytes)`);
+          }
+          JS
+          node /tmp/capture-a-bau.mjs
+          file screenshots/*.png
+
+      - name: Install real screenshots in Publisher and resubmit 22007
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          SCP=(sshpass -e scp -P "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+
+          "${SCP[@]}" screenshots/a-bau-iphone65-current.png root@"$HOST":/tmp/a-bau-iphone65-current.png
+          "${SCP[@]}" screenshots/a-bau-ipad13-current.png root@"$HOST":/tmp/a-bau-ipad13-current.png
+          "${SSH[@]}" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/a-bau-iphone65-current.png "$CID":/tmp/a-bau-iphone65-current.png && docker cp /tmp/a-bau-ipad13-current.png "$CID":/tmp/a-bau-ipad13-current.png'
+
+          mkdir -p status
+          "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" > status/a-bau-real-screenshots-resubmit.txt <<'PY'
+          import json, os, time, django
+          from pathlib import Path
+          from django.core.files.base import ContentFile
+          from django.utils import timezone
+
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+
+          from apps.integrations.apple_assets import sync_app_store_screenshots
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import AppAsset, AppLocalization, MobileApp, Release, Submission
+
+          APP_VERSION = '2.2.2'
+          BUILD_NUMBER = 22007
+          app = MobileApp.objects.select_related('apple_account').get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name=APP_VERSION, build_number=BUILD_NUMBER)
+          build = release.builds.filter(platform='ios', status='succeeded').order_by('-updated_at').first()
+          if not build or not build.external_build_id:
+              raise SystemExit('ERROR: processed iOS build 22007 is not available')
+
+          loc, _ = AppLocalization.objects.get_or_create(app=app, locale='de-DE')
+          # Delete the Publisher-generated illustrative iOS art. Only real captures
+          # of the current authenticated UI may remain for App Store submission.
+          AppAsset.objects.filter(app=app, kind='screenshot', platform='ios', locale='de-DE').delete()
+
+          def save_asset(source, filename, width, height, device_type):
+              data = Path(source).read_bytes()
+              asset = AppAsset(
+                  app=app,
+                  kind='screenshot',
+                  platform='ios',
+                  locale='de-DE',
+                  device_type=device_type,
+                  sort_order=0,
+                  width=width,
+                  height=height,
+              )
+              asset.file.save(filename, ContentFile(data), save=True)
+              return asset
+
+          save_asset('/tmp/a-bau-iphone65-current.png', 'a-bau-iphone65-current.png', 1284, 2778, 'APP_IPHONE_65')
+          save_asset('/tmp/a-bau-ipad13-current.png', 'a-bau-ipad13-current.png', 2064, 2752, 'APP_IPAD_PRO_3GEN_129')
+
+          client = AppleStoreClient(app.apple_account)
+          apple_app = client.find_app(app.bundle_id)
+          app_id = apple_app['id']
+          version = client.find_editable_version(app_id, APP_VERSION)
+          if not version:
+              raise SystemExit('ERROR: editable App Store version 2.2.2 not found')
+          version_id = version['id']
+
+          # Remove every stale App Store screenshot first, including display types
+          # that were populated manually or by older Publisher versions. This is
+          # what guarantees Apple cannot see the rejected synthetic screenshots.
+          localization = client.set_localization(version_id, loc)
+          localization_id = localization['id']
+          sets = client.request('GET', f'/appStoreVersionLocalizations/{localization_id}/appScreenshotSets?limit=200').get('data', [])
+          deleted = 0
+          for screenshot_set in sets:
+              set_id = screenshot_set['id']
+              current = client.request('GET', f'/appScreenshotSets/{set_id}/appScreenshots?limit=200').get('data', [])
+              for item in current:
+                  client.request('DELETE', f"/appScreenshots/{item['id']}")
+                  deleted += 1
+
+          screenshots = sync_app_store_screenshots(
+              client,
+              version_id,
+              [loc],
+              app.assets.filter(kind='screenshot', platform='ios', locale='de-DE'),
+              timeout=300,
+          )
+
+          app.review_notes = (
+              (app.review_notes or '').strip()
+              + "\n\nGuideline 2.3.3: Die vorherigen illustrativen Store-Bilder wurden vollständig entfernt. "
+                "Die neuen 6,5-Zoll-iPhone- und 13-Zoll-iPad-Screenshots sind direkte Aufnahmen der aktuellen, "
+                "authentifizierten A+Bau-Oberfläche in Benutzung."
+          ).strip()
+          app.save(update_fields=['review_notes', 'updated_at'])
+          client.attach_build(version_id, build.external_build_id)
+          client.set_review_details(version_id, app)
+
+          # Reuse and resolve Apple's existing rejected review slot when present.
+          submission_id = None
+          unresolved = client.list_review_submissions(app_id, 'UNRESOLVED_ISSUES')
+          for submission in unresolved:
+              items = client.list_review_submission_items(submission['id'])
+              target = next((item for item in items if client._item_targets_version(item, version_id)), None)
+              if not target:
+                  continue
+              state = target.get('attributes', {}).get('state')
+              if state == 'REJECTED':
+                  body = {'data': {'type': 'reviewSubmissionItems', 'id': target['id'], 'attributes': {'resolved': True}}}
+                  client.request('PATCH', f"/reviewSubmissionItems/{target['id']}", data=json.dumps(body))
+              submit_body = {'data': {'type': 'reviewSubmissions', 'id': submission['id'], 'attributes': {'submitted': True}}}
+              client.request('PATCH', f"/reviewSubmissions/{submission['id']}", data=json.dumps(submit_body))
+              submission_id = submission['id']
+              break
+
+          if submission_id is None:
+              result = client.submit_version(app_id, version_id)
+              submission_id = result['submission']['id']
+
+          final_state = 'UNKNOWN'
+          for _ in range(60):
+              data = client.request('GET', f'/reviewSubmissions/{submission_id}')['data']
+              final_state = data.get('attributes', {}).get('state', 'UNKNOWN')
+              if final_state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+                  break
+              time.sleep(3)
+          if final_state not in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+              raise SystemExit(f'ERROR: resubmission did not enter review queue: {final_state}')
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=release,
+              platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': submission_id,
+                  'submitted_at': timezone.now(),
+                  'raw': {
+                      'apple_state': final_state,
+                      'guideline_2_3_3_screenshots_fixed': True,
+                      'stale_screenshots_deleted': deleted,
+                      'screenshots': screenshots,
+                  },
+              },
+          )
+          release.status = 'in_review'
+          release.save(update_fields=['status', 'updated_at'])
+          print('SUCCESS')
+          print('VERSION', APP_VERSION, 'BUILD', BUILD_NUMBER)
+          print('STALE_SCREENSHOTS_DELETED', deleted)
+          print('SCREENSHOTS', json.dumps(screenshots, sort_keys=True))
+          print('APPLE_REVIEW_STATE', final_state)
+          print('SUBMISSION', submission_id)
+          PY
+          cat status/a-bau-real-screenshots-resubmit.txt
+
+      - name: Commit resubmission receipt
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f status/a-bau-real-screenshots-resubmit.txt ]; then exit 0; fi
+          git config user.name 'A+ Publisher Release Bot'
+          git config user.email 'app@aplus-solution.de'
+          git pull --rebase origin main
+          git add status/a-bau-real-screenshots-resubmit.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: record A+Bau real screenshot resubmission'
+          git push origin HEAD:main

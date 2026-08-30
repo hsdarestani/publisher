@@ -11,6 +11,11 @@ class Command(BaseCommand):
     production schema stores that field as varchar(80), aborting the release
     transaction before a Release/Build could be created. Keep the existing
     orchestration but write a length-safe localization.
+
+    iOS App Store screenshots are intentionally NOT synthesized here. Apple
+    Guideline 2.3.3 requires screenshots to show the current app in use, so the
+    iOS media is captured from the authenticated live A+Bau UI by the dedicated
+    release workflow and then preserved across later bootstrap runs.
     """
 
     help = "Create/update and publish A+Bau with length-safe store localization."
@@ -25,11 +30,13 @@ class Command(BaseCommand):
             "und Höhe. Dieses Aufmaß kann gespeichert und zum Projekt hochgeladen werden; ein USDZ-Modell ist im manuellen Modus "
             "nicht erforderlich. Testweg: anmelden → 'Raum scannen' → beliebiges Demo-Projekt → 'Scannen'. Kamera und Mikrofon werden "
             "nur nach einer aktiven Aktion angefragt. Optionale KI-Funktionen benötigen eine separate Einwilligung. "
+            "Die App-Store-Screenshots zeigen die aktuelle, authentifizierte A+Bau-Oberfläche in Benutzung und wurden nach dem "
+            "Guideline-2.3.3-Hinweis aktualisiert. "
             "Kontolöschung: https://kayi.smarbiz.sbs/konto-loeschen/ · Datenschutz: https://kayi.smarbiz.sbs/datenschutz/ · "
             "Support: https://kayi.smarbiz.sbs/support/."
         )
         app.save(update_fields=["review_notes"])
-        self.stdout.write("review_notes=ipad_non_lidar_fallback")
+        self.stdout.write("review_notes=ipad_non_lidar_fallback+real_store_screenshots")
         return app
 
     def _upsert_localization(self, app):
@@ -61,6 +68,51 @@ class Command(BaseCommand):
             },
         )
         self.stdout.write("localization=ready length_safe=true")
+
+    def _upsert_assets(self, app):
+        """Generate Android store art while preserving real iOS screenshots.
+
+        The base command used Pillow to draw illustrative iOS screenshots. Apple
+        rejected those under Guideline 2.3.3 because they were not captures of
+        the current app. Never overwrite the real iOS captures stored in AppAsset.
+        """
+        self._save_asset(
+            app,
+            kind="icon",
+            platform="shared",
+            filename="a-bau-fav-512.png",
+            data=self._icon_bytes(),
+            width=512,
+            height=512,
+        )
+        self._save_asset(
+            app,
+            kind="feature_graphic",
+            platform="android",
+            filename="a-bau-feature-1024x500.png",
+            data=self._feature_bytes(),
+            width=1024,
+            height=500,
+        )
+        frames = [
+            ("Alles an einem Ort.", "Projekte, Kunden und Termine übersichtlich verwalten."),
+            ("Direkt auf der Baustelle.", "Zeit, Fotos, Berichte und Aufmaß im Einsatz dokumentieren."),
+            ("Erst prüfen. Dann freigeben.", "Monteur, Büro und Kunde in einem nachvollziehbaren Ablauf."),
+            ("Von der Kalkulation zur Rechnung.", "Preise, Margen, Finanzen und KI nur für berechtigte Rollen."),
+        ]
+        for index, (title, subtitle) in enumerate(frames):
+            self._save_asset(
+                app,
+                kind="screenshot",
+                platform="android",
+                filename=f"android-{index + 1}.png",
+                data=self._screenshot_bytes(1080, 1920, index, title, subtitle),
+                width=1080,
+                height=1920,
+                sort_order=index,
+                device_type="phone",
+            )
+        self.stdout.write("store_assets=ready android_generated=true ios=preserved_real_capture")
 
     def _upsert_release(self, app, version, build_number):
         release = super()._upsert_release(app, version, build_number)

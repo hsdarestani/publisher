@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p screenshots
-          cat > /tmp/capture-a-bau.mjs <<'JS'
+          cat > capture-a-bau.mjs <<'JS'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
 
@@ -160,8 +160,6 @@ jobs:
             await login(page);
             await page.waitForTimeout(1200);
 
-            // Prefer the real room-scan/product screen when it exists, because it
-            // is the exact functionality Apple reviewed in earlier submissions.
             const scanTarget = page.getByText(/Raum scannen|Raumscan/i).first();
             try {
               if (await scanTarget.isVisible({ timeout: 1000 })) {
@@ -190,7 +188,7 @@ jobs:
             if (size < 50000) throw new Error(`${file} is unexpectedly small (${size} bytes)`);
           }
           JS
-          node /tmp/capture-a-bau.mjs
+          node ./capture-a-bau.mjs
           file screenshots/*.png
 
       - name: Install real screenshots in Publisher and resubmit 22007
@@ -232,8 +230,6 @@ jobs:
               raise SystemExit('ERROR: processed iOS build 22007 is not available')
 
           loc, _ = AppLocalization.objects.get_or_create(app=app, locale='de-DE')
-          # Delete the Publisher-generated illustrative iOS art. Only real captures
-          # of the current authenticated UI may remain for App Store submission.
           AppAsset.objects.filter(app=app, kind='screenshot', platform='ios', locale='de-DE').delete()
 
           def save_asset(source, filename, width, height, device_type):
@@ -262,9 +258,6 @@ jobs:
               raise SystemExit('ERROR: editable App Store version 2.2.2 not found')
           version_id = version['id']
 
-          # Remove every stale App Store screenshot first, including display types
-          # that were populated manually or by older Publisher versions. This is
-          # what guarantees Apple cannot see the rejected synthetic screenshots.
           localization = client.set_localization(version_id, loc)
           localization_id = localization['id']
           sets = client.request('GET', f'/appStoreVersionLocalizations/{localization_id}/appScreenshotSets?limit=200').get('data', [])
@@ -294,7 +287,6 @@ jobs:
           client.attach_build(version_id, build.external_build_id)
           client.set_review_details(version_id, app)
 
-          # Reuse and resolve Apple's existing rejected review slot when present.
           submission_id = None
           unresolved = client.list_review_submissions(app_id, 'UNRESOLVED_ISSUES')
           for submission in unresolved:

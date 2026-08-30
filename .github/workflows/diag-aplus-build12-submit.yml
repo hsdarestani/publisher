@@ -1,4 +1,4 @@
-name: Diagnose A+ build 12 submission
+name: Finalize A+ build 12 Apple review
 
 on:
   push:
@@ -9,14 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  finalize:
     runs-on: ubuntu-latest
     environment: production
     steps:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
-      - name: Compare Apple marketing versions
+      - name: Detach rejected build 11, attach build 12, submit review
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -27,31 +27,87 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from django.utils import timezone
           from apps.integrations.apple_store import AppleStoreClient
-          from apps.publisher.models import Release
+          from apps.publisher.models import Job, Release, Submission
+          from apps.publisher.readiness import evaluate_release
+          from apps.publisher.review_contacts import apple_review_contact
 
           r=Release.objects.get(id=32)
+          assert r.version_name == '1.0.5' and r.build_number == 12
           app=r.app
+          ios=r.builds.get(platform='ios')
+          assert ios.status == 'succeeded' and ios.artifact and ios.external_build_id
+
           client=AppleStoreClient(app.apple_account)
           record=client.find_app(app.bundle_id)
           version=client.find_editable_version(record['id'],r.version_name)
-          print('release_version='+r.version_name)
-          print('apple_version_state='+str((version.get('attributes') or {}).get('appStoreState') or ''))
-          attached=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data')
-          new_id=r.builds.get(platform='ios').external_build_id
-          print('attached_build='+str((attached or {}).get('id') or ''))
-          print('new_build='+str(new_id))
+          assert version
+          version_id=version['id']
+          state=(version.get('attributes') or {}).get('appStoreState') or (version.get('attributes') or {}).get('appVersionState')
+          assert state in {'DEVELOPER_REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','METADATA_REJECTED','REJECTED'}, state
 
-          for label,build_id in [('attached',(attached or {}).get('id')),('new',new_id)]:
-              if not build_id:
-                  continue
-              build=client.request('GET',f'/builds/{build_id}').get('data') or {}
-              attrs=build.get('attributes') or {}
-              print(f'{label}_build_number='+str(attrs.get('version') or ''))
-              print(f'{label}_processing='+str(attrs.get('processingState') or ''))
-              pre=client.request('GET',f'/builds/{build_id}/preReleaseVersion').get('data') or {}
-              pattrs=pre.get('attributes') or {}
-              print(f'{label}_pre_release_id='+str(pre.get('id') or ''))
-              print(f'{label}_marketing_version='+str(pattrs.get('version') or ''))
-              print(f'{label}_platform='+str(pattrs.get('platform') or ''))
+          new_id=str(ios.external_build_id)
+          new_build=client.request('GET',f'/builds/{new_id}').get('data') or {}
+          assert (new_build.get('attributes') or {}).get('processingState') == 'VALID'
+          new_pre=client.request('GET',f'/builds/{new_id}/preReleaseVersion').get('data') or {}
+          assert (new_pre.get('attributes') or {}).get('version') == r.version_name
+
+          current=client.request('GET',f'/appStoreVersions/{version_id}/build').get('data')
+          old_id=str((current or {}).get('id') or '')
+          print(f'apple_version_state={state}')
+          print(f'old_build={old_id or "none"}')
+          print(f'new_build={new_id}')
+
+          if old_id != new_id:
+              detach_body={'data': None}
+              client.request('PATCH',f'/appStoreVersions/{version_id}/relationships/build',data=json.dumps(detach_body))
+              try:
+                  client.attach_build(version_id,new_id)
+              except Exception:
+                  if old_id:
+                      try:
+                          client.attach_build(version_id,old_id)
+                      except Exception as rollback_exc:
+                          print(f'ROLLBACK_FAILED={rollback_exc}')
+                  raise
+
+          attached=client.request('GET',f'/appStoreVersions/{version_id}/build').get('data') or {}
+          assert str(attached.get('id') or '') == new_id, attached
+          print('build12_attached=yes')
+
+          contact=apple_review_contact(app)
+          client.set_review_details(version_id,app,contact=contact or None)
+          result=client.submit_version(record['id'],version_id)
+          submission=result['submission']
+          print('apple_review_submission='+str(submission['id']))
+          print('apple_review_state='+str((submission.get('attributes') or {}).get('state') or ''))
+
+          Submission.objects.update_or_create(
+              app=app,
+              release=r,
+              platform='ios',
+              defaults={
+                  'state':'in_review',
+                  'external_id':submission['id'],
+                  'submitted_at':timezone.now(),
+                  'raw':result,
+              },
+          )
+          r.status='in_review'
+          r.readiness_snapshot=evaluate_release(r)
+          r.save(update_fields=['status','readiness_snapshot','updated_at'])
+
+          latest=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          if latest and latest.status == 'failed':
+              latest.status='succeeded'
+              latest.error=''
+              latest.result=result
+              latest.progress=100
+              latest.finished_at=timezone.now()
+              latest.append_log('Recovered by safely replacing rejected build 11 with valid build 12 and submitting review.')
+              latest.save(update_fields=['status','error','result','progress','finished_at','logs','updated_at'])
+
+          print('FINAL_IOS_SUBMIT=success')
           PY

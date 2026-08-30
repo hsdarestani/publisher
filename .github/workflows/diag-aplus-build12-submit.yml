@@ -16,7 +16,7 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
-      - name: Read build 12 and Apple review state
+      - name: Compare Apple marketing versions
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -28,47 +28,30 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
           from apps.integrations.apple_store import AppleStoreClient
-          from apps.publisher.models import Job, Release, Submission
+          from apps.publisher.models import Release
 
           r=Release.objects.get(id=32)
           app=r.app
-          print(f'release_status={r.status}')
-          for p in ('android','ios'):
-              b=r.builds.get(platform=p)
-              print(f'{p}_build={b.status} artifact={bool(b.artifact)} external_build_id={b.external_build_id or ""}')
-          for t in ('submit_google','upload_apple','submit_apple'):
-              j=Job.objects.filter(release=r,type=t).order_by('-created_at').first()
-              if j:
-                  err=(j.error or '').replace('\n',' ')[:1200]
-                  print(f'{t}={j.status} error={err}')
-                  if t == 'submit_apple' and j.logs:
-                      print('submit_apple_log_tail_BEGIN')
-                      print(j.logs[-6000:])
-                      print('submit_apple_log_tail_END')
-              else:
-                  print(f'{t}=missing')
-          for p in ('android','ios'):
-              s=Submission.objects.filter(release=r,platform=p).order_by('-created_at').first()
-              print(f'{p}_submission={(s.state if s else "missing")} external={(s.external_id if s else "")}')
-
           client=AppleStoreClient(app.apple_account)
           record=client.find_app(app.bundle_id)
           version=client.find_editable_version(record['id'],r.version_name)
-          print('apple_version_id='+(version['id'] if version else 'missing'))
-          if version:
-              attrs=version.get('attributes') or {}
-              print('apple_version_state='+str(attrs.get('appStoreState') or attrs.get('appVersionState') or ''))
-              rel=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data')
-              print('apple_attached_build='+str((rel or {}).get('id') or ''))
-          ios=r.builds.get(platform='ios')
-          if ios.external_build_id:
-              b=client.request('GET',f"/builds/{ios.external_build_id}").get('data') or {}
-              print('apple_build_processing='+str((b.get('attributes') or {}).get('processingState') or ''))
-          for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW'):
-              submissions=client.list_review_submissions(record['id'],state)
-              print(f'apple_review_{state}_count={len(submissions)}')
-              for sub in submissions[:5]:
-                  items=client.list_review_submission_items(sub['id'])
-                  matches=[item for item in items if version and client._item_targets_version(item,version['id'])]
-                  print(f"review={sub['id']} state={state} matches_version={bool(matches)} item_states={[((x.get('attributes') or {}).get('state')) for x in matches]}")
+          print('release_version='+r.version_name)
+          print('apple_version_state='+str((version.get('attributes') or {}).get('appStoreState') or ''))
+          attached=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data')
+          new_id=r.builds.get(platform='ios').external_build_id
+          print('attached_build='+str((attached or {}).get('id') or ''))
+          print('new_build='+str(new_id))
+
+          for label,build_id in [('attached',(attached or {}).get('id')),('new',new_id)]:
+              if not build_id:
+                  continue
+              build=client.request('GET',f'/builds/{build_id}').get('data') or {}
+              attrs=build.get('attributes') or {}
+              print(f'{label}_build_number='+str(attrs.get('version') or ''))
+              print(f'{label}_processing='+str(attrs.get('processingState') or ''))
+              pre=client.request('GET',f'/builds/{build_id}/preReleaseVersion').get('data') or {}
+              pattrs=pre.get('attributes') or {}
+              print(f'{label}_pre_release_id='+str(pre.get('id') or ''))
+              print(f'{label}_marketing_version='+str(pattrs.get('version') or ''))
+              print(f'{label}_platform='+str(pattrs.get('platform') or ''))
           PY

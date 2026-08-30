@@ -1,0 +1,46 @@
+name: Diagnose A+ build 12 submission
+
+on:
+  push:
+    branches: ['diag/aplus-build12-submit']
+    paths: ['.github/workflows/diag-aplus-build12-submit.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Read build 12 status
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job, Release, Submission
+          r=Release.objects.get(id=32)
+          print(f'release_status={r.status}')
+          for p in ('android','ios'):
+              b=r.builds.get(platform=p)
+              print(f'{p}_build={b.status} artifact={bool(b.artifact)} external_build_id={bool(b.external_build_id)}')
+          for t in ('submit_google','upload_apple','submit_apple'):
+              j=Job.objects.filter(release=r,type=t).order_by('-created_at').first()
+              if j:
+                  err=(j.error or '').replace('\n',' ')[:300]
+                  print(f'{t}={j.status} error={err}')
+              else:
+                  print(f'{t}=missing')
+          for p in ('android','ios'):
+              s=Submission.objects.filter(release=r,platform=p).order_by('-created_at').first()
+              print(f'{p}_submission={(s.state if s else "missing")} external={bool(s.external_id) if s else False}')
+          PY

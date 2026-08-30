@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'b9e024956026220fce9e5b9ba694b64f3138547c'
+  APLUS_COMMIT: 'f27ae1c4f3473de6f6955a272845e13988ca7810'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -239,7 +239,7 @@ jobs:
         with:
           script: |
             for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
-              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id, ref: 'main'});
+              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.owner ? context.repo.repo : context.repo.repo, workflow_id, ref: 'main'});
             }
 
       - name: Wait for signed Android AAB and iOS IPA

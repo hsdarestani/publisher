@@ -1,0 +1,62 @@
+name: Kick A+ Solution final Dienstplan release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kick-aplus-solution-current-20260830.yml'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pin current release to final production commit
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.github/workflows/aplus-solution-current-release.yml')
+          text=p.read_text()
+          old="APLUS_COMMIT: 'b9e024956026220fce9e5b9ba694b64f3138547c'"
+          new="APLUS_COMMIT: 'f27ae1c4f3473de6f6955a272845e13988ca7810'"
+          if new in text:
+              print('Already pinned to final commit.')
+          else:
+              if old not in text:
+                  raise SystemExit('Expected prior APLUS_COMMIT pin not found; refusing to guess.')
+              p.write_text(text.replace(old,new,1))
+          PY
+      - name: Commit release pin
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo 'No pin change needed.'
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add .github/workflows/aplus-solution-current-release.yml
+            git commit -m 'Release final A+ Solution Dienstplan build'
+            git push origin HEAD:main
+          fi
+      - name: Dispatch official current-store release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if gh api repos/${GITHUB_REPOSITORY}/contents/.github/workflows/aplus-solution-current-release.yml?ref=main --jq '.content' | base64 -d | grep -Fq "APLUS_COMMIT: 'f27ae1c4f3473de6f6955a272845e13988ca7810'"; then
+              gh workflow run aplus-solution-current-release.yml --ref main
+              echo 'Official A+ Solution current-store release dispatched.'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'Updated release workflow was not visible on main in time.' >&2
+          exit 1

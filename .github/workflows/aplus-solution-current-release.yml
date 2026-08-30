@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '843b51e703181f7538b1255bbfd630fac246ac71'
+  APLUS_COMMIT: 'b9e024956026220fce9e5b9ba694b64f3138547c'
   STATUS_ISSUE: '74'
 
 jobs:

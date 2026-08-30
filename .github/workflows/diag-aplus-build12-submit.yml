@@ -16,7 +16,7 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
-      - name: Read build 12 status
+      - name: Read build 12 and Apple review state
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -27,20 +27,48 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.integrations.apple_store import AppleStoreClient
           from apps.publisher.models import Job, Release, Submission
+
           r=Release.objects.get(id=32)
+          app=r.app
           print(f'release_status={r.status}')
           for p in ('android','ios'):
               b=r.builds.get(platform=p)
-              print(f'{p}_build={b.status} artifact={bool(b.artifact)} external_build_id={bool(b.external_build_id)}')
+              print(f'{p}_build={b.status} artifact={bool(b.artifact)} external_build_id={b.external_build_id or ""}')
           for t in ('submit_google','upload_apple','submit_apple'):
               j=Job.objects.filter(release=r,type=t).order_by('-created_at').first()
               if j:
-                  err=(j.error or '').replace('\n',' ')[:300]
+                  err=(j.error or '').replace('\n',' ')[:1200]
                   print(f'{t}={j.status} error={err}')
+                  if t == 'submit_apple' and j.logs:
+                      print('submit_apple_log_tail_BEGIN')
+                      print(j.logs[-6000:])
+                      print('submit_apple_log_tail_END')
               else:
                   print(f'{t}=missing')
           for p in ('android','ios'):
               s=Submission.objects.filter(release=r,platform=p).order_by('-created_at').first()
-              print(f'{p}_submission={(s.state if s else "missing")} external={bool(s.external_id) if s else False}')
+              print(f'{p}_submission={(s.state if s else "missing")} external={(s.external_id if s else "")}')
+
+          client=AppleStoreClient(app.apple_account)
+          record=client.find_app(app.bundle_id)
+          version=client.find_editable_version(record['id'],r.version_name)
+          print('apple_version_id='+(version['id'] if version else 'missing'))
+          if version:
+              attrs=version.get('attributes') or {}
+              print('apple_version_state='+str(attrs.get('appStoreState') or attrs.get('appVersionState') or ''))
+              rel=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data')
+              print('apple_attached_build='+str((rel or {}).get('id') or ''))
+          ios=r.builds.get(platform='ios')
+          if ios.external_build_id:
+              b=client.request('GET',f"/builds/{ios.external_build_id}").get('data') or {}
+              print('apple_build_processing='+str((b.get('attributes') or {}).get('processingState') or ''))
+          for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW'):
+              submissions=client.list_review_submissions(record['id'],state)
+              print(f'apple_review_{state}_count={len(submissions)}')
+              for sub in submissions[:5]:
+                  items=client.list_review_submission_items(sub['id'])
+                  matches=[item for item in items if version and client._item_targets_version(item,version['id'])]
+                  print(f"review={sub['id']} state={state} matches_version={bool(matches)} item_states={[((x.get('attributes') or {}).get('state')) for x in matches]}")
           PY

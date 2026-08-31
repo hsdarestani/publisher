@@ -79,7 +79,7 @@ def set_store_review_credentials(request):
         return JsonResponse({"ok": False, "error": "invalid_bundle"}, status=400)
     if not _authorized_store_workflow(request, bundle_id):
         return JsonResponse({"ok": False, "error": "unauthorized"}, status=401)
-    if not username or not password or len(password) < 20:
+    if not username or not password:
         return JsonResponse({"ok": False, "error": "invalid_credentials"}, status=400)
 
     app = (

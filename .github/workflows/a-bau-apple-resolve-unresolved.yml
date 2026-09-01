@@ -1,4 +1,4 @@
-# retry 4
+# retry 5
 name: Resolve rejected A+Bau item and resubmit
 
 on:
@@ -21,7 +21,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve Apple unresolved issue and resubmit build 22007
+      - name: Sync Apple review access, resolve issue, and resubmit build 22007
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -58,6 +58,18 @@ jobs:
           if not build or not build.external_build_id:
               raise SystemExit('ERROR no processed iOS build id for 22007')
 
+          # The Sept 1 rejection is Guideline 2.1 Information Needed: Apple used a
+          # stale demo password. Never print the password; use the encrypted stable
+          # credential already stored in Publisher and sync it directly to ASC.
+          review_password=app.get_review_password()
+          if not review_password:
+              raise SystemExit('ERROR Publisher has no encrypted A+Bau review password')
+          if app.review_username != 'demo':
+              raise SystemExit(f'ERROR unexpected review username: {app.review_username!r}')
+          if not app.requires_login:
+              app.requires_login=True
+              app.save(update_fields=['requires_login','updated_at'])
+
           c=AppleStoreClient(app.apple_account)
           aa=c.find_app(app.bundle_id)
           app_id=aa['id']
@@ -68,6 +80,15 @@ jobs:
           print('APP', app_id)
           print('VERSION', version_id, version.get('attributes',{}).get('appStoreState') or version.get('attributes',{}).get('appVersionState'))
           print('BUILD', build.external_build_id)
+
+          c.set_review_details(version_id, app)
+          synced=c.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          attrs=synced.get('attributes',{})
+          if attrs.get('demoAccountName') != 'demo':
+              raise SystemExit(f"ERROR Apple review username did not sync: {attrs.get('demoAccountName')!r}")
+          if attrs.get('demoAccountRequired') is not True:
+              raise SystemExit('ERROR Apple review account is not marked required')
+          print('REVIEW_DETAILS_SYNCED username=demo password=stored_encrypted_not_printed')
 
           c.attach_build(version_id, build.external_build_id)
 
@@ -120,7 +141,7 @@ jobs:
 
           Submission.objects.update_or_create(
               app=app, release=rel, platform='ios',
-              defaults={'state':'in_review','external_id':submission_id,'submitted_at':timezone.now(),'raw':{'apple_state':state,'resolved_unresolved_issue':True}},
+              defaults={'state':'in_review','external_id':submission_id,'submitted_at':timezone.now(),'raw':{'apple_state':state,'resolved_unresolved_issue':True,'review_credentials_synced':True}},
           )
           rel.status='in_review'
           rel.save(update_fields=['status','updated_at'])

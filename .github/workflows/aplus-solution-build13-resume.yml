@@ -1,0 +1,188 @@
+name: A+ Solution 1.0.6 Build 13 Resume
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build13-resume.yml'
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+env:
+  RELEASE_ID: '33'
+  APLUS_COMMIT: 'e1ac3a0a1c327c02d50c92fb98ecda819e57c836'
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Verify production and review login
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 12 --retry-delay 5 https://solution.smarbiz.sbs/health/ >/dev/null
+          PORT="${SSH_PORT:-22}"
+          REVIEW_SECRET_B64="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); p=a.get_review_password(); assert a.review_username=='store-review@aplus-solution.de' and p; print(base64.b64encode(p.encode()).decode())\"" \
+            | tail -n 1 | tr -d '\r')"
+          test -n "$REVIEW_SECRET_B64"
+          REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          export REVIEW_PASSWORD
+          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://solution.smarbiz.sbs/api/auth/login/
+          import json, os
+          print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          test "$CODE" = '200'
+
+      - name: Wait for Android AAB and iOS IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os
+          from apps.publisher.models import Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          vals = []
+          for platform, job_type in [('android','build_android'),('ios','build_ios')]:
+              b = r.builds.get(platform=platform)
+              f = Job.objects.filter(build=b,type=job_type,status='failed').order_by('-created_at').first()
+              vals.append(':'.join([platform,b.status,'artifact' if b.artifact else '',(f.error or '')[:180].replace('|','/') if f else '']))
+          print('|'.join(vals))
+          PY
+            )"
+            echo "Native build state: $STATE"
+            if [[ "$STATE" == *":failed:"* ]]; then echo "$STATE" >&2; exit 1; fi
+            if [[ "$STATE" == android:succeeded:artifact:*"|"ios:succeeded:artifact:* ]]; then exit 0; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for native artifacts.' >&2
+          exit 1
+
+      - name: Queue Google submit and Apple upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Job, Release
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(id=os.environ['RELEASE_ID']); app=r.app
+          android=r.builds.get(platform='android'); ios=r.builds.get(platform='ios')
+          assert android.status=='succeeded' and android.artifact
+          assert ios.status=='succeeded' and ios.artifact
+          if not Job.objects.filter(release=r,type='submit_google',status__in=['queued','running','succeeded']).exists():
+              enqueue_job('submit_google',app=app,release=r,build=android)
+          if not ios.external_build_id and not Job.objects.filter(build=ios,type='upload_apple',status__in=['queued','running','succeeded']).exists():
+              enqueue_job('upload_apple',app=app,release=r,build=ios,agent=True,platform='macos')
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id: 'cloud-macos.yml', ref: 'main'});
+
+      - name: Wait for Google delivery and Apple processed build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 180); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Job,Release; r=Release.objects.get(id=os.environ['RELEASE_ID']); i=r.builds.get(platform='ios'); g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first(); u=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first(); print('|'.join([g.status if g else 'missing',(g.error or '')[:180].replace('|','/') if g else '',u.status if u else ('succeeded' if i.external_build_id else 'missing'),(u.error or '')[:180].replace('|','/') if u else '',i.external_build_id or '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Store delivery state: $STATE"
+            IFS='|' read -r GST GERR UST UERR APPLE_ID <<< "$STATE"
+            if [ "$GST" = 'failed' ]; then echo "Google submit failed: $GERR" >&2; exit 1; fi
+            if [ "$UST" = 'failed' ]; then echo "Apple upload failed: $UERR" >&2; exit 1; fi
+            if [ "$GST" = 'succeeded' ] && [ -n "$APPLE_ID" ]; then exit 0; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for store delivery.' >&2
+          exit 1
+
+      - name: Queue current build for Apple review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os, time
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Job, Release
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(id=os.environ['RELEASE_ID']); app=r.app; build=r.builds.get(platform='ios')
+          assert build.status=='succeeded' and build.external_build_id
+          client=AppleStoreClient(app.apple_account); apple_app=client.find_app(app.bundle_id); version=client.ensure_version(apple_app['id'],r.version_name); version_id=str(version['id'])
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              for submission in client.list_review_submissions(apple_app['id'],state):
+                  item,_=client._review_submission_matches(submission,version_id)
+                  if item:
+                      client.cancel_review_submission(submission['id'])
+          time.sleep(3)
+          if not Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).exists():
+              enqueue_job('submit_apple',app=app,release=r,build=build)
+          PY
+
+      - name: Wait for both stores submitted
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Job,Release,Submission; r=Release.objects.get(id=os.environ['RELEASE_ID']); g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first(); a=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first(); gs=Submission.objects.filter(release=r,platform='android').first(); aps=Submission.objects.filter(release=r,platform='ios').first(); print('|'.join([g.status if g else 'missing',(g.error or '')[:220].replace('|','/') if g else '',a.status if a else 'missing',(a.error or '')[:220].replace('|','/') if a else '',gs.state if gs else '',aps.state if aps else '',aps.external_id if aps else '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Review submission state: $STATE"
+            IFS='|' read -r GST GERR AST AERR GS AS AID <<< "$STATE"
+            if [ "$GST" = 'failed' ]; then echo "Google failed: $GERR" >&2; exit 1; fi
+            if [ "$AST" = 'failed' ]; then echo "Apple failed: $AERR" >&2; exit 1; fi
+            if [ "$GST" = 'succeeded' ] && [ "$AST" = 'succeeded' ] && [ -n "$GS" ] && [ -n "$AS" ]; then exit 0; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for review submissions.' >&2
+          exit 1
+
+      - name: Confirm completion
+        run: echo 'A+ Solution 1.0.6 build 13 submitted to Google Play and Apple App Review.'

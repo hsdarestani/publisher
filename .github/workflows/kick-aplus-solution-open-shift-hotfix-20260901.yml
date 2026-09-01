@@ -1,0 +1,43 @@
+name: Kick A+ Solution OpenShift Hotfix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kick-aplus-solution-open-shift-hotfix-20260901.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Point current A+ release at hotfix commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('.github/workflows/aplus-solution-current-release.yml')
+          text = path.read_text()
+          replacement = "  APLUS_COMMIT: 'e1ac3a0a1c327c02d50c92fb98ecda819e57c836'"
+          updated, count = re.subn(r"^  APLUS_COMMIT: '[0-9a-f]+'$", replacement, text, count=1, flags=re.M)
+          if count != 1:
+              raise SystemExit('Could not update APLUS_COMMIT exactly once')
+          path.write_text(updated)
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/aplus-solution-current-release.yml
+          if git diff --cached --quiet; then
+            echo 'Current release already points at the requested commit.'
+            exit 0
+          fi
+          git commit -m 'Release A+ Solution OpenShift dashboard hotfix'
+          git push origin HEAD:main

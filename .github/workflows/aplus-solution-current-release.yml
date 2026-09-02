@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'cee3f5bbe0b87605082f98170c77163819f9d46d'
+  APLUS_COMMIT: '7c353069db8399f4af501928dcb43cc415605b50'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, contracts/documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This update improves mobile shift scheduling, multi-select filters, worker reassignment, keyboard-aware notes, '
-              'foreground notifications, notification settings and filtered PDF schedule exports. There are no in-app purchases.'
+              'This update fixes direct shift date selection, PDF exports and native file sharing, explicit all-worker/all-customer filters, '
+              'location-only schedule cards, the copy review transition and readable notification settings. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Verbesserte mobile Dienstplanung, Mehrfachfilter, Mitarbeiterauswahl, Notizen, Benachrichtigungen und PDF-Export.'
+              loc.release_notes='Korrekturen für Kalender, PDF-Export mit Teilen/Speichern, Filter, Schichtkopien und Benachrichtigungstexte.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Mobile Dienstplanung, konfigurierbare Benachrichtigungen und gefilterter PDF-Export.'
+          release.release_notes='Kalender und PDF-Export korrigiert; Schichtkopien mit Animation und lesbare Benachrichtigungseinstellungen.'
           release.save()
 
           queued=[]

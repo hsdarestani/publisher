@@ -1,0 +1,341 @@
+name: Resume A+ Solution build 17 store release
+
+on:
+  push:
+    branches: [ops/aplus-build17-recovery]
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+env:
+  APLUS_COMMIT: '7c353069db8399f4af501928dcb43cc415605b50'
+  STATUS_ISSUE: '74'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Wait for exact A+ production deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 160); do
+            JSON="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/issues/84)"
+            STATE="$(printf '%s' "$JSON" | jq -r '.state')"
+            BODY="$(printf '%s' "$JSON" | jq -r '.body // ""')"
+            if printf '%s' "$BODY" | grep -Fq "Commit: $APLUS_COMMIT"; then
+              if printf '%s' "$BODY" | grep -Fq 'Overall: **failed**'; then
+                echo 'Exact production deployment failed.' >&2
+                printf '%s\n' "$BODY" >&2
+                exit 1
+              fi
+              if [ "$STATE" = 'closed' ] && printf '%s' "$BODY" | grep -Fq 'Overall: **success**'; then
+                curl -fsS --retry 12 --retry-delay 5 https://solution.smarbiz.sbs/health/ >/dev/null
+                echo "Exact production commit is live: $APLUS_COMMIT"
+                exit 0
+              fi
+            fi
+            echo "Waiting for production commit $APLUS_COMMIT ($i/160)..."
+            sleep 15
+          done
+          echo 'Timed out waiting for exact production deployment.' >&2
+          exit 1
+
+      - name: Validate App Review login on production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          REVIEW_SECRET_B64="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); assert a.review_username=='store-review@aplus-solution.de'; p=a.get_review_password(); assert p; print(base64.b64encode(p.encode()).decode())\"" \
+            | tail -n 1 | tr -d '\r')"
+          test -n "$REVIEW_SECRET_B64"
+          echo "::add-mask::$REVIEW_SECRET_B64"
+          REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          export REVIEW_PASSWORD
+          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://solution.smarbiz.sbs/api/auth/login/
+          import json, os
+          print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          test "$CODE" = '200'
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/login.json'))
+          user=data.get('user') or {}
+          assert data.get('access') and data.get('refresh')
+          assert user.get('email') == 'store-review@aplus-solution.de'
+          assert user.get('role') == 'worker'
+          print('reviewer_login=verified')
+          PY
+
+      - name: Resume exact release and retry only failed native builds
+        id: prepare
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os
+          from apps.publisher.models import Build, Job, Release
+          from apps.publisher.tasks import enqueue_job
+          r = Release.objects.get(id=38, app__slug='a-plus-solution', build_number=17)
+          assert r.source_commit == os.environ['APLUS_COMMIT']
+          r.status = 'building'
+          r.save(update_fields=['status', 'updated_at'])
+          for platform, kind, runner in [('android','build_android','linux'), ('ios','build_ios','macos')]:
+              b = Build.objects.get(release=r, platform=platform)
+              if b.status == 'succeeded' and b.artifact:
+                  continue
+              if Job.objects.filter(build=b, type=kind, status__in=['queued','running']).exists():
+                  continue
+              assert b.status in ['failed', 'queued'], (platform, b.status)
+              b.status = 'queued'
+              b.finished_at = None
+              b.save(update_fields=['status', 'finished_at', 'updated_at'])
+              job = enqueue_job(kind, app=r.app, release=r, build=b, payload={'source':'resume-build17-after-maven-429'}, agent=True, platform=runner)
+              print('REQUEUED=' + str(job.id))
+          print('RELEASE_META_JSON=' + json.dumps({'release_id': str(r.id), 'version': r.version_name, 'build': r.build_number}))
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^RELEASE_META_JSON=//p' | tail -n 1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | jq -r '.release_id')" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | jq -r '.build')" >> "$GITHUB_OUTPUT"
+          echo "apple_state=RESUMING_EXISTING_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish build-start status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+          APPLE_STATE: ${{ steps.prepare.outputs.apple_state }}
+        run: |
+          body=$(printf 'A+ Solution store release is running.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Previous Apple state: **%s**\n- Production deploy: **verified**\n- Android AAB: **building**\n- iOS IPA: **building**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$APPLE_STATE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null
+
+      - name: Wake Android and iOS cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.owner ? context.repo.repo : context.repo.repo, workflow_id, ref: 'main'});
+            }
+
+      - name: Wait for signed Android AAB and iOS IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Build, Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          values = []
+          for platform, job_type in [('android', 'build_android'), ('ios', 'build_ios')]:
+              b = Build.objects.get(release=r, platform=platform)
+              failed = Job.objects.filter(build=b, type=job_type).order_by('-created_at').first()
+              error = re.sub(r'\s+', ' ', str(failed.error or '')).replace('|', '/')[:300] if failed and failed.status == 'failed' else ''
+              values.append(':'.join([platform, b.status, 'artifact' if b.artifact else '', error]))
+          print('|'.join(values))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Native build state: $STATE"
+            if [[ "$STATE" == *"failed"* ]]; then echo "$STATE" >&2; exit 1; fi
+            if [[ "$STATE" == android:succeeded:artifact:*"|"ios:succeeded:artifact:* ]]; then exit 0; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for native artifacts.' >&2
+          exit 1
+
+      - name: Queue Google Play submit and Apple upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Job,Release
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(id=os.environ['RELEASE_ID']); app=r.app
+          android=r.builds.get(platform='android'); ios=r.builds.get(platform='ios')
+          assert android.status=='succeeded' and android.artifact
+          assert ios.status=='succeeded' and ios.artifact
+          if not Job.objects.filter(release=r,type='submit_google',status__in=['queued','running','succeeded']).exists():
+              print('queued_google='+str(enqueue_job('submit_google',app=app,release=r,build=android).id))
+          if not ios.external_build_id and not Job.objects.filter(build=ios,type='upload_apple',status__in=['queued','running','succeeded']).exists():
+              print('queued_apple_upload='+str(enqueue_job('upload_apple',app=app,release=r,build=ios,agent=True,platform='macos').id))
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id: 'cloud-macos.yml', ref: 'main'});
+
+      - name: Wait for Google submission and Apple processed build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 180); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          i = r.builds.get(platform='ios')
+          g = Job.objects.filter(release=r, type='submit_google').order_by('-created_at').first()
+          u = Job.objects.filter(release=r, type='upload_apple').order_by('-created_at').first()
+          def error(job):
+              return re.sub(r'\s+', ' ', str(job.error or '')).replace('|', '/')[:300] if job else ''
+          print('|'.join([g.status if g else 'missing', error(g), u.status if u else ('succeeded' if i.external_build_id else 'missing'), error(u), i.external_build_id or '']))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Store delivery state: $STATE"
+            IFS='|' read -r GST GERR UST UERR APPLE_ID <<< "$STATE"
+            if [ "$GST" = 'failed' ]; then echo "Google submit failed: $GERR" >&2; exit 1; fi
+            if [ "$UST" = 'failed' ]; then echo "Apple upload failed: $UERR" >&2; exit 1; fi
+            if [ "$GST" = 'succeeded' ] && [ -n "$APPLE_ID" ]; then exit 0; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for store delivery.' >&2
+          exit 1
+
+      - name: Cancel prior Apple review for this version and queue current submit
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os,time
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Job,Release
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(id=os.environ['RELEASE_ID']); app=r.app; build=r.builds.get(platform='ios')
+          assert build.status=='succeeded' and build.external_build_id
+          client=AppleStoreClient(app.apple_account); apple_app=client.find_app(app.bundle_id); version=client.ensure_version(apple_app['id'],r.version_name); version_id=str(version['id'])
+          canceled=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              for submission in client.list_review_submissions(apple_app['id'],state):
+                  item,_=client._review_submission_matches(submission,version_id)
+                  if item:
+                      client.cancel_review_submission(submission['id']); canceled.append(submission['id'])
+          if canceled:
+              for _ in range(30):
+                  active=False
+                  for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                      for submission in client.list_review_submissions(apple_app['id'],state):
+                          item,_=client._review_submission_matches(submission,version_id)
+                          if item: active=True; break
+                      if active: break
+                  if not active: break
+                  time.sleep(2)
+              if active: raise SystemExit('Prior Apple review did not leave the active queue.')
+          if not Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).exists():
+              print('queued_submit_apple='+str(enqueue_job('submit_apple',app=app,release=r,build=build).id))
+          print('canceled_prior_reviews='+','.join(canceled))
+          PY
+
+      - name: Wait for both stores submitted
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Job, Release, Submission
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          g = Job.objects.filter(release=r, type='submit_google').order_by('-created_at').first()
+          a = Job.objects.filter(release=r, type='submit_apple').order_by('-created_at').first()
+          gs = Submission.objects.filter(release=r, platform='android').first()
+          apple = Submission.objects.filter(release=r, platform='ios').first()
+          def error(job):
+              return re.sub(r'\s+', ' ', str(job.error or '')).replace('|', '/')[:300] if job else ''
+          print('|'.join([g.status if g else 'missing', error(g), a.status if a else 'missing', error(a), gs.state if gs else '', apple.state if apple else '', apple.external_id if apple else '']))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Review submission state: $STATE"
+            IFS='|' read -r GST GERR AST AERR GS AS AID <<< "$STATE"
+            if [ "$GST" = 'failed' ]; then echo "Google failed: $GERR" >&2; exit 1; fi
+            if [ "$AST" = 'failed' ]; then echo "Apple failed: $AERR" >&2; exit 1; fi
+            if [ "$GST" = 'succeeded' ] && [ "$AST" = 'succeeded' ] && [ -n "$GS" ] && [ -n "$AS" ]; then exit 0; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for review submissions.' >&2
+          exit 1
+
+      - name: Publish final verified store status
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+        run: |
+          body=$(printf '✅ A+ Solution current release was built and submitted to both stores.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Production: **live and verified**\n- Google Play production: **submitted**\n- App Store Connect: **submitted for review**\n- Workflow: %s/%s/actions/runs/%s\n\nStore review/processing is now controlled by Google and Apple.' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=closed >/dev/null
+
+      - name: Publish failure status
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+        run: |
+          body=$(printf '❌ A+ Solution store release hit a blocker.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Workflow: %s/%s/actions/runs/%s\n\nOpen the failed workflow step for the exact blocker.' "$APLUS_COMMIT" "${VERSION:-pending}" "${BUILD:-pending}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null

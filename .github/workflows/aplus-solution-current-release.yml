@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'e1ac3a0a1c327c02d50c92fb98ecda819e57c836'
+  APLUS_COMMIT: 'cee3f5bbe0b87605082f98170c77163819f9d46d'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, contracts/documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This update contains the current production release including payroll-preparation consistency, contract/ANÜ document flows, '
-              'availability and shift-swap behavior, notifications, reporting and workforce automation. There are no in-app purchases.'
+              'This update improves mobile shift scheduling, multi-select filters, worker reassignment, keyboard-aware notes, '
+              'foreground notifications, notification settings and filtered PDF schedule exports. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Stabilitäts- und Funktionsupdate für Dienstplanung, Arbeitszeitkonto, Verträge, Benachrichtigungen, Reports und Automatisierung.'
+              loc.release_notes='Verbesserte mobile Dienstplanung, Mehrfachfilter, Mitarbeiterauswahl, Notizen, Benachrichtigungen und PDF-Export.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Stabilitäts- und Funktionsupdate für die aktuelle A+ Solution Workforce-App.'
+          release.release_notes='Mobile Dienstplanung, konfigurierbare Benachrichtigungen und gefilterter PDF-Export.'
           release.save()
 
           queued=[]
@@ -254,7 +254,20 @@ jobs:
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 240); do
             STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build,Job,Release; r=Release.objects.get(id=os.environ['RELEASE_ID']); vals=[];\nfor p,t in [('android','build_android'),('ios','build_ios')]:\n b=Build.objects.get(release=r,platform=p); f=Job.objects.filter(build=b,type=t,status='failed').order_by('-created_at').first(); vals.append(':'.join([p,b.status,'artifact' if b.artifact else '',(f.error or '')[:180].replace('|','/') if f else '']));\nprint('|'.join(vals))\"" | tail -n 1 | tr -d '\r')"
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Build, Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          values = []
+          for platform, job_type in [('android', 'build_android'), ('ios', 'build_ios')]:
+              b = Build.objects.get(release=r, platform=platform)
+              failed = Job.objects.filter(build=b, type=job_type, status='failed').order_by('-created_at').first()
+              error = re.sub(r'\s+', ' ', str(failed.error or '')).replace('|', '/')[:300] if failed else ''
+              values.append(':'.join([platform, b.status, 'artifact' if b.artifact else '', error]))
+          print('|'.join(values))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
             echo "Native build state: $STATE"
             if [[ "$STATE" == *"failed"* ]]; then echo "$STATE" >&2; exit 1; fi
             if [[ "$STATE" == android:succeeded:artifact:*"|"ios:succeeded:artifact:* ]]; then exit 0; fi
@@ -306,7 +319,19 @@ jobs:
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 180); do
             STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Job,Release,Submission; r=Release.objects.get(id=os.environ['RELEASE_ID']); i=r.builds.get(platform='ios'); g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first(); u=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first(); print('|'.join([g.status if g else 'missing',(g.error or '')[:180].replace('|','/') if g else '',u.status if u else ('succeeded' if i.external_build_id else 'missing'),(u.error or '')[:180].replace('|','/') if u else '',i.external_build_id or '']))\"" | tail -n 1 | tr -d '\r')"
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          i = r.builds.get(platform='ios')
+          g = Job.objects.filter(release=r, type='submit_google').order_by('-created_at').first()
+          u = Job.objects.filter(release=r, type='upload_apple').order_by('-created_at').first()
+          def error(job):
+              return re.sub(r'\s+', ' ', str(job.error or '')).replace('|', '/')[:300] if job else ''
+          print('|'.join([g.status if g else 'missing', error(g), u.status if u else ('succeeded' if i.external_build_id else 'missing'), error(u), i.external_build_id or '']))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
             echo "Store delivery state: $STATE"
             IFS='|' read -r GST GERR UST UERR APPLE_ID <<< "$STATE"
             if [ "$GST" = 'failed' ]; then echo "Google submit failed: $GERR" >&2; exit 1; fi
@@ -370,7 +395,20 @@ jobs:
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 120); do
             STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Job,Release,Submission; r=Release.objects.get(id=os.environ['RELEASE_ID']); g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first(); a=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first(); gs=Submission.objects.filter(release=r,platform='android').first(); aps=Submission.objects.filter(release=r,platform='ios').first(); print('|'.join([g.status if g else 'missing',(g.error or '')[:220].replace('|','/') if g else '',a.status if a else 'missing',(a.error or '')[:220].replace('|','/') if a else '',gs.state if gs else '',aps.state if aps else '',aps.external_id if aps else '']))\"" | tail -n 1 | tr -d '\r')"
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Job, Release, Submission
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          g = Job.objects.filter(release=r, type='submit_google').order_by('-created_at').first()
+          a = Job.objects.filter(release=r, type='submit_apple').order_by('-created_at').first()
+          gs = Submission.objects.filter(release=r, platform='android').first()
+          apple = Submission.objects.filter(release=r, platform='ios').first()
+          def error(job):
+              return re.sub(r'\s+', ' ', str(job.error or '')).replace('|', '/')[:300] if job else ''
+          print('|'.join([g.status if g else 'missing', error(g), a.status if a else 'missing', error(a), gs.state if gs else '', apple.state if apple else '', apple.external_id if apple else '']))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
             echo "Review submission state: $STATE"
             IFS='|' read -r GST GERR AST AERR GS AS AID <<< "$STATE"
             if [ "$GST" = 'failed' ]; then echo "Google failed: $GERR" >&2; exit 1; fi

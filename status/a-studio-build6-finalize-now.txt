@@ -1,0 +1,1 @@
+Finalize A+ Studio 1.0.0 (6) after the matching Publisher deployment succeeds.

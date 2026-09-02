@@ -42,8 +42,9 @@ jobs:
           print('APP|bundle=' + str(app.bundle_id) + '|package=' + str(app.package_name or app.bundle_id))
           print('PUBLISHER_RELEASES')
           for release in Release.objects.filter(app=app).order_by('-created_at')[:20]:
-              builds = list(release.builds.values('platform','status','build_number','artifact_checksum'))
+              builds = list(release.builds.values('platform','status','external_build_id','commit_sha','artifact_checksum'))
               print('RELEASE|' + json.dumps({
+                  'id': str(release.id),
                   'version_name': release.version_name,
                   'build_number': release.build_number,
                   'status': release.status,

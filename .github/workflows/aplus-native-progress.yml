@@ -1,0 +1,34 @@
+name: Inspect A+ Solution native build progress
+on:
+  push:
+    branches: [ops/aplus-release-progress-20260902]
+permissions:
+  contents: read
+jobs:
+  progress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read release progress without credentials or build log contents
+        env:
+          DEPLOY_PASSWORD: ${{ secrets.PASS }}
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/askpass <<'SH'
+          #!/bin/sh
+          printf '%s\n' "$DEPLOY_PASSWORD"
+          SH
+          chmod 700 /tmp/askpass
+          export SSH_ASKPASS=/tmp/askpass SSH_ASKPASS_REQUIRE=force DISPLAY=:0
+          setsid -w ssh -T -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=no -o ConnectTimeout=20 root@"$DEPLOY_HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json, re
+          from apps.publisher.models import Release, Job
+          r = Release.objects.get(app__slug='a-plus-solution', source_commit='cee3f5bbe0b87605082f98170c77163819f9d46d', build_number=16)
+          rows = []
+          for b in r.builds.all():
+              phases = re.findall(r'ARCHIVE SUCCEEDED|EXPORT SUCCEEDED|SwiftCompile|CompileC|CodeSign|npm install|pod install|xcodebuild|BUILD SUCCESSFUL', b.logs or '')
+              rows.append({'platform': b.platform, 'status': b.status, 'artifact': bool(b.artifact), 'log_bytes': len(b.logs or ''), 'last_phase': phases[-1] if phases else None, 'updated_at': str(b.updated_at), 'finished_at': str(b.finished_at)})
+          print('NATIVE_BUILD_PROGRESS=' + json.dumps(rows))
+          PY

@@ -1,0 +1,159 @@
+name: Inspect current A+ Studio store state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-current-store-state.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          python -m pip install --disable-pip-version-check 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Inspect Publisher and Apple state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SSHPASS="$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Release, Submission
+
+          app = MobileApp.objects.get(slug='a-studio')
+          print('APP|bundle=' + str(app.bundle_id) + '|package=' + str(app.package_name or app.bundle_id))
+          print('PUBLISHER_RELEASES')
+          for release in Release.objects.filter(app=app).order_by('-created_at')[:20]:
+              builds = list(release.builds.values('platform','status','build_number','artifact_checksum'))
+              print('RELEASE|' + json.dumps({
+                  'version_name': release.version_name,
+                  'build_number': release.build_number,
+                  'status': release.status,
+                  'builds': builds,
+              }, sort_keys=True, default=str))
+          print('PUBLISHER_SUBMISSIONS')
+          for sub in Submission.objects.filter(app=app).order_by('-created_at')[:20]:
+              print('SUBMISSION|' + json.dumps({
+                  'platform': sub.platform,
+                  'state': sub.state,
+                  'external_id': sub.external_id,
+                  'release_id': str(sub.release_id),
+                  'submitted_at': sub.submitted_at,
+              }, sort_keys=True, default=str))
+
+          if not app.apple_account_id:
+              print('APPLE|not_configured')
+              raise SystemExit(0)
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          if not record:
+              print('APPLE|app_not_found')
+              raise SystemExit(0)
+          print('APPLE_APP|' + json.dumps({'id': record.get('id'), 'bundle': app.bundle_id}, sort_keys=True))
+          versions = client.list_versions(record['id'])
+          print('APPLE_VERSIONS')
+          for version in versions:
+              attrs = version.get('attributes', {})
+              print('APPLE_VERSION|' + json.dumps({
+                  'id': version.get('id'),
+                  'version': attrs.get('versionString'),
+                  'state': attrs.get('appStoreState'),
+                  'platform': attrs.get('platform'),
+              }, sort_keys=True))
+          try:
+              builds = client.list_builds(record['id'])
+          except Exception as exc:
+              print('APPLE_BUILDS_ERROR|' + str(exc)[:1000])
+              builds = []
+          print('APPLE_BUILDS')
+          for build in builds[:30]:
+              attrs = build.get('attributes', {})
+              print('APPLE_BUILD|' + json.dumps({
+                  'id': build.get('id'),
+                  'version': attrs.get('version'),
+                  'processing_state': (attrs.get('processingState') or attrs.get('processingStateV2')),
+                  'uploaded_date': attrs.get('uploadedDate'),
+                  'expired': attrs.get('expired'),
+              }, sort_keys=True, default=str))
+          print('APPLE_REVIEW_SUBMISSIONS')
+          for state in ('IN_REVIEW','WAITING_FOR_REVIEW','UNRESOLVED_ISSUES','READY_FOR_REVIEW','COMPLETE'):
+              try:
+                  submissions = client.list_review_submissions(record['id'], state)
+              except Exception as exc:
+                  print('APPLE_REVIEW_ERROR|' + state + '|' + str(exc)[:500])
+                  continue
+              for sub in submissions[:10]:
+                  print('APPLE_REVIEW|' + json.dumps({
+                      'id': sub.get('id'),
+                      'state': state,
+                      'submitted_date': sub.get('attributes', {}).get('submittedDate'),
+                  }, sort_keys=True, default=str))
+          PY
+
+      - name: Inspect Google Play tracks and version codes
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          PACKAGE_NAME: de.aplussolution.studio
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo 'GOOGLE|service_account_missing'
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os
+          from urllib.parse import quote
+          from google.auth.transport.requests import AuthorizedSession, Request
+          from google.oauth2 import service_account
+
+          package = os.environ['PACKAGE_NAME']
+          info = json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds = service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/androidpublisher'])
+          creds.refresh(Request())
+          session = AuthorizedSession(creds)
+          api = 'https://androidpublisher.googleapis.com/androidpublisher/v3'
+          q = lambda v: quote(str(v), safe='._-')
+
+          def req(method, url, **kwargs):
+              response = session.request(method, url, timeout=60, **kwargs)
+              if not response.ok:
+                  print('GOOGLE_ERROR|HTTP ' + str(response.status_code) + '|' + response.text[:2000].replace('\n',' '))
+                  raise SystemExit(0)
+              return response.json() if response.content else {}
+
+          edit = req('POST', f'{api}/applications/{q(package)}/edits', json={})['id']
+          print('GOOGLE_EDIT|' + edit)
+          try:
+              bundles = req('GET', f'{api}/applications/{q(package)}/edits/{q(edit)}/bundles').get('bundles', [])
+              codes = sorted({int(b.get('versionCode', 0)) for b in bundles if b.get('versionCode') is not None})
+              print('GOOGLE_VERSION_CODES|' + json.dumps(codes))
+              for track_name in ('production','internal','alpha','beta'):
+                  response = session.get(f'{api}/applications/{q(package)}/edits/{q(edit)}/tracks/{q(track_name)}', timeout=60)
+                  if response.status_code == 404:
+                      continue
+                  if not response.ok:
+                      print('GOOGLE_TRACK_ERROR|' + track_name + '|HTTP ' + str(response.status_code) + '|' + response.text[:1000].replace('\n',' '))
+                      continue
+                  print('GOOGLE_TRACK|' + track_name + '|' + json.dumps(response.json(), sort_keys=True, ensure_ascii=False))
+          finally:
+              session.delete(f'{api}/applications/{q(package)}/edits/{q(edit)}', timeout=30)
+          PY

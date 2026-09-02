@@ -31,4 +31,7 @@ jobs:
               phases = re.findall(r'ARCHIVE SUCCEEDED|EXPORT SUCCEEDED|SwiftCompile|CompileC|CodeSign|npm install|pod install|xcodebuild|BUILD SUCCESSFUL', b.logs or '')
               rows.append({'platform': b.platform, 'status': b.status, 'artifact': bool(b.artifact), 'log_bytes': len(b.logs or ''), 'last_phase': phases[-1] if phases else None, 'updated_at': str(b.updated_at), 'finished_at': str(b.finished_at)})
           print('NATIVE_BUILD_PROGRESS=' + json.dumps(rows))
+          from apps.publisher.models import Submission
+          print('STORE_PROGRESS=' + json.dumps(list(Job.objects.filter(release=r, type__in=['submit_google', 'upload_apple', 'submit_apple']).values('id', 'type', 'status', 'updated_at')), default=str))
+          print('STORE_SUBMISSIONS=' + json.dumps(list(Submission.objects.filter(release=r).values('platform', 'state')), default=str))
           PY

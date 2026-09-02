@@ -1,0 +1,51 @@
+name: Dispatch A+ Studio Build 6 finalizer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'status/a-studio-build6-finalize-now.txt'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: a-studio-build6-finalize-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Wait for matching Publisher deploy to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            JSON="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&per_page=20")"
+            STATUS="$(printf '%s' "$JSON" | jq -r '[.workflow_runs[] | select(.name == "Validate and deploy A+ Publisher")][0].status // "missing"')"
+            CONCLUSION="$(printf '%s' "$JSON" | jq -r '[.workflow_runs[] | select(.name == "Validate and deploy A+ Publisher")][0].conclusion // ""')"
+            echo "DEPLOY|status=${STATUS}|conclusion=${CONCLUSION}"
+            if [ "$STATUS" = completed ]; then
+              if [ "$CONCLUSION" = success ]; then
+                exit 0
+              fi
+              echo "::error::Matching Publisher deploy finished with conclusion=${CONCLUSION}."
+              exit 2
+            fi
+            sleep 10
+          done
+          echo '::error::Timed out waiting for matching Publisher deploy.'
+          exit 2
+
+      - name: Dispatch Build 6 finalizer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run a-studio-build6-post-deploy-finalize.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo 'A+ Studio Build 6 finalizer dispatched.'

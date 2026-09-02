@@ -25,7 +25,8 @@ jobs:
           setsid -w ssh -T -p "${DEPLOY_PORT:-22}" -o StrictHostKeyChecking=no -o ConnectTimeout=20 root@"$DEPLOY_HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
           import json, re
           from apps.publisher.models import Release, Job
-          r = Release.objects.get(app__slug='a-plus-solution', source_commit='cee3f5bbe0b87605082f98170c77163819f9d46d', build_number=16)
+          r = Release.objects.filter(app__slug='a-plus-solution', source_commit='7c353069db8399f4af501928dcb43cc415605b50').latest('created_at')
+          print('NATIVE_RELEASE=' + json.dumps({'version': r.version_name, 'build': r.build_number, 'source': r.source_commit}))
           rows = []
           for b in r.builds.all():
               phases = re.findall(r'ARCHIVE SUCCEEDED|EXPORT SUCCEEDED|SwiftCompile|CompileC|CodeSign|npm install|pod install|xcodebuild|BUILD SUCCESSFUL', b.logs or '')

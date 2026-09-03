@@ -1,0 +1,57 @@
+name: A+ Studio Withdraw Build 7 Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-withdraw-build7.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  withdraw:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Withdraw current A+ Studio review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Submission
+
+          app=MobileApp.objects.get(slug='a-studio')
+          client=AppleStoreClient(app.apple_account)
+          record=client.find_app(app.bundle_id)
+          if not record:
+              raise SystemExit('A+ Studio not found in App Store Connect')
+          version=next((v for v in client.list_versions(record['id']) if v.get('attributes',{}).get('versionString')=='1.0.0'),None)
+          if not version:
+              raise SystemExit('A+ Studio 1.0.0 not found')
+          vid=str(version['id'])
+          found=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'],state):
+                  item,_=client._review_submission_matches(sub,vid)
+                  if item:
+                      client.cancel_review_submission(sub['id'])
+                      found.append((state,sub['id']))
+          Submission.objects.filter(app=app,platform='ios',state='in_review').update(
+              state='withdrawn',last_error='Withdrawn before review: Build 7 companion-only positioning superseded by truthful cloud-builder Build 8.'
+          )
+          print('WITHDRAWN_BUILD7',found)
+          PY

@@ -1,0 +1,34 @@
+name: A+ Studio Build 7 Dedicated Mac Upload
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build7-dedicated-mac-upload.yml'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  upload-agent:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+      - name: Verify Apple tooling
+        run: |
+          xcodebuild -version
+          xcrun --find altool
+      - name: Claim A+ Studio upload job
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '1'
+        run: python agents/custom_cloud_macos_altool.py

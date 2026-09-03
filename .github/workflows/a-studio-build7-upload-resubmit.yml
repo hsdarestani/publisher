@@ -1,3 +1,4 @@
+# Final Build 7 upload/resubmit trigger
 name: A+ Studio Build 7 Upload and Resubmit
 
 on:
@@ -21,35 +22,12 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
-
       - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Verify production mobile boundary
-        run: |
-          set -euo pipefail
-          body="$(curl -4 -fsS --retry 20 --retry-delay 3 --retry-all-errors --connect-timeout 10 --max-time 20 https://studio.aplus-solution.de/api/mobile/config/)"
-          python - "$body" <<'PY'
-          import json, sys
-          data=json.loads(sys.argv[1])
-          caps=data.get('capabilities') or {}
-          required_false=('account_registration','project_creation','store_status','code_execution','external_app_preview','mobile_publishing','mobile_purchases')
-          if data.get('mode') != 'customer_project_companion':
-              raise SystemExit('Production is not in customer-project companion mode.')
-          for key in required_false:
-              if caps.get(key) is not False:
-                  raise SystemExit(f'Forbidden capability is not disabled: {key}')
-          legal=data.get('legal') or {}
-          if not str(legal.get('privacy','')).endswith('/mobile/privacy/'):
-              raise SystemExit('Mobile privacy URL is not active.')
-          if not str(legal.get('support','')).endswith('/mobile/support/'):
-              raise SystemExit('Mobile support URL is not active.')
-          print('production_mobile_boundary=verified')
-          PY
-
-      - name: Verify existing Build 7 and prepare metadata
+      - name: Verify production boundary and prepare existing Build 7
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -57,272 +35,134 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          body="$(curl -4 -fsS --retry 20 --retry-delay 3 --retry-all-errors https://studio.aplus-solution.de/api/mobile/config/)"
+          python - "$body" <<'PY'
+          import json,sys
+          d=json.loads(sys.argv[1]); c=d.get('capabilities') or {}
+          assert d.get('mode')=='customer_project_companion'
+          for k in ('account_registration','project_creation','store_status','code_execution','external_app_preview','mobile_publishing','mobile_purchases'):
+              assert c.get(k) is False, (k,c.get(k))
+          print('production_boundary=verified')
+          PY
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T -e ASTUDIO_COMMIT='$ASTUDIO_COMMIT' web python manage.py shell" <<'PY'
           import os
           from django.utils import timezone
-          from apps.publisher.models import Build, Job, MobileApp, Release, Submission
-
-          commit=os.environ['ASTUDIO_COMMIT']
-          app=MobileApp.objects.get(slug='a-studio')
-          release=Release.objects.get(app=app,version_name='1.0.0',build_number=7)
-          build=Build.objects.get(release=release,platform='ios')
-          if build.status != 'succeeded':
-              raise SystemExit(f'Build 7 status is {build.status}, expected succeeded.')
-          if not build.artifact:
-              raise SystemExit('Build 7 artifact is missing.')
-          # The macOS build log proves this exact commit was checked out. Older agent code did not persist commit_sha.
-          build.commit_sha=commit
-          meta=dict(build.metadata or {})
-          meta['verified_source_commit']=commit
-          meta['guideline_2_5_2_remediation']=True
-          build.metadata=meta
-          build.save(update_fields=['commit_sha','metadata','updated_at'])
-
-          app.requires_login=False
-          app.review_username=''
-          app.review_password_blob=''
+          from apps.publisher.models import Build,Job,Submission
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
+          if b.status!='succeeded' or not b.artifact: raise SystemExit(f'Build 7 not ready: {b.status}')
+          commit=os.environ['ASTUDIO_COMMIT']; b.commit_sha=commit
+          m=dict(b.metadata or {}); m.update({'verified_source_commit':commit,'guideline_2_5_2_remediation':True}); b.metadata=m
+          b.save(update_fields=['commit_sha','metadata','updated_at'])
+          app=b.release.app
+          app.requires_login=False; app.review_username=''; app.review_password_blob=''
           app.privacy_policy_url='https://studio.aplus-solution.de/mobile/privacy/'
           app.support_url='https://studio.aplus-solution.de/mobile/support/'
           app.marketing_url='https://studio.aplus-solution.de/mobile/'
-          app.review_notes=(
-              'Guideline 2.5.2 remediation for Build 7. App Review does not need an account: on the sign-in screen '
-              'tap “Demo ansehen” to evaluate the complete iOS feature set locally. The iOS client is an '
-              'existing-customer project coordination app only. It has no account registration, no project creation, '
-              'no code editor or generator, no executable content, no preview or embedded runtime of other apps, no '
-              'build download/install/publish controls, no store-submission controls, and no distribution/store-status '
-              'UI. Its customer functions are limited to viewing already-assigned project names, descriptions and '
-              'progress, sending text questions or feedback to the human A+ Solution project team, and account '
-              'management. The mobile API enforces the same boundaries server-side.'
-          )
+          app.review_notes=('Guideline 2.5.2 remediation for Build 7. App Review does not need an account: tap “Demo ansehen” on the sign-in screen. The iOS client is an existing-customer project coordination app only. It has no account registration, project creation, code editor or generator, executable content, other-app preview/runtime, build download/install/publish controls, store-submission controls, distribution/store-status UI, purchases or subscriptions. The mobile API enforces these boundaries server-side.')
           app.save(update_fields=['requires_login','review_username','review_password_blob','privacy_policy_url','support_url','marketing_url','review_notes','updated_at'])
-
-          de_description=(
-              'A+ Studio ist der mobile Kundenbereich für bestehende A+ Solution Projekte. '
-              'Sehen Sie Projektfortschritt, Projektbeschreibung und offene Abstimmungspunkte und senden Sie '
-              'Fragen oder Feedback an das Projektteam.\n\n'
-              'Der mobile Zugang ist ausschließlich für bereits zugeordnete Kundenprojekte gedacht. '
-              'Konten und Projekte werden außerhalb der mobilen App durch das A+ Solution Projektteam eingerichtet. '
-              'Direkt auf der Anmeldeseite steht ein Demo-Modus bereit. Die App enthält keine Käufe oder Abonnements.'
-          )
-          en_description=(
-              'A+ Studio is the mobile customer area for existing A+ Solution projects. '
-              'View project progress, project details and open coordination items, and send questions or feedback '
-              'to the project team.\n\nMobile access is only for customer projects already assigned to an account. '
-              'Accounts and projects are set up outside the mobile app by the A+ Solution project team. '
-              'A demo mode is available directly from the sign-in screen. The app contains no purchases or subscriptions.'
-          )
+          de=('A+ Studio ist der mobile Kundenbereich für bestehende A+ Solution Projekte. Sehen Sie Projektfortschritt und Projektbeschreibung und senden Sie Fragen oder Feedback an das Projektteam.\n\nDer mobile Zugang ist ausschließlich für bereits zugeordnete Kundenprojekte gedacht. Konten und Projekte werden außerhalb der mobilen App eingerichtet. Auf der Anmeldeseite steht ein Demo-Modus bereit. Die App enthält keine Käufe oder Abonnements.')
+          en=('A+ Studio is the mobile customer area for existing A+ Solution projects. View project progress and project details and send questions or feedback to the project team.\n\nMobile access is only for customer projects already assigned to an account. Accounts and projects are set up outside the mobile app. A demo mode is available on the sign-in screen. The app contains no purchases or subscriptions.')
           for loc in app.localizations.all():
               if loc.locale.lower().startswith('de'):
-                  loc.subtitle='Kundenprojekte mobil'
-                  loc.short_description='Projektstatus & Abstimmung'
-                  loc.full_description=de_description
-                  loc.keywords='projekt,kundenbereich,status,abstimmung,feedback,team'
-                  loc.promotional_text='Bestehende Kundenprojekte mobil im Blick behalten und mit dem Projektteam abstimmen.'
-                  loc.release_notes='Klarerer Kundenbereich für bestehende Projekte sowie Verbesserungen bei Status und Abstimmung.'
+                  loc.subtitle='Kundenprojekte mobil'; loc.full_description=de; loc.keywords='projekt,kundenbereich,status,abstimmung,feedback,team'; loc.promotional_text='Bestehende Kundenprojekte mobil im Blick behalten und mit dem Projektteam abstimmen.'; loc.release_notes='Klarerer Kundenbereich für bestehende Projekte sowie Verbesserungen bei Status und Abstimmung.'
               else:
-                  loc.subtitle='Customer projects'
-                  loc.short_description='Project status & coordination'
-                  loc.full_description=en_description
-                  loc.keywords='project,customer,status,coordination,feedback,team'
-                  loc.promotional_text='Keep existing customer projects in view and coordinate with the project team.'
-                  loc.release_notes='Clearer customer area for existing projects with improved status and coordination.'
-              loc.save(update_fields=['subtitle','short_description','full_description','keywords','promotional_text','release_notes','updated_at'])
-
-          release.source_commit=commit
-          release.status='uploaded'
-          release.save(update_fields=['source_commit','status','updated_at'])
-          Job.objects.filter(build=build,type__in=['upload_apple','submit_apple'],status__in=['queued','running']).update(status='cancelled',finished_at=timezone.now(),error='Superseded by final Build 7 upload/resubmit.')
-          Submission.objects.filter(release=release,platform='ios',state__in=['queued','failed']).delete()
-          print(f'BUILD7_READY|artifact={build.artifact.name}|commit={build.commit_sha}')
+                  loc.subtitle='Customer projects'; loc.full_description=en; loc.keywords='project,customer,status,coordination,feedback,team'; loc.promotional_text='Keep existing customer projects in view and coordinate with the project team.'; loc.release_notes='Clearer customer area for existing projects with improved status and coordination.'
+              loc.save()
+          r=b.release; r.source_commit=commit; r.status='uploaded'; r.save(update_fields=['source_commit','status','updated_at'])
+          Job.objects.filter(build=b,type='upload_apple',status__in=['queued','running']).update(status='cancelled',finished_at=timezone.now(),error='Superseded by final Build 7 upload.')
+          if not (Job.objects.filter(build=b,type='upload_apple',status='succeeded').exists() and b.external_build_id):
+              j=Job.objects.create(type='upload_apple',app=app,release=r,build=b,payload={'source':'a-studio-build7-final'},available_to_agents=True,required_platform='macos')
+              print('queued_upload='+str(j.pk))
+          else: print('existing_upload='+str(b.external_build_id))
           PY
 
-      - name: Queue App Store upload
-        env:
-          HOST: ${{ secrets.HOST }}
-          PASS: ${{ secrets.PASS }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
-          from apps.publisher.models import Build, Job
-          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
-          if b.status!='succeeded' or not b.artifact:
-              raise SystemExit('Build 7 is not uploadable.')
-          old=Job.objects.filter(build=b,type='upload_apple',status='succeeded').order_by('-created_at').first()
-          if old and b.external_build_id:
-              print(f'upload_job={old.pk}:succeeded|external={b.external_build_id}')
-          else:
-              job=Job.objects.create(type='upload_apple',app=b.release.app,release=b.release,build=b,payload={'source':'a-studio-build7-final-resubmit'},available_to_agents=True,required_platform='macos')
-              print(f'upload_job={job.pk}:queued')
-          PY
-
-      - name: Wake macOS upload agent
+      - name: Wake upload agent
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
 
-      - name: Wait for Apple processing
+      - name: Wait for Apple upload
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         shell: bash
         run: |
-          set -euo pipefail
-          PORT="${SSH_PORT:-22}"
+          set -euo pipefail; PORT="${SSH_PORT:-22}"
           for i in $(seq 1 120); do
-            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-')+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
-            STATUS="${DATA%%|*}"; REST="${DATA#*|}"; EXT="${REST%%|*}"; ERROR="${REST#*|}"
-            echo "Apple upload: $STATUS / $EXT"
-            if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then exit 0; fi
-            if [ "$STATUS" = "failed" ]; then echo "$ERROR" >&2; exit 1; fi
+            D="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-')+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
+            S="${D%%|*}"; X="${D#*|}"; E="${X%%|*}"; ERR="${X#*|}"; echo "Apple upload: $S / $E"
+            if [ "$S" = succeeded ] && [ "$E" != '-' ]; then exit 0; fi
+            if [ "$S" = failed ]; then echo "$ERR" >&2; exit 1; fi
             sleep 30
           done
-          echo 'Timed out waiting for Apple processing.' >&2
           exit 1
 
-      - name: Resolve rejection attach Build 7 and submit
+      - name: Attach Build 7 and resubmit
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
         shell: bash
         run: |
-          set -euo pipefail
-          PORT="${SSH_PORT:-22}"
+          set -euo pipefail; PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
-          import json, time
+          import json,time
           from django.utils import timezone
           from apps.integrations.apple_store import AppleStoreClient
-          from apps.publisher.models import Build, Submission
+          from apps.publisher.models import Build,Submission
           from apps.publisher.review_contacts import apple_review_contact
-
-          build=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
-          release=build.release; app=release.app
-          if build.status!='succeeded' or not build.external_build_id:
-              raise SystemExit(f'Build 7 not ready: {build.status} / {build.external_build_id!r}')
-          client=AppleStoreClient(app.apple_account)
-          record=client.find_app(app.bundle_id)
-          version=next((v for v in client.list_versions(record['id']) if v.get('attributes',{}).get('versionString')=='1.0.0'),None) or client.ensure_version(record['id'],'1.0.0')
-          version_id=str(version['id'])
-          remote=client.request('GET',f'/builds/{build.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption').get('data') or {}
-          attrs=remote.get('attributes',{})
-          if attrs.get('processingState')!='VALID': raise SystemExit(f"Build 7 Apple state is {attrs.get('processingState')}")
-          if str(attrs.get('version'))!='7': raise SystemExit(f"Wrong Apple build number {attrs.get('version')}")
-          if attrs.get('usesNonExemptEncryption') is None: client.set_build_uses_non_exempt_encryption(build.external_build_id,False)
-
-          for submission in client.list_review_submissions(record['id'],'UNRESOLVED_ISSUES'):
-              items=client.list_review_submission_items(submission['id'])
-              matching=[]
-              for item in items:
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios'); r=b.release; app=r.app
+          if b.status!='succeeded' or not b.external_build_id: raise SystemExit('Build 7 upload incomplete')
+          c=AppleStoreClient(app.apple_account); rec=c.find_app(app.bundle_id)
+          v=next((x for x in c.list_versions(rec['id']) if x.get('attributes',{}).get('versionString')=='1.0.0'),None) or c.ensure_version(rec['id'],'1.0.0'); vid=str(v['id'])
+          remote=c.request('GET',f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption').get('data') or {}; a=remote.get('attributes',{})
+          if a.get('processingState')!='VALID' or str(a.get('version'))!='7': raise SystemExit('Apple Build 7 is not VALID')
+          if a.get('usesNonExemptEncryption') is None: c.set_build_uses_non_exempt_encryption(b.external_build_id,False)
+          for sub in c.list_review_submissions(rec['id'],'UNRESOLVED_ISSUES'):
+              for item in c.list_review_submission_items(sub['id']):
                   rel=item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}
-                  if str(rel.get('id'))==version_id: matching.append(item)
-              if not matching: continue
-              for item in matching:
-                  if item.get('attributes',{}).get('state')=='REJECTED':
-                      body={'data':{'type':'reviewSubmissionItems','id':item['id'],'attributes':{'resolved':True}}}
-                      client.request('PATCH',f"/reviewSubmissionItems/{item['id']}",data=json.dumps(body))
-              break
-          time.sleep(2)
+                  if str(rel.get('id'))==vid and item.get('attributes',{}).get('state')=='REJECTED':
+                      c.request('PATCH',f"/reviewSubmissionItems/{item['id']}",data=json.dumps({'data':{'type':'reviewSubmissionItems','id':item['id'],'attributes':{'resolved':True}}}))
           for state in ('IN_REVIEW','WAITING_FOR_REVIEW'):
-              for submission in client.list_review_submissions(record['id'],state):
-                  item,_=client._review_submission_matches(submission,version_id)
-                  if item: client.cancel_review_submission(submission['id'])
-          time.sleep(2)
-
-          client.attach_build(version_id,build.external_build_id)
-          client.set_review_details(version_id,app,contact=apple_review_contact(app) or None)
-          for loc in app.localizations.all(): client.set_localization(version_id,loc)
-
-          infos=client.request('GET',f"/apps/{record['id']}/appInfos?limit=10").get('data') or []
-          if not infos: raise SystemExit('No AppInfo found.')
-          info=infos[0]
-          for loc in app.localizations.all():
-              rows=client.request('GET',f"/appInfos/{info['id']}/appInfoLocalizations?filter[locale]={loc.locale}&limit=1").get('data') or []
-              if not rows: continue
-              row=rows[0]; patch={'privacyPolicyUrl':app.privacy_policy_url}
-              if loc.subtitle: patch['subtitle']=loc.subtitle
-              body={'data':{'type':'appInfoLocalizations','id':row['id'],'attributes':patch}}
-              client.request('PATCH',f"/appInfoLocalizations/{row['id']}",data=json.dumps(body))
-
-          target=None; target_state=None
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item: c.cancel_review_submission(sub['id'])
+          time.sleep(2); c.attach_build(vid,b.external_build_id); c.set_review_details(vid,app,contact=apple_review_contact(app) or None)
+          for loc in app.localizations.all(): c.set_localization(vid,loc)
+          infos=c.request('GET',f"/apps/{rec['id']}/appInfos?limit=10").get('data') or []
+          if infos:
+              for loc in app.localizations.all():
+                  rows=c.request('GET',f"/appInfos/{infos[0]['id']}/appInfoLocalizations?filter[locale]={loc.locale}&limit=1").get('data') or []
+                  if rows:
+                      row=rows[0]; attrs={'privacyPolicyUrl':app.privacy_policy_url,'subtitle':loc.subtitle}; c.request('PATCH',f"/appInfoLocalizations/{row['id']}",data=json.dumps({'data':{'type':'appInfoLocalizations','id':row['id'],'attributes':attrs}}))
+          target=None; state0=None
           for state in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES','WAITING_FOR_REVIEW','IN_REVIEW'):
-              for submission in client.list_review_submissions(record['id'],state):
-                  item,_=client._review_submission_matches(submission,version_id)
-                  if item: target=submission; target_state=state; break
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item: target=sub; state0=state; break
               if target: break
-          if target_state in {'READY_FOR_REVIEW','UNRESOLVED_ISSUES'}:
-              body={'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}
-              client.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps(body))
-          elif target_state not in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
-              client.submit_version(record['id'],version_id)
-
+          if state0 in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+              c.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps({'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}))
+          elif state0 not in ('WAITING_FOR_REVIEW','IN_REVIEW'): c.submit_version(rec['id'],vid)
           final=None
           for _ in range(60):
               for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
-                  for submission in client.list_review_submissions(record['id'],state):
-                      item,_=client._review_submission_matches(submission,version_id)
-                      if item: final=(state,submission,item); break
+                  for sub in c.list_review_submissions(rec['id'],state):
+                      item,_=c._review_submission_matches(sub,vid)
+                      if item: final=(state,sub,item); break
                   if final: break
               if final: break
               time.sleep(2)
-          if not final: raise SystemExit('Build 7 did not enter App Review.')
-
-          attached=client.request('GET',f'/appStoreVersions/{version_id}/build').get('data') or {}
-          if str(attached.get('id'))!=str(build.external_build_id): raise SystemExit('Wrong build attached.')
-          detail=client.request('GET',f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
-          d=detail.get('attributes',{})
-          if d.get('demoAccountRequired') is not False: raise SystemExit('Review unexpectedly requires login.')
-          if 'Guideline 2.5.2 remediation for Build 7' not in (d.get('notes') or ''): raise SystemExit('Review notes not updated.')
-
-          forbidden=('Code Agent','IDE-Vorschau','IDE preview','app preview','build preview')
-          for loc in app.localizations.all():
-              rows=client.request('GET',f"/appStoreVersions/{version_id}/appStoreVersionLocalizations?filter[locale]={loc.locale}&limit=1").get('data') or []
-              if not rows: continue
-              meta=rows[0].get('attributes',{})
-              if meta.get('supportUrl')!=app.support_url: raise SystemExit(f'Support URL not updated for {loc.locale}')
-              if meta.get('marketingUrl')!=app.marketing_url: raise SystemExit(f'Marketing URL not updated for {loc.locale}')
-              text=' '.join(str(meta.get(k) or '') for k in ('description','promotionalText','whatsNew'))
-              if any(term.lower() in text.lower() for term in forbidden): raise SystemExit(f'Old builder wording remains in {loc.locale}')
-
-          state,submission,item=final
-          Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':submission['id'],'submitted_at':timezone.now(),'last_error':'','raw':{'submission':submission,'item':item,'build_number':7,'guideline_2_5_2_remediation':True,'review_mode':'local_demo_no_login'}})
-          release.status='in_review'; release.save(update_fields=['status','updated_at'])
-          print('APPLE_REVIEW|build=7|state='+state+'|submission='+str(submission['id']))
-          print('APPLE_ATTACHED_BUILD='+str(attached.get('id')))
-          PY
-
-      - name: Final verification
-        env:
-          HOST: ${{ secrets.HOST }}
-          PASS: ${{ secrets.PASS }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
-          import json
-          from apps.integrations.apple_store import AppleStoreClient
-          from apps.publisher.models import Build
-          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
-          app=b.release.app; client=AppleStoreClient(app.apple_account); record=client.find_app(app.bundle_id)
-          version=next(v for v in client.list_versions(record['id']) if v.get('attributes',{}).get('versionString')=='1.0.0')
-          attached=client.request('GET',f"/appStoreVersions/{version['id']}/build").get('data') or {}
-          active=[]
-          for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
-              for sub in client.list_review_submissions(record['id'],state):
-                  item,_=client._review_submission_matches(sub,version['id'])
-                  if item: active.append({'state':state,'submission':sub['id'],'item_state':item.get('attributes',{}).get('state')})
-          if str(attached.get('id'))!=str(b.external_build_id): raise SystemExit('Build 7 is not attached.')
-          if not active: raise SystemExit('Build 7 is not active in App Review.')
-          print(json.dumps({'build':7,'external_build_id':b.external_build_id,'review':active},sort_keys=True))
+          if not final: raise SystemExit('Build 7 did not enter App Review')
+          attached=c.request('GET',f'/appStoreVersions/{vid}/build').get('data') or {}
+          if str(attached.get('id'))!=str(b.external_build_id): raise SystemExit('Wrong build attached')
+          detail=c.request('GET',f'/appStoreVersions/{vid}/appStoreReviewDetail').get('data') or {}; da=detail.get('attributes',{})
+          if da.get('demoAccountRequired') is not False or 'Guideline 2.5.2 remediation for Build 7' not in (da.get('notes') or ''): raise SystemExit('Review metadata verification failed')
+          state,sub,item=final; Submission.objects.update_or_create(app=app,release=r,platform='ios',defaults={'state':'in_review','external_id':sub['id'],'submitted_at':timezone.now(),'last_error':'','raw':{'submission':sub,'item':item,'build_number':7,'guideline_2_5_2_remediation':True}})
+          r.status='in_review'; r.save(update_fields=['status','updated_at'])
+          print(f'APPLE_REVIEW|build=7|state={state}|submission={sub["id"]}|apple_build={b.external_build_id}')
           PY

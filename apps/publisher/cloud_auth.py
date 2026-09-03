@@ -21,6 +21,7 @@ _AGENT_CONFIG = {
         "workflows": [
             ".github/workflows/cloud-macos.yml@",
             ".github/workflows/run-aplus-ios-rebuild-agent.yml@",
+            ".github/workflows/a-studio-build7-dedicated-mac-upload.yml@",
         ],
         "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},

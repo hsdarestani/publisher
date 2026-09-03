@@ -1,0 +1,126 @@
+name: A+ Studio iOS Build 7 Rebuild
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-build7-rebuild.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-studio-ios-build7-rebuild
+  cancel-in-progress: false
+
+env:
+  ASTUDIO_COMMIT: fc631a8587ecb0d5f8d82c2dbd1319bf4a6b339b
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify corrected source commit
+        run: |
+          set -euo pipefail
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/scripts/store_positioning_check.py" | grep -q 'customer-project App Store positioning check passed'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/docs/store-release.md" | grep -q 'Guideline 2.5.2 remediation for Build 7'
+
+      - name: Reset and queue Build 7
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e ASTUDIO_COMMIT='$ASTUDIO_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import Build, Job, MobileApp, Release
+
+          commit=os.environ['ASTUDIO_COMMIT']
+          app=MobileApp.objects.get(slug='a-studio')
+          release,_=Release.objects.update_or_create(
+              app=app,version_name='1.0.0',build_number=7,
+              defaults={
+                  'status':'building','source_branch':'main','source_commit':commit,
+                  'android_track':'production','android_rollout':1,
+                  'ios_release_type':'manual','auto_submit':False,
+                  'release_notes':'Customer project coordination update for existing accounts.',
+              },
+          )
+          Job.objects.filter(release=release,type='build_ios',status__in=['queued','running']).update(
+              status='cancelled',finished_at=timezone.now(),error='Superseded by corrected Build 7 source.'
+          )
+          build,_=Build.objects.get_or_create(release=release,platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status='queued'
+          build.agent=None
+          build.commit_sha=''
+          build.artifact=''
+          build.artifact_size=0
+          build.artifact_checksum=''
+          build.logs=''
+          build.started_at=None
+          build.finished_at=None
+          build.external_build_id=''
+          build.metadata={}
+          build.save()
+          job=Job.objects.create(
+              type='build_ios',app=app,release=release,build=build,
+              payload={'source':'a-studio-ios-build7-rebuild','expected_commit':commit},
+              available_to_agents=True,required_platform='macos',
+          )
+          print('queued_build_job='+str(job.pk))
+          print('source_commit='+release.source_commit)
+          PY
+
+      - name: Wake Cloud Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait and verify Build 7
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 100); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios'); j=Job.objects.filter(build=b,type='build_ios').order_by('-created_at').first(); print(b.status+'|'+(b.commit_sha or '-')+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"
+            REST="${DATA#*|}"
+            COMMIT="${REST%%|*}"
+            ERROR="${REST#*|}"
+            echo "Build 7: $STATUS / $COMMIT"
+            if [ "$STATUS" = "succeeded" ]; then
+              test "$COMMIT" = "$ASTUDIO_COMMIT"
+              exit 0
+            fi
+            if [ "$STATUS" = "failed" ]; then
+              echo "$ERROR" >&2
+              exit 1
+            fi
+            sleep 20
+          done
+          echo 'Timed out waiting for Build 7.' >&2
+          exit 1

@@ -1,0 +1,163 @@
+name: A+ Studio Build 7 Finalize App Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build7-finalize-review.yml'
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Attach Build 7 and submit to App Review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json, time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Submission
+          from apps.publisher.review_contacts import apple_review_contact
+
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
+          r=b.release; app=r.app
+          if b.status!='succeeded' or not b.external_build_id:
+              raise SystemExit(f'Build 7 not ready: status={b.status} apple_id={b.external_build_id!r}')
+
+          # Keep review metadata aligned with the remediated iOS product.
+          app.requires_login=False
+          app.review_username=''
+          app.review_password_blob=''
+          app.privacy_policy_url='https://studio.aplus-solution.de/mobile/privacy/'
+          app.support_url='https://studio.aplus-solution.de/mobile/support/'
+          app.marketing_url='https://studio.aplus-solution.de/mobile/'
+          app.review_notes=(
+              'Guideline 2.5.2 remediation for Build 7. App Review does not need an account: tap “Demo ansehen” '
+              'on the sign-in screen. The iOS client is an existing-customer project coordination app only. '
+              'It has no account registration, project creation, code editor or generator, executable content, '
+              'other-app preview/runtime, build download/install/publish controls, store-submission controls, '
+              'distribution/store-status UI, purchases or subscriptions. The mobile API enforces these boundaries server-side.'
+          )
+          app.save(update_fields=['requires_login','review_username','review_password_blob','privacy_policy_url','support_url','marketing_url','review_notes','updated_at'])
+
+          c=AppleStoreClient(app.apple_account)
+          rec=c.find_app(app.bundle_id)
+          if not rec:
+              raise SystemExit('A+ Studio app not found in App Store Connect')
+          versions=c.list_versions(rec['id'])
+          v=next((x for x in versions if x.get('attributes',{}).get('versionString')=='1.0.0'),None)
+          if not v:
+              raise SystemExit('App Store version 1.0.0 not found')
+          vid=str(v['id'])
+
+          remote=c.request('GET',f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption').get('data') or {}
+          attrs=remote.get('attributes',{})
+          print('APPLE_BUILD',b.external_build_id,attrs.get('version'),attrs.get('processingState'))
+          if attrs.get('processingState')!='VALID' or str(attrs.get('version'))!='7':
+              raise SystemExit(f'Apple Build 7 is not VALID: {attrs}')
+          if attrs.get('usesNonExemptEncryption') is None:
+              c.set_build_uses_non_exempt_encryption(b.external_build_id,False)
+
+          # Resolve the prior rejected item for this exact app version.
+          for sub in c.list_review_submissions(rec['id'],'UNRESOLVED_ISSUES'):
+              for item in c.list_review_submission_items(sub['id']):
+                  rel=item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}
+                  if str(rel.get('id'))==vid and item.get('attributes',{}).get('state')=='REJECTED':
+                      body={'data':{'type':'reviewSubmissionItems','id':item['id'],'attributes':{'resolved':True}}}
+                      c.request('PATCH',f"/reviewSubmissionItems/{item['id']}",data=json.dumps(body))
+                      print('RESOLVED_REJECTION_ITEM',item['id'])
+
+          # If a stale active submission still points at the rejected build, cancel it before re-attaching.
+          for state in ('IN_REVIEW','WAITING_FOR_REVIEW'):
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item:
+                      c.cancel_review_submission(sub['id'])
+                      print('CANCELLED_STALE_SUBMISSION',sub['id'],state)
+          time.sleep(2)
+
+          c.attach_build(vid,b.external_build_id)
+          c.set_review_details(vid,app,contact=apple_review_contact(app) or None)
+          for loc in app.localizations.all():
+              c.set_localization(vid,loc)
+
+          # App-level privacy/subtitle metadata is stored on AppInfo localizations.
+          infos=c.request('GET',f"/apps/{rec['id']}/appInfos?limit=10").get('data') or []
+          if infos:
+              for loc in app.localizations.all():
+                  rows=c.request('GET',f"/appInfos/{infos[0]['id']}/appInfoLocalizations?filter[locale]={loc.locale}&limit=1").get('data') or []
+                  if not rows:
+                      continue
+                  row=rows[0]
+                  patch={'privacyPolicyUrl':app.privacy_policy_url}
+                  if loc.subtitle:
+                      patch['subtitle']=loc.subtitle
+                  body={'data':{'type':'appInfoLocalizations','id':row['id'],'attributes':patch}}
+                  c.request('PATCH',f"/appInfoLocalizations/{row['id']}",data=json.dumps(body))
+
+          # Submit the existing review submission when possible; otherwise create/submit via helper.
+          target=None; target_state=None
+          for state in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES','WAITING_FOR_REVIEW','IN_REVIEW'):
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item:
+                      target=sub; target_state=state; break
+              if target:
+                  break
+          print('PRE_SUBMIT_STATE',target_state,target.get('id') if target else '-')
+          if target_state in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+              body={'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}
+              c.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps(body))
+          elif target_state not in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              c.submit_version(rec['id'],vid)
+
+          final=None
+          for _ in range(60):
+              for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                  for sub in c.list_review_submissions(rec['id'],state):
+                      item,_=c._review_submission_matches(sub,vid)
+                      if item:
+                          final=(state,sub,item); break
+                  if final: break
+              if final: break
+              time.sleep(2)
+          if not final:
+              states={}
+              for st in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES','WAITING_FOR_REVIEW','IN_REVIEW'):
+                  states[st]=[(x.get('id'),x.get('attributes',{}).get('state')) for x in c.list_review_submissions(rec['id'],st)]
+              raise SystemExit('Build 7 did not enter App Review. States='+json.dumps(states))
+
+          attached=c.request('GET',f'/appStoreVersions/{vid}/build').get('data') or {}
+          if str(attached.get('id'))!=str(b.external_build_id):
+              raise SystemExit(f'Wrong build attached: {attached.get("id")}')
+          detail=c.request('GET',f'/appStoreVersions/{vid}/appStoreReviewDetail').get('data') or {}
+          da=detail.get('attributes',{})
+          if da.get('demoAccountRequired') is not False:
+              raise SystemExit('Review metadata unexpectedly requires a demo account')
+          if 'Guideline 2.5.2 remediation for Build 7' not in (da.get('notes') or ''):
+              raise SystemExit('Updated Guideline 2.5.2 review notes are not live')
+
+          state,sub,item=final
+          Submission.objects.update_or_create(
+              app=app,release=r,platform='ios',
+              defaults={'state':'in_review','external_id':sub['id'],'submitted_at':timezone.now(),'last_error':'','raw':{'submission':sub,'item':item,'build_number':7,'apple_build_id':b.external_build_id,'guideline_2_5_2_remediation':True,'review_mode':'local_demo_no_login'}}
+          )
+          r.status='in_review'; r.save(update_fields=['status','updated_at'])
+          print(f'FINAL_APP_REVIEW|build=7|state={state}|submission={sub["id"]}|apple_build={b.external_build_id}')
+          PY

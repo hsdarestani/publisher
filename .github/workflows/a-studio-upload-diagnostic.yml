@@ -1,0 +1,40 @@
+name: A+ Studio Apple Upload Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-upload-diagnostic.yml'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Print latest A+ Studio Apple upload job
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import Build, Job
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=7,platform='ios')
+          jobs=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at')[:5]
+          print('BUILD', b.status, b.external_build_id or '-', b.commit_sha or '-', b.artifact.name if b.artifact else '-')
+          for j in jobs:
+              print('\n=== JOB',j.pk,j.status,'===')
+              print('ERROR:',j.error or '-')
+              print('PAYLOAD:',json.dumps(j.payload or {},default=str))
+              print('LOGS:\n'+(j.logs or '')[-30000:])
+          PY

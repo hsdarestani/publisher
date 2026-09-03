@@ -1,0 +1,90 @@
+name: A+ Studio iOS Build 8 Queue V2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-build8-queue-v2.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  ASTUDIO_COMMIT: 6bb06a41268dc85432f8996cd3c94d3e99469a97
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify source
+        run: |
+          set -euo pipefail
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/scripts/store_positioning_check.py" | grep -q 'truthful cloud-app-builder App Store positioning check passed'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/docs/store-release.md" | grep -q 'Guideline 2.5.2 remediation for Build 8'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/core/mobile_api.py" | grep -q '"mode": "cloud_app_builder"'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/core/mobile_api.py" | grep -q '"project_creation": True'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/core/mobile_api.py" | grep -q '"local_code_execution": False'
+          curl -fsS "https://raw.githubusercontent.com/hsdarestani/a-studio/$ASTUDIO_COMMIT/core/mobile_api.py" | grep -q '"external_app_preview": False'
+
+      - name: Queue Build 8
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 20); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import Build, Job, MobileApp, Release
+
+          commit='6bb06a41268dc85432f8996cd3c94d3e99469a97'
+          app=MobileApp.objects.get(slug='a-studio')
+          release,_=Release.objects.update_or_create(
+              app=app,version_name='1.0.0',build_number=8,
+              defaults={
+                  'status':'building','source_branch':'main','source_commit':commit,
+                  'android_track':'production','android_rollout':1,
+                  'ios_release_type':'manual','auto_submit':False,
+                  'release_notes':'Cloud app creation from iOS with server-side generation and no local execution of generated app code.',
+              },
+          )
+          Job.objects.filter(release=release,type__in=['build_ios','upload_apple'],status__in=['queued','running']).update(
+              status='cancelled',finished_at=timezone.now(),error='Superseded by truthful Build 8 V2.'
+          )
+          build,_=Build.objects.get_or_create(release=release,platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status='queued'; build.agent=None; build.commit_sha=''; build.artifact=''; build.artifact_size=0
+          build.artifact_checksum=''; build.logs=''; build.started_at=None; build.finished_at=None
+          build.external_build_id=''; build.metadata={'expected_source_commit':commit,'product_mode':'cloud_app_builder'}
+          build.save()
+          job=Job.objects.create(
+              type='build_ios',app=app,release=release,build=build,
+              payload={'source':'a-studio-ios-build8-queue-v2','expected_commit':commit},
+              available_to_agents=True,required_platform='macos',
+          )
+          print('BUILD8_QUEUED',job.pk,commit)
+          PY
+            then exit 0; fi
+            sleep 5
+          done
+          echo 'Publisher web service unavailable.' >&2
+          exit 1
+
+      - name: Wake Cloud Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"

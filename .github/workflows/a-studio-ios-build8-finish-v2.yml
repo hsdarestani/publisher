@@ -1,0 +1,229 @@
+name: A+ Studio iOS Build 8 Finish V2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-ios-build8-finish-v2.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: production
+    steps:
+      - name: Install SSH helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for Publisher and Build 8
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 150); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.filter(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=8,platform='ios').first(); j=Job.objects.filter(build=b,type='build_ios').order_by('-created_at').first() if b else None; print(((b.status if b else 'missing')+'|'+((j.error if j else '') or '')))\"" 2>/dev/null | tail -n1 || true)"
+            STATUS="${DATA%%|*}"; ERR="${DATA#*|}"
+            echo "Build 8 status: ${STATUS:-publisher-unavailable}"
+            if [ "$STATUS" = "succeeded" ]; then exit 0; fi
+            if [ "$STATUS" = "failed" ]; then echo "$ERR" >&2; exit 1; fi
+            sleep 20
+          done
+          echo 'Timed out waiting for Build 8.' >&2
+          exit 1
+
+      - name: Set truthful store metadata and queue Apple upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail; PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import Build,Job
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=8,platform='ios')
+          app=b.release.app
+          if b.status!='succeeded' or not b.artifact: raise SystemExit(f'Build 8 not ready: {b.status}')
+          app.requires_login=False
+          app.review_username=''
+          app.review_password_blob=''
+          app.privacy_policy_url='https://studio.aplus-solution.de/mobile/privacy/'
+          app.support_url='https://studio.aplus-solution.de/mobile/support/'
+          app.marketing_url='https://studio.aplus-solution.de/mobile/'
+          app.review_notes=(
+              'Guideline 2.5.2 remediation for Build 8. A+ Studio is accurately presented as a cloud-based app creation service. '
+              'Existing users can create a new app project in iOS by entering the app name, business type, language and requirements. '
+              'Those inputs are sent over HTTPS to A+ Studio remote infrastructure, where generation and build processing occur. '
+              'Generated application code and build artifacts remain on the remote service. The iOS client does not download, install, execute or launch generated customer-app code. '
+              'It does not render a generated customer app as an executable app runtime or executable preview. '
+              'The mobile API intentionally omits preview/live/repository URLs, deployment artifacts and downloadable build files. '
+              'The iOS app has no generated-app installation, IPA/APK download, publishing, software-store or app-store submission controls. '
+              'App Review does not need credentials: tap “Demo ansehen” to see the complete bundled iOS workflow locally. '
+              'There are no purchases or subscriptions in the iOS app.'
+          )
+          app.save(update_fields=['requires_login','review_username','review_password_blob','privacy_policy_url','support_url','marketing_url','review_notes','updated_at'])
+
+          de=('A+ Studio ist ein Cloud App Builder für bestehende A+ Studio Nutzer.\n\n'
+              'Starten Sie neue App-Projekte mobil, beschreiben Sie Zielgruppe und gewünschte Funktionen und verfolgen Sie den Status der serverseitigen Erstellung. '
+              'Änderungswünsche können direkt einem bestehenden App-Projekt zugeordnet werden.\n\n'
+              'Die technische Generierung und Verarbeitung der App-Projekte findet auf der A+ Studio Cloud-Infrastruktur statt. '
+              'Die mobile Anwendung lädt, installiert oder führt den generierten App-Code nicht aus und startet erzeugte Anwendungen nicht als ausführbare Anwendung innerhalb von A+ Studio.\n\n'
+              'Konten werden außerhalb der mobilen Anwendung eingerichtet. Ein lokaler Demo-Modus erklärt den mobilen Workflow ohne Anmeldung. Die mobile App enthält keine Käufe oder Abonnements.')
+          en=('A+ Studio is a cloud app builder for existing A+ Studio users.\n\n'
+              'Start new app projects from mobile, describe the target users and required functionality, and follow the server-side creation status. '
+              'Change requests can be assigned to an existing app project.\n\n'
+              'Technical generation and processing happen on A+ Studio cloud infrastructure. The mobile app does not download, install or execute generated app code '
+              'and does not launch a generated customer app as an executable application inside A+ Studio.\n\n'
+              'Accounts are provisioned outside the mobile app. A local demo mode explains the mobile workflow without sign-in. The mobile app contains no purchases or subscriptions.')
+          for loc in app.localizations.all():
+              if loc.locale.lower().startswith('de'):
+                  loc.subtitle='Apps in der Cloud erstellen'; loc.full_description=de
+                  loc.keywords='app-projekte,cloud,builder,software,projekt,status,produkt,workflow,business'
+                  loc.promotional_text='Neue App-Projekte mobil starten und ihre serverseitige Erstellung in A+ Studio Cloud verfolgen.'
+                  loc.release_notes='App-Projekte können jetzt mobil gestartet werden. Generierung und Verarbeitung erfolgen serverseitig in der A+ Studio Cloud.'
+              else:
+                  loc.subtitle='Create apps in the cloud'; loc.full_description=en
+                  loc.keywords='app projects,cloud,builder,software,project,status,product,workflow,business'
+                  loc.promotional_text='Start new app projects from mobile and follow their server-side creation in A+ Studio Cloud.'
+                  loc.release_notes='App projects can now be started from mobile. Generation and processing happen remotely in A+ Studio Cloud.'
+              loc.save()
+
+          running=Job.objects.filter(build=b,type='upload_apple',status__in=['queued','running'])
+          if not running.exists() and not (Job.objects.filter(build=b,type='upload_apple',status='succeeded').exists() and b.external_build_id):
+              j=Job.objects.create(type='upload_apple',app=app,release=b.release,build=b,payload={'source':'a-studio-build8-finish-v2'},available_to_agents=True,required_platform='macos')
+              print('UPLOAD_QUEUED',j.pk)
+          else:
+              print('UPLOAD_ALREADY_PRESENT',b.external_build_id or '-')
+          PY
+
+      - name: Wake Cloud Mac for upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for Apple upload and processing
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail; PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 150); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=8,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-')+'|'+((j.error if j else '') or ''))\"" 2>/dev/null | tail -n1 || true)"
+            S="${DATA%%|*}"; REST="${DATA#*|}"; APPLE_ID="${REST%%|*}"; ERR="${REST#*|}"
+            echo "Apple upload: ${S:-publisher-unavailable} / ${APPLE_ID:--}"
+            if [ "$S" = "succeeded" ] && [ "$APPLE_ID" != '-' ]; then exit 0; fi
+            if [ "$S" = "failed" ]; then echo "$ERR" >&2; exit 1; fi
+            sleep 30
+          done
+          echo 'Timed out waiting for Apple Build 8 processing.' >&2
+          exit 1
+
+      - name: Attach Build 8 and submit App Review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail; PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json,time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build,Submission
+          from apps.publisher.review_contacts import apple_review_contact
+
+          b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=8,platform='ios')
+          r=b.release; app=r.app
+          if b.status!='succeeded' or not b.external_build_id: raise SystemExit('Build 8 upload incomplete')
+          c=AppleStoreClient(app.apple_account); rec=c.find_app(app.bundle_id)
+          if not rec: raise SystemExit('A+ Studio not found in App Store Connect')
+          v=next((x for x in c.list_versions(rec['id']) if x.get('attributes',{}).get('versionString')=='1.0.0'),None) or c.ensure_version(rec['id'],'1.0.0')
+          vid=str(v['id'])
+          remote=c.request('GET',f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption').get('data') or {}
+          attrs=remote.get('attributes',{})
+          print('APPLE_BUILD',b.external_build_id,attrs.get('version'),attrs.get('processingState'))
+          if attrs.get('processingState')!='VALID' or str(attrs.get('version'))!='8': raise SystemExit(f'Apple Build 8 is not VALID: {attrs}')
+          if attrs.get('usesNonExemptEncryption') is None: c.set_build_uses_non_exempt_encryption(b.external_build_id,False)
+
+          for sub in c.list_review_submissions(rec['id'],'UNRESOLVED_ISSUES'):
+              for item in c.list_review_submission_items(sub['id']):
+                  rel=item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}
+                  if str(rel.get('id'))==vid and item.get('attributes',{}).get('state')=='REJECTED':
+                      c.request('PATCH',f"/reviewSubmissionItems/{item['id']}",data=json.dumps({'data':{'type':'reviewSubmissionItems','id':item['id'],'attributes':{'resolved':True}}}))
+
+          for state in ('IN_REVIEW','WAITING_FOR_REVIEW'):
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item: c.cancel_review_submission(sub['id'])
+          time.sleep(2)
+
+          c.attach_build(vid,b.external_build_id)
+          c.set_review_details(vid,app,contact=apple_review_contact(app) or None)
+          for loc in app.localizations.all(): c.set_localization(vid,loc)
+          infos=c.request('GET',f"/apps/{rec['id']}/appInfos?limit=10").get('data') or []
+          if infos:
+              for loc in app.localizations.all():
+                  rows=c.request('GET',f"/appInfos/{infos[0]['id']}/appInfoLocalizations?filter[locale]={loc.locale}&limit=1").get('data') or []
+                  if rows:
+                      row=rows[0]
+                      c.request('PATCH',f"/appInfoLocalizations/{row['id']}",data=json.dumps({'data':{'type':'appInfoLocalizations','id':row['id'],'attributes':{'privacyPolicyUrl':app.privacy_policy_url,'subtitle':loc.subtitle}}}))
+
+          target=None; state0=None
+          for state in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES','WAITING_FOR_REVIEW','IN_REVIEW'):
+              for sub in c.list_review_submissions(rec['id'],state):
+                  item,_=c._review_submission_matches(sub,vid)
+                  if item: target=sub; state0=state; break
+              if target: break
+          print('PRE_SUBMIT_STATE',state0,target.get('id') if target else '-')
+          if state0 in ('READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+              c.request('PATCH',f"/reviewSubmissions/{target['id']}",data=json.dumps({'data':{'type':'reviewSubmissions','id':target['id'],'attributes':{'submitted':True}}}))
+          elif state0 not in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+              c.submit_version(rec['id'],vid)
+
+          final=None
+          for _ in range(75):
+              for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                  for sub in c.list_review_submissions(rec['id'],state):
+                      item,_=c._review_submission_matches(sub,vid)
+                      if item: final=(state,sub,item); break
+                  if final: break
+              if final: break
+              time.sleep(2)
+          if not final: raise SystemExit('Build 8 did not enter App Review')
+
+          attached=c.request('GET',f'/appStoreVersions/{vid}/build').get('data') or {}
+          if str(attached.get('id'))!=str(b.external_build_id): raise SystemExit('Wrong build attached')
+          detail=c.request('GET',f'/appStoreVersions/{vid}/appStoreReviewDetail').get('data') or {}
+          da=detail.get('attributes',{})
+          if da.get('demoAccountRequired') is not False: raise SystemExit('Review unexpectedly requires demo account')
+          notes=da.get('notes') or ''
+          for phrase in ('cloud-based app creation service','does not download, install, execute','does not render a generated customer app'):
+              if phrase not in notes: raise SystemExit('Truthful review notes missing: '+phrase)
+
+          state,sub,item=final
+          Submission.objects.update_or_create(
+              app=app,release=r,platform='ios',
+              defaults={'state':'in_review','external_id':sub['id'],'submitted_at':timezone.now(),'last_error':'','raw':{'submission':sub,'item':item,'build_number':8,'apple_build_id':b.external_build_id,'product_mode':'cloud_app_builder','local_generated_code_execution':False}}
+          )
+          r.status='in_review'; r.save(update_fields=['status','updated_at'])
+          print(f'FINAL_APP_REVIEW|build=8|state={state}|submission={sub["id"]}|apple_build={b.external_build_id}')
+          PY

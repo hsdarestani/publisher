@@ -12,6 +12,9 @@ APPLE_USES_NON_EXEMPT_ENCRYPTION = {
     # Smarbiz is a Capacitor wrapper around the HTTPS web application and does not
     # ship custom/non-exempt cryptographic algorithms.
     "smarbiz": False,
+    # A+ Esthetic is likewise a Capacitor client using ordinary platform HTTPS/TLS
+    # for its Customer Club and booking APIs; it does not ship custom crypto.
+    "a-esthetic": False,
 }
 
 

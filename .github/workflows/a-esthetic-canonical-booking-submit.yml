@@ -1,0 +1,168 @@
+name: Build and submit A+ Esthetic canonical booking update
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-canonical-booking-submit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-esthetic-store-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+    env:
+      SOURCE_COMMIT: ac351fdcb226969b60b17889186c237a6c10b7d9
+    steps:
+      - name: Prepare Publisher release and queue native builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          PY_CODE=$(cat <<'PY'
+          import os, re
+          from django.db.models import Max
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.publisher.tasks import enqueue_job
+
+          source_commit = os.environ['SOURCE_COMMIT']
+          app = MobileApp.objects.get(slug='a-esthetic')
+          if app.package_name != 'de.aplusesthetic.app' or app.bundle_id != 'de.aplusesthetic.app':
+              raise SystemExit('A+ Esthetic store identifiers do not match de.aplusesthetic.app')
+          if not app.google_account_id or not app.google_account.configured:
+              raise SystemExit('A+ Esthetic Google Play account is not configured')
+          if not app.apple_account_id or not app.apple_account.configured:
+              raise SystemExit('A+ Esthetic App Store account is not configured')
+
+          patches = []
+          for value in Release.objects.filter(app=app).values_list('version_name', flat=True):
+              match = re.fullmatch(r'1\.0\.(\d+)', value or '')
+              if match:
+                  patches.append(int(match.group(1)))
+          next_patch = max(patches or [0]) + 1
+          version_name = f'1.0.{next_patch}'
+          build_number = (Release.objects.filter(app=app).aggregate(value=Max('build_number'))['value'] or 0) + 1
+
+          release = Release.objects.create(
+              app=app,
+              version_name=version_name,
+              build_number=build_number,
+              status='building',
+              source_branch='main',
+              source_commit=source_commit,
+              android_track='production',
+              android_rollout=1,
+              ios_release_type='manual',
+              auto_submit=True,
+              release_notes=(
+                  'Die Terminbuchung wurde vollständig mit dem A+ Buchungssystem synchronisiert. '
+                  'Termine, Umbuchungen und Stornierungen verwenden jetzt dieselbe Datenquelle; '
+                  'vorhandene Paket-Sitzungen werden automatisch berücksichtigt.'
+              ),
+          )
+          app.latest_commit_sha = source_commit
+          app.save(update_fields=['latest_commit_sha', 'updated_at'])
+          for loc in app.localizations.all():
+              loc.release_notes = release.release_notes
+              loc.save(update_fields=['release_notes', 'updated_at'])
+
+          android = Build.objects.create(release=release, platform='android', status='queued', commit_sha=source_commit)
+          ios = Build.objects.create(release=release, platform='ios', status='queued', commit_sha=source_commit)
+          enqueue_job('build_android', app=app, release=release, build=android, agent=True, platform='linux')
+          enqueue_job('build_ios', app=app, release=release, build=ios, agent=True, platform='macos')
+          print(f'A_ESTHETIC_RELEASE id={release.pk} version={version_name} build={build_number} source={source_commit}')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && SOURCE_COMMIT='$SOURCE_COMMIT' printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
+
+      - name: Wait for builds, uploads and review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+
+          for attempt in $(seq 1 150); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source_commit = os.environ['SOURCE_COMMIT']
+          app = MobileApp.objects.get(slug='a-esthetic')
+          release = Release.objects.filter(app=app, source_commit=source_commit).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('release_missing')
+          android = release.builds.get(platform='android')
+          ios = release.builds.get(platform='ios')
+
+          def live(kind):
+              return release.jobs.filter(type=kind, status__in=['queued','running','succeeded']).exists()
+          def failed(kind):
+              return release.jobs.filter(type=kind, status='failed').order_by('-created_at').first()
+
+          google_sub = Submission.objects.filter(release=release, platform='android').first()
+          apple_sub = Submission.objects.filter(release=release, platform='ios').first()
+
+          if android.status == 'succeeded' and not google_sub and not live('upload_google'):
+              enqueue_job('upload_google', app=app, release=release, build=android)
+          if ios.status == 'succeeded' and not apple_sub and not live('upload_apple'):
+              enqueue_job('upload_apple', app=app, release=release, build=ios, agent=True, platform='macos')
+          upload_apple_ok = release.jobs.filter(type='upload_apple', status='succeeded').exists()
+          if ios.status == 'succeeded' and upload_apple_ok and ios.external_build_id and not apple_sub and not live('submit_apple'):
+              enqueue_job('submit_apple', app=app, release=release, build=ios)
+
+          google_sub = Submission.objects.filter(release=release, platform='android').first()
+          apple_sub = Submission.objects.filter(release=release, platform='ios').first()
+          google_state = google_sub.state if google_sub else 'pending'
+          apple_state = apple_sub.state if apple_sub else 'pending'
+          failed_jobs = list(release.jobs.filter(status='failed').values_list('type','error'))
+          print(
+              'A_ESTHETIC_STATE '
+              f'version={release.version_name} build={release.build_number} '
+              f'android_build={android.status} ios_build={ios.status} '
+              f'google={google_state} apple={apple_state} '
+              f'failed={len(failed_jobs)}'
+          )
+          for kind, error in failed_jobs:
+              print(f'FAILED_JOB {kind}: {(error or "")[:600]}')
+          if google_state == 'in_review' and apple_state == 'in_review':
+              print('A_ESTHETIC_DONE')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
+            echo "$STATE"
+
+            if printf '%s' "$STATE" | grep -q 'A_ESTHETIC_DONE'; then
+              echo 'Both A+ Esthetic store submissions are in review.'
+              exit 0
+            fi
+            if printf '%s' "$STATE" | grep -q '^FAILED_JOB '; then
+              echo 'A Publisher build/store job failed; stopping instead of silently retrying a store submission.'
+              exit 1
+            fi
+            sleep 30
+          done
+
+          echo 'Timed out waiting for both stores to enter review.'
+          exit 1

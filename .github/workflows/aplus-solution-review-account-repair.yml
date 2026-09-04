@@ -31,7 +31,7 @@ jobs:
             CODE="$(curl -sS -o /tmp/review-sync-probe.json -w '%{http_code}' \
               -X POST -H 'Content-Type: application/json' \
               --data '{"password":"probe-not-a-real-password"}' \
-              https://solution.smarbiz.sbs/api/auth/store-review/sync/ || true)"
+              https://app.aplus-solution.de/api/auth/store-review/sync/ || true)"
             echo "review_sync_endpoint_http=$CODE"
             if [ "$CODE" = "403" ]; then exit 0; fi
             sleep 10
@@ -73,7 +73,7 @@ jobs:
           HTTP_CODE="$(python3 - <<'PY' | curl -sS -o /tmp/review-sync.json -w '%{http_code}' \
             -X POST -H 'Content-Type: application/json' \
             -H "Authorization: Bearer $OIDC_TOKEN" \
-            --data-binary @- https://solution.smarbiz.sbs/api/auth/store-review/sync/
+            --data-binary @- https://app.aplus-solution.de/api/auth/store-review/sync/
           import json, os
           print(json.dumps({'password': os.environ['REVIEW_PASSWORD']}))
           PY
@@ -87,7 +87,7 @@ jobs:
           LOGIN_CODE="$(python3 - <<'PY' | curl -sS --retry 5 --retry-all-errors --retry-delay 3 \
             --connect-timeout 15 --max-time 30 -o /tmp/aplus-login.json -w '%{http_code}' \
             -H 'Content-Type: application/json' --data-binary @- \
-            https://solution.smarbiz.sbs/api/auth/login/
+            https://app.aplus-solution.de/api/auth/login/
           import json, os
           print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
           PY
@@ -104,13 +104,13 @@ jobs:
           print('reviewer_login=verified')
           PY
 
-      - name: Dispatch current A+ Solution store release
+      - name: Dispatch current A+ Solution Strato store release
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'aplus-solution-current-release.yml',
+              workflow_id: 'aplus-solution-strato-store-release.yml',
               ref: 'main'
             });

@@ -1,0 +1,46 @@
+name: Retry A+ Strato release after publisher ready
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/kick-aplus-strato-release-v3.yml']
+  workflow_dispatch:
+permissions:
+  actions: write
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wait until publisher production is stable
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          ready=0
+          for i in $(seq 1 60); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py check >/dev/null"; then
+              ready=1
+              break
+            fi
+            sleep 10
+          done
+          test "$ready" -eq 1
+          sleep 10
+      - name: Dispatch current Strato release workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'aplus-solution-strato-store-release.yml',
+              ref: 'main'
+            });

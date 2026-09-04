@@ -48,7 +48,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           SSH=(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST")
           for attempt in $(seq 1 90); do
-            if "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_a_esthetic_push >/dev/null 2>&1"; then
+            if "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_a_esthetic_push </dev/null >/dev/null 2>&1"; then
               break
             fi
             if [ "$attempt" = 90 ]; then
@@ -61,7 +61,7 @@ jobs:
           "${SSH[@]}" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/aplus-publisher
-          docker compose exec -T web python manage.py provision_a_esthetic_push --apply
+          docker compose exec -T web python manage.py provision_a_esthetic_push --apply </dev/null
 
           TARGET_ENV=/opt/a-esthetic-mobile/mobile.env
           if [ ! -f "$TARGET_ENV" ]; then
@@ -76,28 +76,17 @@ jobs:
           chmod 600 "$TMP"
           trap 'rm -f "$TMP"' EXIT
 
-          docker compose exec -T web python manage.py shell <<'PY' > "$TMP"
-          import base64, json
-          from apps.publisher.models import MobileApp
-          app = MobileApp.objects.get(slug='a-esthetic')
-          payload = app.google_account.get_credentials() if app.google_account and app.google_account.configured else {}
-          print(base64.b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode() if payload else '')
-          PY
+          docker compose exec -T web python manage.py shell -c "import base64,json; from apps.publisher.models import MobileApp,StoreAccount; app=MobileApp.objects.get(slug='a-esthetic'); cfg=dict(app.build_config or {}); account_id=cfg.get('push_firebase_account_id'); account=StoreAccount.objects.filter(pk=account_id).first(); payload=account.get_credentials() if account and account.configured else {}; print(base64.b64encode(json.dumps(payload,separators=(',',':')).encode()).decode() if payload else '')" </dev/null > "$TMP"
           FCM_B64="$(tail -n1 "$TMP" | tr -d '\r\n')"
           if [ -n "$FCM_B64" ]; then
             sed -i '/^FIREBASE_SERVICE_ACCOUNT_JSON=/d;/^FIREBASE_SERVICE_ACCOUNT_B64=/d' "$TARGET_ENV"
             printf 'FIREBASE_SERVICE_ACCOUNT_B64=%s\n' "$FCM_B64" >> "$TARGET_ENV"
             echo 'backend_fcm=installed'
           else
-            echo 'backend_fcm=missing_publisher_account'
+            echo 'backend_fcm=missing_publisher_firebase_account'
           fi
 
-          TARGET_TEAM="$(docker compose exec -T web python manage.py shell <<'PY' | tail -n1 | tr -d '\r\n'
-          from apps.publisher.models import MobileApp
-          app = MobileApp.objects.get(slug='a-esthetic')
-          print(app.apple_account.apple_team_id if app.apple_account else '')
-          PY
-          )"
+          TARGET_TEAM="$(docker compose exec -T web python manage.py shell -c "from apps.publisher.models import MobileApp; app=MobileApp.objects.get(slug='a-esthetic'); print(app.apple_account.apple_team_id if app.apple_account else '')" </dev/null | tail -n1 | tr -d '\r\n')"
           APNS_SOURCE=''
           while IFS= read -r candidate; do
             [ "$candidate" = "$TARGET_ENV" ] && continue
@@ -106,7 +95,7 @@ jobs:
               APNS_SOURCE="$candidate"
               break
             fi
-          done < <(grep -rl '^APNS_KEY_ID=' /opt --include='*.env' --include='*.conf' 2>/dev/null || true)
+          done < <(find /opt -type f -size -2M -print0 2>/dev/null | xargs -0 -r grep -l '^APNS_KEY_ID=' 2>/dev/null || true)
 
           if [ -n "$APNS_SOURCE" ]; then
             sed -i '/^APNS_KEY_ID=/d;/^APNS_TEAM_ID=/d;/^APNS_PRIVATE_KEY=/d;/^APNS_PRIVATE_KEY_B64=/d;/^APNS_USE_SANDBOX=/d' "$TARGET_ENV"

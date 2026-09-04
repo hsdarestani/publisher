@@ -1,0 +1,45 @@
+name: A+ Esthetic submission status probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-submit-status.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Read A+ Esthetic Publisher state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='a-esthetic')
+          release = app.releases.filter(source_commit='ac351fdcb226969b60b17889186c237a6c10b7d9').order_by('-created_at').first()
+          if not release:
+              raise SystemExit('release_missing')
+          print(f'RELEASE version={release.version_name} build={release.build_number} status={release.status} auto_submit={release.auto_submit}')
+          for build in release.builds.order_by('platform'):
+              print(f'BUILD {build.platform} status={build.status} external={bool(build.external_build_id)} artifact={bool(build.artifact)}')
+          for job in release.jobs.order_by('created_at'):
+              error = (job.error or '').replace('\n',' ')[:800]
+              print(f'JOB {job.type} status={job.status} progress={job.progress} error={error}')
+          for sub in release.submissions.order_by('platform'):
+              print(f'SUBMISSION {sub.platform} state={sub.state} external={sub.external_id}')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

@@ -25,7 +25,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Wait for metadata-unlock command in Publisher production
+      - name: Wait for submitted-item removal command in Publisher production
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -35,13 +35,13 @@ jobs:
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 90); do
             if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_studio_builder_v3 >/dev/null"; then
-              echo 'Build 10 metadata-unlock command is live.'
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_studio_builder_v4 >/dev/null"; then
+              echo 'Build 10 submitted-item removal command is live.'
               exit 0
             fi
             sleep 5
           done
-          echo 'Build 10 metadata-unlock command never appeared in production.' >&2
+          echo 'Build 10 submitted-item removal command never appeared in production.' >&2
           exit 2
 
       - name: Verify production still exposes the real Cloud App Builder boundary
@@ -60,7 +60,7 @@ jobs:
           print('production_mobile_boundary=cloud_app_builder_no_generated_runtime')
           PY
 
-      - name: Unlock rejected draft metadata and submit processed Build 10
+      - name: Remove old submitted review item and submit processed Build 10
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -69,7 +69,7 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v3 --app-version 1.0.0 --build-number 10 --publish")"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v4 --app-version 1.0.0 --build-number 10 --publish")"
           printf '%s\n' "$OUTPUT"
           printf '%s\n' "$OUTPUT" | grep -q 'APPLE_REVIEW|build=10|'
           printf '%s\n' "$OUTPUT" | grep -q 'release=1.0.0(10) status=in_review'
@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v3 --app-version 1.0.0 --build-number 10 --diagnose-only")"
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v4 --app-version 1.0.0 --build-number 10 --diagnose-only")"
           printf '%s\n' "$OUTPUT"
           printf '%s\n' "$OUTPUT" | grep -q 'mobile_positioning=cloud_app_builder_no_generated_runtime'
           printf '%s\n' "$OUTPUT" | grep -q 'source_commit=d435b5c066120045cb0f61cfc0f79a20298ffbcc'

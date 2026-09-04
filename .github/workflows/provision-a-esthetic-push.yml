@@ -34,7 +34,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Provision native providers and production FCM/APNs when available
         env:
@@ -46,7 +46,19 @@ jobs:
           test -n "$HOST" && test -n "$PASS"
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'REMOTE'
+          SSH=(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST")
+          for attempt in $(seq 1 90); do
+            if "${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help provision_a_esthetic_push >/dev/null 2>&1"; then
+              break
+            fi
+            if [ "$attempt" = 90 ]; then
+              echo 'Publisher deploy did not expose provision_a_esthetic_push in time.' >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          "${SSH[@]}" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py provision_a_esthetic_push --apply
@@ -121,7 +133,6 @@ jobs:
           import django
           django.setup()
           from p0_app.ops_models import MobileDevice
-          from platform_app.models import UserProfile
           android = MobileDevice.objects.filter(active=True, platform='android').count()
           ios = MobileDevice.objects.filter(active=True, platform='ios').count()
           admins = MobileDevice.objects.filter(active=True, user__profile__role='admin').count()

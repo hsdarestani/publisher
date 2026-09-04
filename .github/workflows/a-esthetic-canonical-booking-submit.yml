@@ -1,4 +1,4 @@
-name: Build and submit A+ Esthetic canonical booking update
+name: Build and submit latest A+ Esthetic update
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: ac351fdcb226969b60b17889186c237a6c10b7d9
+      SOURCE_COMMIT: d5ef2cd6bdf40d85c47aba8e73a99fd6bc0b5c4c
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -36,7 +36,7 @@ jobs:
           PY_CODE=$(cat <<'PY'
           import os, re
           from django.db.models import Max
-          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.publisher.models import MobileApp, Release, Build
           from apps.publisher.tasks import enqueue_job
 
           source_commit = os.environ['SOURCE_COMMIT']
@@ -48,43 +48,64 @@ jobs:
           if not app.apple_account_id or not app.apple_account.configured:
               raise SystemExit('A+ Esthetic App Store account is not configured')
 
-          patches = []
-          for value in Release.objects.filter(app=app).values_list('version_name', flat=True):
-              match = re.fullmatch(r'1\.0\.(\d+)', value or '')
-              if match:
-                  patches.append(int(match.group(1)))
-          next_patch = max(patches or [0]) + 1
-          version_name = f'1.0.{next_patch}'
-          build_number = (Release.objects.filter(app=app).aggregate(value=Max('build_number'))['value'] or 0) + 1
+          release = Release.objects.filter(app=app, source_commit=source_commit).order_by('-created_at').first()
+          if not release:
+              patches = []
+              for value in Release.objects.filter(app=app).values_list('version_name', flat=True):
+                  match = re.fullmatch(r'1\.0\.(\d+)', value or '')
+                  if match:
+                      patches.append(int(match.group(1)))
+              next_patch = max(patches or [0]) + 1
+              version_name = f'1.0.{next_patch}'
+              build_number = (Release.objects.filter(app=app).aggregate(value=Max('build_number'))['value'] or 0) + 1
+              notes = (
+                  'Neue Patientenakte mit zentralem Dokumentenzugriff sowie eine vollständig '
+                  'überarbeitete Terminbuchung mit Behandlung, Behandler und verfügbaren Zeiten. '
+                  'Zusätzlich wurden Stabilität und Bedienung der App verbessert.'
+              )
+              release = Release.objects.create(
+                  app=app,
+                  version_name=version_name,
+                  build_number=build_number,
+                  status='building',
+                  source_branch='main',
+                  source_commit=source_commit,
+                  android_track='production',
+                  android_rollout=1,
+                  ios_release_type='manual',
+                  auto_submit=True,
+                  release_notes=notes,
+              )
+              app.latest_commit_sha = source_commit
+              app.save(update_fields=['latest_commit_sha', 'updated_at'])
+              for loc in app.localizations.all():
+                  loc.release_notes = notes
+                  loc.save(update_fields=['release_notes', 'updated_at'])
+              print(f'A_ESTHETIC_RELEASE_CREATED id={release.pk} version={version_name} build={build_number} source={source_commit}')
+          else:
+              print(f'A_ESTHETIC_RELEASE_REUSED id={release.pk} version={release.version_name} build={release.build_number} source={source_commit}')
 
-          release = Release.objects.create(
-              app=app,
-              version_name=version_name,
-              build_number=build_number,
-              status='building',
-              source_branch='main',
-              source_commit=source_commit,
-              android_track='production',
-              android_rollout=1,
-              ios_release_type='manual',
-              auto_submit=True,
-              release_notes=(
-                  'Die Terminbuchung wurde vollständig mit dem A+ Buchungssystem synchronisiert. '
-                  'Termine, Umbuchungen und Stornierungen verwenden jetzt dieselbe Datenquelle; '
-                  'vorhandene Paket-Sitzungen werden automatisch berücksichtigt.'
-              ),
+          android, _ = Build.objects.get_or_create(
+              release=release,
+              platform='android',
+              defaults={'status': 'queued', 'commit_sha': source_commit},
           )
-          app.latest_commit_sha = source_commit
-          app.save(update_fields=['latest_commit_sha', 'updated_at'])
-          for loc in app.localizations.all():
-              loc.release_notes = release.release_notes
-              loc.save(update_fields=['release_notes', 'updated_at'])
+          ios, _ = Build.objects.get_or_create(
+              release=release,
+              platform='ios',
+              defaults={'status': 'queued', 'commit_sha': source_commit},
+          )
 
-          android = Build.objects.create(release=release, platform='android', status='queued', commit_sha=source_commit)
-          ios = Build.objects.create(release=release, platform='ios', status='queued', commit_sha=source_commit)
-          enqueue_job('build_android', app=app, release=release, build=android, agent=True, platform='linux')
-          enqueue_job('build_ios', app=app, release=release, build=ios, agent=True, platform='macos')
-          print(f'A_ESTHETIC_RELEASE id={release.pk} version={version_name} build={build_number} source={source_commit}')
+          if android.status not in {'succeeded', 'running'} and not release.jobs.filter(type='build_android', status__in=['queued','running','succeeded']).exists():
+              android.status = 'queued'
+              android.commit_sha = source_commit
+              android.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_android', app=app, release=release, build=android, agent=True, platform='linux')
+          if ios.status not in {'succeeded', 'running'} and not release.jobs.filter(type='build_ios', status__in=['queued','running','succeeded']).exists():
+              ios.status = 'queued'
+              ios.commit_sha = source_commit
+              ios.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_ios', app=app, release=release, build=ios, agent=True, platform='macos')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
@@ -103,7 +124,7 @@ jobs:
           for attempt in $(seq 1 150); do
             PY_CODE=$(cat <<'PY'
           import os
-          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
           source_commit = os.environ['SOURCE_COMMIT']
@@ -116,8 +137,6 @@ jobs:
 
           def live(kind):
               return release.jobs.filter(type=kind, status__in=['queued','running','succeeded']).exists()
-          def failed(kind):
-              return release.jobs.filter(type=kind, status='failed').order_by('-created_at').first()
 
           google_sub = Submission.objects.filter(release=release, platform='android').first()
           apple_sub = Submission.objects.filter(release=release, platform='ios').first()
@@ -135,15 +154,16 @@ jobs:
           google_state = google_sub.state if google_sub else 'pending'
           apple_state = apple_sub.state if apple_sub else 'pending'
           failed_jobs = list(release.jobs.filter(status='failed').values_list('type','error'))
+          active_jobs = list(release.jobs.filter(status__in=['queued','running']).values_list('type','status'))
           print(
               'A_ESTHETIC_STATE '
               f'version={release.version_name} build={release.build_number} '
               f'android_build={android.status} ios_build={ios.status} '
               f'google={google_state} apple={apple_state} '
-              f'failed={len(failed_jobs)}'
+              f'active={active_jobs} failed={len(failed_jobs)}'
           )
           for kind, error in failed_jobs:
-              print(f'FAILED_JOB {kind}: {(error or "")[:600]}')
+              print(f'FAILED_JOB {kind}: {(error or "")[:900]}')
           if google_state == 'in_review' and apple_state == 'in_review':
               print('A_ESTHETIC_DONE')
           PY
@@ -158,7 +178,7 @@ jobs:
               exit 0
             fi
             if printf '%s' "$STATE" | grep -q '^FAILED_JOB '; then
-              echo 'A Publisher build/store job failed; stopping instead of silently retrying a store submission.'
+              echo 'A Publisher build/store job failed; stopping for diagnosis.'
               exit 1
             fi
             sleep 30

@@ -1,0 +1,28 @@
+name: Diagnose A+ Strato access from Publisher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diag-aplus-strato-access.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check configured access without exposing secrets
+        env:
+          STRATO_HOST: ${{ secrets.STRATO_HOST }}
+          STRATO_SSH_PRIVATE_KEY: ${{ secrets.STRATO_SSH_PRIVATE_KEY }}
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          [ -n "${HOST:-}" ] && echo 'publisher_host=true' || echo 'publisher_host=false'
+          [ -n "${PASS:-}" ] && echo 'publisher_password=true' || echo 'publisher_password=false'
+          [ -n "${STRATO_HOST:-}" ] && echo 'strato_host=true' || echo 'strato_host=false'
+          [ -n "${STRATO_SSH_PRIVATE_KEY:-}" ] && echo 'strato_key=true' || echo 'strato_key=false'

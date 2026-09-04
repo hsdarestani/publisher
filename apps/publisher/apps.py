@@ -8,3 +8,6 @@ class PublisherConfig(AppConfig):
 
     def ready(self):
         from . import signals  # noqa: F401
+        from .runtime_patches import install
+
+        install()

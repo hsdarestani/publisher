@@ -1,0 +1,70 @@
+name: Kick A+ Solution Strato store release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kick-aplus-solution-strato-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Point A+ store release at Strato production
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('.github/workflows/aplus-solution-current-release.yml')
+          text = path.read_text(encoding='utf-8')
+          text, count = re.subn(
+              r"APLUS_COMMIT: '[0-9a-f]{40}'",
+              "APLUS_COMMIT: 'cbaefc551ff8415b5ef293e3ab314385e4f2d94a'",
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit('Could not update APLUS_COMMIT exactly once.')
+          old = 'https://solution.smarbiz.sbs'
+          if old not in text:
+              raise SystemExit('Expected legacy production URL was not found.')
+          text = text.replace(old, 'https://app.aplus-solution.de')
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          grep -F "APLUS_COMMIT: 'cbaefc551ff8415b5ef293e3ab314385e4f2d94a'" .github/workflows/aplus-solution-current-release.yml
+          ! grep -Fq 'https://solution.smarbiz.sbs' .github/workflows/aplus-solution-current-release.yml
+          grep -Fq 'https://app.aplus-solution.de/api' .github/workflows/aplus-solution-current-release.yml
+
+      - name: Commit release workflow and remove one-time kicker
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'A+ Publisher Automation'
+          git config user.email '45485005+hsdarestani@users.noreply.github.com'
+          git add .github/workflows/aplus-solution-current-release.yml
+          git rm .github/workflows/kick-aplus-solution-strato-release.yml
+          git commit -m 'Release A+ Solution against Strato production'
+          git push origin HEAD:main
+
+      - name: Dispatch the store release explicitly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run aplus-solution-current-release.yml --ref main
+          echo 'A+ Solution store release dispatched.'

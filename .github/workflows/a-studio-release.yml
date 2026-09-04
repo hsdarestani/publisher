@@ -113,7 +113,7 @@ jobs:
           gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY"
           gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
 
-      - name: Advance release as build results arrive
+      - name: Advance release through App Store resubmission
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -121,20 +121,25 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
+          COMPLETE=0
           for i in $(seq 1 40); do
             echo "=== Publisher release pass $i ==="
             OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish")"
             printf '%s\n' "$OUTPUT"
 
-            if printf '%s\n' "$OUTPUT" | grep -q 'build_android=succeeded' && \
-               printf '%s\n' "$OUTPUT" | grep -q 'build_ios=succeeded'; then
+            if printf '%s\n' "$OUTPUT" | grep -q 'release=1.0.0(9) status=in_review'; then
+              COMPLETE=1
               break
             fi
             sleep 30
           done
+          if [ "$COMPLETE" -ne 1 ]; then
+            echo 'A+ Studio Build 9 did not reach an active App Store review state.' >&2
+            exit 1
+          fi
 
-      - name: Final release state
+      - name: Final App Store review state
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -142,7 +147,9 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio --app-version 1.0.0 --build-number 1 --publish")"
+          printf '%s\n' "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | grep -q 'release=1.0.0(9) status=in_review'
 
 # A+ Studio release orchestration is intentionally triggered by its compliance and App Store integration changes as well as build/recovery changes.

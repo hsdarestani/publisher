@@ -1,0 +1,134 @@
+name: Provision A+ Esthetic native push
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/signing/management/commands/provision_a_esthetic_push.py'
+      - '.github/workflows/provision-a-esthetic-push.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate provisioning command
+        env:
+          DEBUG: '1'
+          DJANGO_SECRET_KEY: ci-secret
+          ALLOWED_HOSTS: localhost,127.0.0.1
+        run: |
+          python manage.py check
+          python manage.py help provision_a_esthetic_push >/dev/null
+
+  apply-production:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Provision native providers and production FCM/APNs when available
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py provision_a_esthetic_push --apply
+
+          TARGET_ENV=/opt/a-esthetic-mobile/mobile.env
+          if [ ! -f "$TARGET_ENV" ]; then
+            echo 'backend_host=separate'
+            echo 'backend_fcm=requires_cross_host_provisioning'
+            echo 'backend_apns=requires_cross_host_provisioning'
+            exit 0
+          fi
+
+          chmod 600 "$TARGET_ENV"
+          TMP="$(mktemp)"
+          chmod 600 "$TMP"
+          trap 'rm -f "$TMP"' EXIT
+
+          docker compose exec -T web python manage.py shell <<'PY' > "$TMP"
+          import base64, json
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='a-esthetic')
+          payload = app.google_account.get_credentials() if app.google_account and app.google_account.configured else {}
+          print(base64.b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode() if payload else '')
+          PY
+          FCM_B64="$(tail -n1 "$TMP" | tr -d '\r\n')"
+          if [ -n "$FCM_B64" ]; then
+            sed -i '/^FIREBASE_SERVICE_ACCOUNT_JSON=/d;/^FIREBASE_SERVICE_ACCOUNT_B64=/d' "$TARGET_ENV"
+            printf 'FIREBASE_SERVICE_ACCOUNT_B64=%s\n' "$FCM_B64" >> "$TARGET_ENV"
+            echo 'backend_fcm=installed'
+          else
+            echo 'backend_fcm=missing_publisher_account'
+          fi
+
+          TARGET_TEAM="$(docker compose exec -T web python manage.py shell <<'PY' | tail -n1 | tr -d '\r\n'
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='a-esthetic')
+          print(app.apple_account.apple_team_id if app.apple_account else '')
+          PY
+          )"
+          APNS_SOURCE=''
+          while IFS= read -r candidate; do
+            [ "$candidate" = "$TARGET_ENV" ] && continue
+            TEAM="$(grep '^APNS_TEAM_ID=' "$candidate" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+            if [ -n "$TARGET_TEAM" ] && [ "$TEAM" = "$TARGET_TEAM" ] && grep -q '^APNS_KEY_ID=' "$candidate" && grep -Eq '^(APNS_PRIVATE_KEY|APNS_PRIVATE_KEY_B64)=' "$candidate"; then
+              APNS_SOURCE="$candidate"
+              break
+            fi
+          done < <(grep -rl '^APNS_KEY_ID=' /opt --include='*.env' --include='*.conf' 2>/dev/null || true)
+
+          if [ -n "$APNS_SOURCE" ]; then
+            sed -i '/^APNS_KEY_ID=/d;/^APNS_TEAM_ID=/d;/^APNS_PRIVATE_KEY=/d;/^APNS_PRIVATE_KEY_B64=/d;/^APNS_USE_SANDBOX=/d' "$TARGET_ENV"
+            grep -E '^(APNS_KEY_ID|APNS_TEAM_ID|APNS_PRIVATE_KEY|APNS_PRIVATE_KEY_B64)=' "$APNS_SOURCE" >> "$TARGET_ENV"
+            printf 'APNS_USE_SANDBOX=0\n' >> "$TARGET_ENV"
+            echo 'backend_apns=installed_from_same_team_key'
+          else
+            echo 'backend_apns=no_same_team_provider_key_found'
+          fi
+
+          chmod 600 "$TARGET_ENV"
+          systemctl restart a-esthetic-mobile.service
+          sleep 2
+          systemctl is-active --quiet a-esthetic-mobile.service
+
+          set -a
+          . "$TARGET_ENV"
+          set +a
+          export PYTHONPATH=/opt/a-esthetic-mobile/vendor
+          cd /opt/a-esthetic-mobile
+          python3 - <<'PY'
+          import os
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          import django
+          django.setup()
+          from p0_app.ops_models import MobileDevice
+          from platform_app.models import UserProfile
+          android = MobileDevice.objects.filter(active=True, platform='android').count()
+          ios = MobileDevice.objects.filter(active=True, platform='ios').count()
+          admins = MobileDevice.objects.filter(active=True, user__profile__role='admin').count()
+          print(f'active_android_devices={android}')
+          print(f'active_ios_devices={ios}')
+          print(f'active_admin_devices={admins}')
+          print('fcm_runtime=' + ('configured' if (os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON') or os.getenv('FIREBASE_SERVICE_ACCOUNT_B64')) else 'missing'))
+          print('apns_runtime=' + ('configured' if (os.getenv('APNS_KEY_ID') and os.getenv('APNS_TEAM_ID') and (os.getenv('APNS_PRIVATE_KEY') or os.getenv('APNS_PRIVATE_KEY_B64'))) else 'missing'))
+          PY
+          REMOTE

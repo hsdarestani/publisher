@@ -13,10 +13,10 @@ permissions:
 jobs:
   recover:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     environment: production
     steps:
-      - name: Repair Apple review association and submit latest build
+      - name: Reuse Apple review draft and submit A+ Esthetic 1.0.2
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -33,159 +33,130 @@ jobs:
           from apps.publisher.tasks import enqueue_job
 
           SOURCE_COMMIT = 'd5ef2cd6bdf40d85c47aba8e73a99fd6bc0b5c4c'
-          ACTIVE_REVIEW_STATES = {'WAITING_FOR_REVIEW', 'IN_REVIEW'}
-
           app = MobileApp.objects.get(slug='a-esthetic')
           release = Release.objects.filter(app=app, source_commit=SOURCE_COMMIT).order_by('-created_at').first()
           if not release:
-              raise SystemExit('latest_release_missing')
+              raise SystemExit('release_missing')
           ios = release.builds.get(platform='ios')
           if ios.status != 'succeeded' or not ios.external_build_id:
-              raise SystemExit(f'ios_build_not_ready status={ios.status} external={bool(ios.external_build_id)}')
-          if not app.apple_account or not app.apple_account.configured:
-              raise SystemExit('apple_account_missing')
+              raise SystemExit('ios_build_not_ready')
 
           client = AppleStoreClient(app.apple_account)
-          record = client.find_app(app.bundle_id)
-          app_id = record['id']
-          target = client.find_editable_version(app_id, release.version_name)
+          app_record = client.find_app(app.bundle_id)
+          app_id = app_record['id']
+          target = next(
+              (v for v in client.list_versions(app_id) if v.get('attributes',{}).get('versionString') == release.version_name),
+              None,
+          )
           if not target:
-              target = next(
-                  (v for v in client.list_versions(app_id) if v.get('attributes',{}).get('versionString') == release.version_name),
-                  None,
-              )
-          if not target:
-              raise SystemExit(f'apple_target_version_missing version={release.version_name}')
+              raise SystemExit('apple_1_0_2_missing')
           target_id = target['id']
-          target_state = target.get('attributes',{}).get('appStoreState') or target.get('attributes',{}).get('appVersionState') or ''
+          target_state = target.get('attributes',{}).get('appStoreState') or ''
           print(f'APPLE_TARGET id={target_id} version={release.version_name} state={target_state} build={ios.external_build_id}')
 
-          def all_reviews():
+          def reviews():
               return client.request('GET', f'/apps/{app_id}/reviewSubmissions?limit=200').get('data', [])
 
-          def review_state(review):
-              attrs = review.get('attributes', {})
-              return attrs.get('state') or attrs.get('reviewSubmissionState') or ''
+          def rstate(review):
+              return review.get('attributes',{}).get('state') or ''
 
-          def review_canceled(review):
-              attrs = review.get('attributes', {})
-              return bool(attrs.get('canceled'))
-
-          def review_items(review):
+          def items(review):
               return client.list_review_submission_items(review['id'])
 
-          def target_items(review):
-              return [item for item in review_items(review) if client._item_targets_version(item, target_id)]
+          def item_state(item):
+              return item.get('attributes',{}).get('state') or ''
 
-          reviews = all_reviews()
-          for review in reviews:
-              items = review_items(review)
-              targets = [item['id'] for item in items if client._item_targets_version(item, target_id)]
-              print(
-                  f'APPLE_REVIEW id={review["id"]} state={review_state(review) or "-"} '
-                  f'canceled={review_canceled(review)} items={len(items)} target_items={",".join(targets) or "-"}'
-              )
+          def targets(item):
+              return client._item_targets_version(item, target_id)
 
-          # If the target is genuinely already active for review, just mirror that
-          # state into Publisher and finish. This is safe/idempotent.
-          for review in reviews:
-              if review_state(review) in ACTIVE_REVIEW_STATES and not review_canceled(review) and target_items(review):
-                  Submission.objects.update_or_create(
-                      app=app,
-                      release=release,
-                      platform='ios',
-                      defaults={'state': 'in_review', 'external_id': review['id']},
-                  )
-                  release.status = 'in_review'
-                  release.save(update_fields=['status','updated_at'])
-                  android = Submission.objects.filter(release=release, platform='android').first()
-                  print(f'FINAL already_active android={android.state if android else "missing"} ios=in_review version={release.version_name} build={release.build_number}')
-                  raise SystemExit(0)
+          def active_target_review():
+              for review in reviews():
+                  if rstate(review) not in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
+                      continue
+                  for item in items(review):
+                      if targets(item) and item_state(item) != 'REMOVED':
+                          return review
+              return None
 
-          # Detach the target from any canceled/non-active submission. Apple can
-          # leave the ReviewSubmissionItem linked after cancellation, which blocks
-          # adding the same App Store version to the next draft.
-          stale = []
-          for review in reviews:
-              state = review_state(review)
-              canceled = review_canceled(review)
-              for item in target_items(review):
-                  if canceled or state not in {'READY_FOR_REVIEW'}:
-                      stale.append((review, item))
-
-          for review, item in stale:
-              print(
-                  f'APPLE_STALE_ITEM delete={item["id"]} parent={review["id"]} '
-                  f'state={review_state(review) or "-"} canceled={review_canceled(review)}'
-              )
-              client.request('DELETE', f'/reviewSubmissionItems/{item["id"]}')
-
-          if stale:
-              deadline = time.time() + 120
-              while time.time() < deadline:
-                  lingering = []
-                  for review in all_reviews():
-                      state = review_state(review)
-                      canceled = review_canceled(review)
-                      for item in target_items(review):
-                          if canceled or state not in {'READY_FOR_REVIEW'}:
-                              lingering.append((review['id'], item['id'], state, canceled))
-                  if not lingering:
-                      print('APPLE_STALE_ASSOCIATION=cleared')
-                      break
-                  print(f'APPLE_STALE_ASSOCIATION=waiting count={len(lingering)}')
-                  time.sleep(5)
-              else:
-                  raise SystemExit('apple_stale_review_item_did_not_detach')
-
-          reviews = all_reviews()
-          ready_with_target = None
-          empty_ready = None
-          for review in reviews:
-              if review_state(review) != 'READY_FOR_REVIEW' or review_canceled(review):
-                  continue
-              items = review_items(review)
-              if any(client._item_targets_version(item, target_id) for item in items):
-                  ready_with_target = review
-                  break
-              version_items = [
-                  item for item in items
-                  if (item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')
-              ]
-              if not version_items and empty_ready is None:
-                  empty_ready = review
-
-          if ready_with_target:
-              print(f'APPLE_READY_DRAFT_MATCH id={ready_with_target["id"]}')
-          else:
-              if empty_ready is None:
-                  body = {'data': {'type': 'reviewSubmissions', 'attributes': {}, 'relationships': {
-                      'app': {'data': {'type': 'apps', 'id': app_id}}
-                  }}}
-                  empty_ready = client.request('POST', '/reviewSubmissions', data=json.dumps(body))['data']
-                  print(f'APPLE_READY_DRAFT_CREATED id={empty_ready["id"]}')
-              item_body = {'data': {'type': 'reviewSubmissionItems', 'relationships': {
-                  'reviewSubmission': {'data': {'type': 'reviewSubmissions', 'id': empty_ready['id']}},
-                  'appStoreVersion': {'data': {'type': 'appStoreVersions', 'id': target_id}},
-              }}}
-              new_item = client.request('POST', '/reviewSubmissionItems', data=json.dumps(item_body))['data']
-              print(f'APPLE_READY_DRAFT_REUSED id={empty_ready["id"]} item={new_item["id"]}')
-
-          # Failed historical jobs are kept for audit. Queue one clean submission
-          # attempt; handle_submit_apple will update metadata, attach Build 6 and
-          # reuse the READY_FOR_REVIEW draft that now owns this version.
-          active = release.jobs.filter(type='submit_apple', status__in=['queued','running']).first()
+          active = active_target_review()
           if active:
-              job = active
-              print(f'APPLE_SUBMIT_JOB_REUSED id={job.id} status={job.status}')
-          else:
+              Submission.objects.update_or_create(
+                  app=app, release=release, platform='ios',
+                  defaults={'state':'in_review','external_id':active['id']},
+              )
+              release.status = 'in_review'
+              release.save(update_fields=['status','updated_at'])
+              android = Submission.objects.filter(release=release, platform='android').first()
+              print(f'FINAL android={android.state if android else "missing"} ios=in_review version={release.version_name} build={release.build_number}')
+              raise SystemExit(0)
+
+          # Apple keeps completed/canceled review history. A historical item may
+          # still appear in the list with state REMOVED; that does not own the
+          # version anymore and must not be deleted again.
+          for review in reviews():
+              for item in items(review):
+                  if targets(item):
+                      print(f'APPLE_HISTORY review={review["id"]} review_state={rstate(review)} item={item["id"]} item_state={item_state(item)}')
+
+          ready = None
+          for review in reviews():
+              if rstate(review) != 'READY_FOR_REVIEW':
+                  continue
+              current_items = items(review)
+              if any(targets(item) and item_state(item) != 'REMOVED' for item in current_items):
+                  ready = review
+                  print(f'APPLE_READY_HAS_TARGET id={review["id"]}')
+                  break
+              live_version_items = [
+                  item for item in current_items
+                  if item_state(item) != 'REMOVED'
+                  and (item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')
+              ]
+              if not live_version_items and ready is None:
+                  ready = review
+
+          if not ready:
+              body = {'data': {'type':'reviewSubmissions','attributes':{},'relationships':{
+                  'app': {'data': {'type':'apps','id':app_id}}
+              }}}
+              ready = client.request('POST','/reviewSubmissions',data=json.dumps(body))['data']
+              print(f'APPLE_READY_CREATED id={ready["id"]}')
+
+          current_items = items(ready)
+          if not any(targets(item) and item_state(item) != 'REMOVED' for item in current_items):
+              item_body = {'data': {'type':'reviewSubmissionItems','relationships':{
+                  'reviewSubmission': {'data': {'type':'reviewSubmissions','id':ready['id']}},
+                  'appStoreVersion': {'data': {'type':'appStoreVersions','id':target_id}},
+              }}}
+              last_error = None
+              for attempt in range(1, 37):
+                  try:
+                      created = client.request('POST','/reviewSubmissionItems',data=json.dumps(item_body))['data']
+                      print(f'APPLE_TARGET_ATTACHED review={ready["id"]} item={created["id"]} attempt={attempt}')
+                      last_error = None
+                      break
+                  except Exception as exc:
+                      message = str(exc)
+                      last_error = message
+                      if 'ITEM_PART_OF_ANOTHER_SUBMISSION' not in message:
+                          raise
+                      print(f'APPLE_TARGET_WAITING_FOR_OLD_REVIEW_RELEASE attempt={attempt}')
+                      time.sleep(5)
+              if last_error:
+                  raise SystemExit('apple_old_review_still_owns_version: ' + last_error[:1200])
+
+          # Queue one fresh submit attempt. Historical failures remain for audit.
+          job = release.jobs.filter(type='submit_apple', status__in=['queued','running']).first()
+          if not job:
               job = enqueue_job('submit_apple', app=app, release=release, build=ios)
-              print(f'APPLE_SUBMIT_JOB_QUEUED id={job.id}')
+              print(f'APPLE_SUBMIT_QUEUED id={job.id}')
+          else:
+              print(f'APPLE_SUBMIT_REUSED id={job.id} status={job.status}')
 
           deadline = time.time() + 900
           while time.time() < deadline:
               job.refresh_from_db()
-              print(f'APPLE_SUBMIT_JOB_STATE id={job.id} status={job.status} progress={job.progress}')
+              print(f'APPLE_SUBMIT_STATE id={job.id} status={job.status} progress={job.progress}')
               if job.status == 'succeeded':
                   break
               if job.status == 'failed':
@@ -194,10 +165,15 @@ jobs:
           if job.status != 'succeeded':
               raise SystemExit(f'apple_submit_timeout status={job.status}')
 
+          # Verify both the Publisher record and Apple's live review state.
+          apple_review = active_target_review()
+          if not apple_review:
+              raise SystemExit('apple_review_not_active_after_submit')
           sub = Submission.objects.filter(release=release, platform='ios').first()
           if not sub or sub.state != 'in_review':
-              raise SystemExit(f'apple_submission_not_in_review state={sub.state if sub else "missing"}')
+              raise SystemExit(f'publisher_ios_state={sub.state if sub else "missing"}')
           android = Submission.objects.filter(release=release, platform='android').first()
+          print(f'APPLE_ACTIVE_REVIEW id={apple_review["id"]} state={rstate(apple_review)}')
           print(f'FINAL android={android.state if android else "missing"} ios={sub.state} version={release.version_name} build={release.build_number}')
           PY
           )

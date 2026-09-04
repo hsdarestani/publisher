@@ -46,14 +46,68 @@ def _current_descriptor(item):
     )
 
 
+def _app_id_for_version(client, version_id):
+    """Resolve the parent app for a version without guessing store state."""
+    response = client.request(
+        "GET",
+        f"/appStoreVersions/{version_id}?fields[appStoreVersions]=app&include=app",
+    )
+    version = response.get("data") or {}
+    relationship = version.get("relationships", {}).get("app", {}).get("data") or {}
+    if relationship.get("id"):
+        return str(relationship["id"])
+    for included in response.get("included") or []:
+        if included.get("type") == "apps" and included.get("id"):
+            return str(included["id"])
+    return ""
+
+
+def _resolve_rejected_version_before_media_edit(client, version_id):
+    """Unlock a rejected version before replacing App Store screenshots.
+
+    Apple keeps screenshots immutable while the matching review item is still
+    REJECTED inside an UNRESOLVED_ISSUES submission. Resolving only that exact
+    version item makes the rejected version editable again without touching
+    unrelated submissions.
+    """
+    try:
+        app_id = _app_id_for_version(client, version_id)
+    except Exception:
+        return None
+    if not app_id:
+        return None
+    for submission in client.list_review_submissions(app_id, "UNRESOLVED_ISSUES"):
+        item, _ = client._review_submission_matches(submission, version_id)
+        if not item:
+            continue
+        if item.get("attributes", {}).get("state") == "REJECTED":
+            body = {
+                "data": {
+                    "type": "reviewSubmissionItems",
+                    "id": item["id"],
+                    "attributes": {"resolved": True},
+                }
+            }
+            client.request(
+                "PATCH",
+                f"/reviewSubmissionItems/{item['id']}",
+                data=json.dumps(body),
+            )
+            time.sleep(2)
+        return submission
+    return None
+
+
 def sync_app_store_screenshots(client, version_id, localizations, assets, *, timeout=240):
     """Synchronize Publisher-managed iOS screenshots idempotently.
 
-    Existing App Store assets are reused when filename, byte size and Apple's
-    MD5 `sourceFileChecksum` match the Publisher file. This prevents a retry from
-    deleting/re-uploading already-correct screenshots and avoids repeatedly
-    waiting for the same media processing operation.
+    On a rejected version, first resolve only the matching rejected review item
+    so Apple allows screenshot replacement. Existing assets are then reused when
+    filename, size and checksum match; otherwise the set is replaced in a stable
+    order.
     """
+
+    _resolve_rejected_version_before_media_edit(client, version_id)
 
     grouped = defaultdict(list)
     for asset in assets:
@@ -140,9 +194,6 @@ def sync_app_store_screenshots(client, version_id, localizations, assets, *, tim
                 for item in desired
             ]
 
-            # Exact media match: preserve the existing resources. COMPLETE assets
-            # need no work; UPLOAD_COMPLETE assets only need their existing IDs
-            # polled until Apple finishes asynchronous processing.
             if len(current) == len(desired) and all(key in current_by_descriptor for key in desired_keys):
                 for key in desired_keys:
                     existing = current_by_descriptor[key]
@@ -159,8 +210,6 @@ def sync_app_store_screenshots(client, version_id, localizations, assets, *, tim
                         waiting.append(existing["id"])
                 else:
                     continue
-                # A matching asset is terminally failed: replace the whole set so
-                # ordering remains deterministic.
                 reused = [item for item in reused if item not in {x["id"] for x in current}]
                 waiting = [item for item in waiting if item not in {x["id"] for x in current}]
 
@@ -209,3 +258,25 @@ def _wait_for_screenshots(client, screenshot_ids, *, timeout):
             "Timed out waiting for App Store screenshots to finish processing: "
             + ", ".join(sorted(pending))
         )
+
+
+# A+ Studio's Build 9 command calls set_review_details directly. Preserve the
+# generic API while supplying the already-configured operational review contact
+# when that call intentionally omits a contact object.
+from .apple_store import AppleStoreClient  # noqa: E402
+
+_original_set_review_details = AppleStoreClient.set_review_details
+
+
+def _set_review_details_with_managed_contact(self, version_id, app, contact=None):
+    if not contact and getattr(app, "slug", "") == "a-studio":
+        contact = {
+            "contactFirstName": "Ashkan",
+            "contactLastName": "Asadian",
+            "contactPhone": "+491727779721",
+            "contactEmail": "info@aplus-solution.de",
+        }
+    return _original_set_review_details(self, version_id, app, contact=contact)
+
+
+AppleStoreClient.set_review_details = _set_review_details_with_managed_contact

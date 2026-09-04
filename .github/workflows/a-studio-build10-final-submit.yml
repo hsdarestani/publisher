@@ -1,0 +1,91 @@
+name: A+ Studio Build 10 Final App Store Submit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build10-final-submit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-studio-build10-final-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for metadata-unlock command in Publisher production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py help bootstrap_a_studio_builder_v3 >/dev/null"; then
+              echo 'Build 10 metadata-unlock command is live.'
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Build 10 metadata-unlock command never appeared in production.' >&2
+          exit 2
+
+      - name: Verify production still exposes the real Cloud App Builder boundary
+        run: |
+          set -euo pipefail
+          body="$(curl -4 -fsS --retry 20 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 20 https://studio.aplus-solution.de/api/mobile/config/)"
+          python - "$body" <<'PY'
+          import json, sys
+          data=json.loads(sys.argv[1]); caps=data.get('capabilities') or {}
+          assert data.get('mode') == 'cloud_app_builder', data
+          assert caps.get('project_creation') is True
+          assert caps.get('cloud_app_generation') is True
+          for key in ('code_download','local_code_execution','external_app_preview','mobile_publishing'):
+              assert caps.get(key) is False, (key, caps.get(key))
+          print('production_mobile_boundary=cloud_app_builder_no_generated_runtime')
+          PY
+
+      - name: Unlock rejected draft metadata and submit processed Build 10
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v3 --app-version 1.0.0 --build-number 10 --publish")"
+          printf '%s\n' "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | grep -q 'APPLE_REVIEW|build=10|'
+          printf '%s\n' "$OUTPUT" | grep -q 'release=1.0.0(10) status=in_review'
+
+      - name: Verify final Publisher state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py bootstrap_a_studio_builder_v3 --app-version 1.0.0 --build-number 10 --diagnose-only")"
+          printf '%s\n' "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | grep -q 'mobile_positioning=cloud_app_builder_no_generated_runtime'
+          printf '%s\n' "$OUTPUT" | grep -q 'source_commit=d435b5c066120045cb0f61cfc0f79a20298ffbcc'
+          printf '%s\n' "$OUTPUT" | grep -q 'build_ios=succeeded artifact=yes external_id=f7e5927b-669f-473e-88ed-a19bec207c71'
+          printf '%s\n' "$OUTPUT" | grep -q 'release=1.0.0(10) status=in_review'

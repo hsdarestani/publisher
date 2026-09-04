@@ -1,0 +1,84 @@
+name: Recover and submit A+ Esthetic build 5
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/a-esthetic-release-5-recover-submit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Queue corrected Google and Apple submissions
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-esthetic')
+          release = Release.objects.filter(app=app, version_name='1.0.1', build_number=5).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('A+ Esthetic 1.0.1 (5) release not found')
+          android = release.builds.get(platform='android')
+          ios = release.builds.get(platform='ios')
+          if android.status != 'succeeded' or ios.status != 'succeeded':
+              raise SystemExit(f'Builds not ready: android={android.status}, ios={ios.status}')
+
+          # Keep the historical failed attempts for audit, but queue clean retries only
+          # if there is no currently active/succeeded retry of the same type.
+          if not release.jobs.filter(type='upload_google', status__in=['queued','running','succeeded']).exists():
+              enqueue_job('upload_google', app=app, release=release, build=android)
+          if not release.submissions.filter(platform='ios', state='in_review').exists() and not release.jobs.filter(type='submit_apple', status__in=['queued','running','succeeded']).exists():
+              enqueue_job('submit_apple', app=app, release=release, build=ios)
+          print(f'QUEUED release={release.id} version={release.version_name} build={release.build_number}')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wait for both stores to enter review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 120); do
+            PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-esthetic')
+          release = Release.objects.filter(app=app, version_name='1.0.1', build_number=5).order_by('-created_at').first()
+          subs = {s.platform: s.state for s in release.submissions.all()}
+          active = list(release.jobs.filter(type__in=['upload_google','submit_apple'], status__in=['queued','running']).values_list('type','status'))
+          latest_google = release.jobs.filter(type='upload_google').order_by('-created_at').first()
+          latest_apple = release.jobs.filter(type='submit_apple').order_by('-created_at').first()
+          print(f"STATE google={subs.get('android','pending')} apple={subs.get('ios','pending')} active={active}")
+          if latest_google and latest_google.status == 'failed': print('GOOGLE_ERROR ' + (latest_google.error or '')[:1200])
+          if latest_apple and latest_apple.status == 'failed': print('APPLE_ERROR ' + (latest_apple.error or '')[:1200])
+          if subs.get('android') == 'in_review' and subs.get('ios') == 'in_review': print('DONE')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell")
+            echo "$STATE"
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -Eq '^(GOOGLE_ERROR|APPLE_ERROR) '; then exit 1; fi
+            sleep 30
+          done
+          echo 'Timed out waiting for review state.'
+          exit 1

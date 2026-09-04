@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Read A+ Esthetic Publisher state
+      - name: Read A+ Esthetic Publisher and App Store state
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -26,18 +26,50 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           PY_CODE=$(cat <<'PY'
           from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+
+          source_commit='d5ef2cd6bdf40d85c47aba8e73a99fd6bc0b5c4c'
           app = MobileApp.objects.get(slug='a-esthetic')
-          release = app.releases.filter(source_commit='d5ef2cd6bdf40d85c47aba8e73a99fd6bc0b5c4c').order_by('-created_at').first()
+          release = app.releases.filter(source_commit=source_commit).order_by('-created_at').first()
           if not release:
               raise SystemExit('release_missing')
           print(f'RELEASE version={release.version_name} build={release.build_number} status={release.status} auto_submit={release.auto_submit}')
           for build in release.builds.order_by('platform'):
-              print(f'BUILD {build.platform} status={build.status} external={bool(build.external_build_id)} artifact={bool(build.artifact)}')
+              print(f'BUILD {build.platform} status={build.status} external={bool(build.external_build_id)} artifact={bool(build.artifact)} external_id={build.external_build_id or "-"}')
           for job in release.jobs.order_by('created_at'):
               error = (job.error or '').replace('\n',' ')[:1200]
-              print(f'JOB {job.type} status={job.status} progress={job.progress} error={error}')
+              print(f'JOB {job.id} {job.type} status={job.status} progress={job.progress} error={error}')
           for sub in release.submissions.order_by('platform'):
               print(f'SUBMISSION {sub.platform} state={sub.state} external={sub.external_id}')
+
+          if app.apple_account and app.apple_account.configured:
+              client = AppleStoreClient(app.apple_account)
+              record = client.find_app(app.bundle_id)
+              print(f'APPLE_APP id={record["id"]} name={record.get("attributes",{}).get("name","")}')
+              versions = client.list_versions(record['id'])
+              for item in versions:
+                  attrs = item.get('attributes', {})
+                  print(
+                      'APPLE_VERSION '
+                      f'id={item.get("id")} '
+                      f'version={attrs.get("versionString")} '
+                      f'state={attrs.get("appStoreState") or attrs.get("appVersionState")} '
+                      f'created={attrs.get("createdDate") or "-"}'
+                  )
+              for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW'):
+                  try:
+                      submissions = client.list_review_submissions(record['id'], state)
+                  except Exception as exc:
+                      print(f'APPLE_REVIEW state={state} error={str(exc)[:500]}')
+                      continue
+                  for sub in submissions:
+                      items = client.list_review_submission_items(sub['id'])
+                      targets=[]
+                      for item in items:
+                          rel=(item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {})
+                          if rel.get('id'):
+                              targets.append(str(rel['id']))
+                      print(f'APPLE_REVIEW id={sub["id"]} state={state} targets={",".join(targets) or "-"}')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)

@@ -37,7 +37,7 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          SOURCE='f34019853a2e77405de7cccae8b6e44310142a6b'
+          SOURCE='d7efb450b3493cf153aa680cd2a0e923345744e9'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')

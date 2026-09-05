@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 8dfa11510b6fac621ef5a3a33a0a25c975333713
+      SOURCE_COMMIT: 5e7d94602aaf063750215500dc210509e39ec89e
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -49,8 +49,8 @@ jobs:
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
                   'Darstellungs- und Stabilitätsupdate für die mobile App. '
-                  'Die Customer-Club-Navigation wurde optimiert und ein Android-WebView-Fehler behoben, '
-                  'durch den Markengrafiken außerhalb ihres Bereichs dargestellt werden konnten.'
+                  'Das vertikale Scrollen im Customer Club wurde korrigiert und die untere Navigation '
+                  'bleibt jetzt zuverlässig am unteren Bildschirmrand sichtbar.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

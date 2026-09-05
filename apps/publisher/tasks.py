@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import timedelta
+import time
 import traceback
 from celery import shared_task
 from django.db import transaction
@@ -154,6 +155,45 @@ def handle_submit_google(job):
     return handle_upload_google(job)
 
 
+def _cancel_active_apple_review_for_version(client, app_id, version_id):
+    """Release Apple's active review slot before attaching a replacement build.
+
+    App Store Connect will not reliably allow a new binary to replace the build on
+    a version that is already WAITING_FOR_REVIEW or IN_REVIEW. Reuse the same
+    version by cancelling only the matching active submission, wait until Apple
+    releases it, then let the normal submit flow attach and resubmit the new build.
+    """
+    canceled = []
+    for state in ("WAITING_FOR_REVIEW", "IN_REVIEW"):
+        for submission in client.list_review_submissions(app_id, state):
+            item, _ = client._review_submission_matches(submission, version_id)
+            if item:
+                client.cancel_review_submission(submission["id"])
+                canceled.append(str(submission["id"]))
+
+    if not canceled:
+        return canceled
+
+    active = True
+    for _ in range(30):
+        active = False
+        for state in ("WAITING_FOR_REVIEW", "IN_REVIEW"):
+            for submission in client.list_review_submissions(app_id, state):
+                item, _ = client._review_submission_matches(submission, version_id)
+                if item:
+                    active = True
+                    break
+            if active:
+                break
+        if not active:
+            break
+        time.sleep(2)
+
+    if active:
+        raise RuntimeError("Prior Apple review did not leave the active queue.")
+    return canceled
+
+
 def handle_submit_apple(job):
     from apps.integrations.apple_assets import sync_app_store_screenshots
     from apps.integrations.apple_compliance import (
@@ -172,6 +212,8 @@ def handle_submit_apple(job):
     client = AppleStoreClient(app.apple_account)
     record = client.find_app(app.bundle_id)
     version = client.ensure_version(record["id"], release.version_name)
+    version_id = str(version["id"])
+    canceled_reviews = _cancel_active_apple_review_for_version(client, record["id"], version_id)
 
     app_compliance = apply_app_store_compliance(
         client,
@@ -189,20 +231,21 @@ def handle_submit_apple(job):
         )
 
     for loc in app.localizations.all():
-        client.set_localization(version["id"], loc)
+        client.set_localization(version_id, loc)
     screenshot_result = sync_app_store_screenshots(
         client,
-        version["id"],
+        version_id,
         app.localizations.all(),
         app.assets.filter(kind="screenshot", platform="ios"),
     )
 
-    client.attach_build(version["id"], build.external_build_id)
+    client.attach_build(version_id, build.external_build_id)
     contact = apple_review_contact(app)
-    client.set_review_details(version["id"], app, contact=contact or None)
-    result = client.submit_version(record["id"], version["id"])
+    client.set_review_details(version_id, app, contact=contact or None)
+    result = client.submit_version(record["id"], version_id)
     result["screenshots"] = screenshot_result
     result["app_compliance"] = app_compliance
+    result["canceled_prior_reviews"] = canceled_reviews
     if encryption_answer is not None:
         result["uses_non_exempt_encryption"] = encryption_answer
 

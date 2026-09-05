@@ -2,6 +2,8 @@ name: A+ Esthetic Apple review recovery
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
   push:
     branches: [main]
     paths:
@@ -10,13 +12,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: a-esthetic-apple-review-recovery
+  cancel-in-progress: false
+
 jobs:
   recover:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     steps:
-      - name: Safely submit current A+ Esthetic release
+      - name: Safely advance and submit current A+ Esthetic release
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -33,6 +39,7 @@ jobs:
 
           SOURCE='f34019853a2e77405de7cccae8b6e44310142a6b'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
+          TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')
           release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()
           if not release: raise SystemExit('release_missing')
@@ -65,10 +72,44 @@ jobs:
                       print('FINAL already_active ios=in_review',target_name,release.build_number)
                       raise SystemExit(0)
 
+          # Never interrupt an active review. The scheduled run will try again after Apple changes state.
           other_in_review=next((v for v in versions if vst(v)=='IN_REVIEW' and (not target or v['id']!=target['id'])),None)
           if other_in_review:
               print('APPLE_BLOCKED_ACTIVE_REVIEW',other_in_review.get('attributes',{}).get('versionString'))
               print('APPLE_ACTION=leave_existing_review_untouched')
+              raise SystemExit(0)
+
+          # Publisher uses manual iOS release. Once Apple approves the currently reviewed version,
+          # release that approved version so App Store Connect can open the slot for the queued update.
+          pending_release=next((v for v in versions if vst(v)=='PENDING_DEVELOPER_RELEASE' and (not target or v['id']!=target['id'])),None)
+          if pending_release:
+              release_body={
+                  'data':{
+                      'type':'appStoreVersionReleaseRequests',
+                      'relationships':{
+                          'appStoreVersion':{
+                              'data':{'type':'appStoreVersions','id':pending_release['id']}
+                          }
+                      }
+                  }
+              }
+              try:
+                  client.request('POST','/appStoreVersionReleaseRequests',data=json.dumps(release_body))
+                  print('APPLE_PREVIOUS_RELEASE_REQUESTED',pending_release.get('attributes',{}).get('versionString'),pending_release['id'])
+              except Exception as exc:
+                  # A duplicate request/state race is harmless; re-read the state before deciding.
+                  refreshed=next((v for v in vs() if v['id']==pending_release['id']),None)
+                  current=vst(refreshed) if refreshed else 'MISSING'
+                  if current=='PENDING_DEVELOPER_RELEASE':
+                      raise
+                  print('APPLE_PREVIOUS_RELEASE_ALREADY_ADVANCING',current,str(exc)[:400])
+              print('APPLE_ACTION=wait_for_previous_distribution')
+              raise SystemExit(0)
+
+          # Processing/Apple-release states are intentionally left untouched. A later scheduled run resumes.
+          transition=next((v for v in versions if vst(v) in TRANSITIONAL and (not target or v['id']!=target['id'])),None)
+          if transition:
+              print('APPLE_PREVIOUS_VERSION_TRANSITIONING',transition.get('attributes',{}).get('versionString'),vst(transition))
               raise SystemExit(0)
 
           waiting=next((v for v in versions if vst(v)=='WAITING_FOR_REVIEW' and (not target or v['id']!=target['id'])),None)
@@ -92,6 +133,7 @@ jobs:
               print('APPLE_VERSION_RENAMED',target['id'],target_name)
 
           if target is None:
+              # READY_FOR_SALE / READY_FOR_DISTRIBUTION versions are historical and do not block a new version.
               editable=next((v for v in vs() if vst(v) in EDITABLE),None)
               if editable:
                   target=editable if editable.get('attributes',{}).get('versionString')==target_name else client.update_version_string(editable['id'],target_name)
@@ -123,6 +165,7 @@ jobs:
                       if attempt==36: raise
                       time.sleep(5)
 
+          # A previous failed submit job should not poison recovery. Requeue a clean submit when needed.
           job=release.jobs.filter(type='submit_apple',status__in=['queued','running']).first()
           if not job: job=enqueue_job('submit_apple',app=app,release=release,build=ios)
           print('APPLE_SUBMIT_JOB',job.id,job.status)

@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 779d43db0a0294e17d0b7fe073ce6b238b38bc5d
+      SOURCE_COMMIT: d685934b02a0b5eefc28c9b22486605bc3f899a3
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,9 +48,8 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'Darstellungs- und Stabilitätsupdate für die mobile App. '
-                  'Das vertikale Scrollen im Customer Club wurde korrigiert und die untere Navigation '
-                  'bleibt jetzt zuverlässig am unteren Bildschirmrand sichtbar.'
+                  'Optimierte und übersichtlichere Navigation im Customer Club. '
+                  'Nicht benötigte Bereiche wurden vorerst ausgeblendet und die Stabilität der mobilen App weiter verbessert.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

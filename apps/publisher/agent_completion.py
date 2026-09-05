@@ -88,6 +88,7 @@ def agent_complete(request, job_pk):
             "release",
             "app",
             "app__apple_account",
+            "app__google_account",
         ),
         pk=job_pk,
     )
@@ -146,9 +147,34 @@ def agent_complete(request, job_pk):
     agent.last_seen_at = timezone.now()
     agent.save(update_fields=["current_job", "last_seen_at", "updated_at"])
 
-    # Automatic App Store upload is an auto-submit behavior. Releases with
-    # auto_submit=False keep the signed IPA ready in Publisher until the store
-    # record/metadata has been deliberately prepared by an orchestration command.
+    # Auto-submit releases should move both native platforms forward as soon as
+    # their signed artifacts are complete. Android submission runs on Celery;
+    # iOS first needs the cloud Mac upload and then queues App Store submission.
+    if (
+        succeeded
+        and job.type == "build_android"
+        and build
+        and job.release
+        and job.release.auto_submit
+        and job.app.google_account
+        and job.app.google_account.configured
+    ):
+        exists = Job.objects.filter(
+            release=job.release,
+            type="submit_google",
+            status__in=["queued", "running", "succeeded"],
+        ).exists()
+        if not exists:
+            next_job = enqueue_job(
+                "submit_google",
+                app=job.app,
+                release=job.release,
+                build=build,
+            )
+            next_job.append_log(
+                "Automatically queued after the cloud Android build because auto_submit is enabled."
+            )
+
     if (
         succeeded
         and job.type == "build_ios"

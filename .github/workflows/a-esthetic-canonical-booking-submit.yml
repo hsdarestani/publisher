@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: d685934b02a0b5eefc28c9b22486605bc3f899a3
+      SOURCE_COMMIT: f34019853a2e77405de7cccae8b6e44310142a6b
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,8 +48,9 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'Optimierte und übersichtlichere Navigation im Customer Club. '
-                  'Nicht benötigte Bereiche wurden vorerst ausgeblendet und die Stabilität der mobilen App weiter verbessert.'
+                  'Die Book-Verwaltung ist jetzt direkt in der A+ App verfügbar: Kalender, Buchungen, '
+                  'Kunden und Patientenakte, Behandlungen sowie Verfügbarkeiten lassen sich ohne Wechsel '
+                  'in den Browser verwalten. Zusätzlich wurden Navigation und Stabilität weiter verbessert.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

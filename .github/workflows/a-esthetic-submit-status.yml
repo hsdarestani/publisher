@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 30
     environment: production
     steps:
-      - name: Safely submit A+ Esthetic 1.0.6
+      - name: Safely submit current A+ Esthetic release
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -31,7 +31,7 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          SOURCE='779d43db0a0294e17d0b7fe073ce6b238b38bc5d'
+          SOURCE='f34019853a2e77405de7cccae8b6e44310142a6b'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           app=MobileApp.objects.get(slug='a-esthetic')
           release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()

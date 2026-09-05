@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: d5ef2cd6bdf40d85c47aba8e73a99fd6bc0b5c4c
+      SOURCE_COMMIT: e9acda0ce1bca3e68befc079d5a8f9c5606951e8
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -59,9 +59,9 @@ jobs:
               version_name = f'1.0.{next_patch}'
               build_number = (Release.objects.filter(app=app).aggregate(value=Max('build_number'))['value'] or 0) + 1
               notes = (
-                  'Neue Patientenakte mit zentralem Dokumentenzugriff sowie eine vollständig '
-                  'überarbeitete Terminbuchung mit Behandlung, Behandler und verfügbaren Zeiten. '
-                  'Zusätzlich wurden Stabilität und Bedienung der App verbessert.'
+                  'Stabilitätsupdate für Android mit verbesserter App-Startzuverlässigkeit. '
+                  'Die mobile Navigation und die Darstellung der unteren Navigationsleiste wurden verbessert. '
+                  'Zusätzlich wurden kleinere Stabilitätskorrekturen vorgenommen.'
               )
               release = Release.objects.create(
                   app=app,

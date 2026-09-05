@@ -1,0 +1,77 @@
+name: Kick A+ Solution Customer Color Release 2026-09-05
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kick-aplus-solution-color-release-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  retarget-and-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point release workflow at customer-color fix and dispatch it
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const path = '.github/workflows/aplus-solution-current-release.yml';
+            const target = 'a21d8a2576b4d4e45c5e8771cf46c40c88740264';
+            const { data } = await github.rest.repos.getContent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path,
+              ref: 'main',
+            });
+            if (Array.isArray(data) || !data.content || !data.sha) {
+              core.setFailed('Could not load current A+ Solution store release workflow.');
+              return;
+            }
+            const source = Buffer.from(data.content, 'base64').toString('utf8');
+            let next = source.replace(/APLUS_COMMIT:\s*'[0-9a-f]+'/i, `APLUS_COMMIT: '${target}'`);
+
+            next = next.replace(
+              /loc\.release_notes='[^']*'/,
+              "loc.release_notes='Kundenfarben im Dienstplan korrigiert: Martha einheitlich bernsteingelb; Messe Frankfurt, OMMIA/OMNIA und Hofgut weiß.'"
+            );
+            next = next.replace(
+              /release\.release_notes='[^']*'/,
+              "release.release_notes='Kundenfarben korrigiert: Martha-Standorte bernsteingelb; Messe Frankfurt, OMMIA/OMNIA und Hofgut weiß.'"
+            );
+
+            const oldReview = `              'This update fixes direct shift date selection, PDF exports and native file sharing, explicit all-worker/all-customer filters, '\n              'location-only schedule cards, the copy review transition and readable notification settings. There are no in-app purchases.'`;
+            const newReview = `              'This update corrects fixed customer colors in the schedule: all Martha locations use amber yellow, while Messe Frankfurt, '\n              'OMMIA/OMNIA and Hofgut use white. There are no in-app purchases.'`;
+            next = next.replace(oldReview, newReview);
+
+            if (!next.includes(`APLUS_COMMIT: '${target}'`)) {
+              core.setFailed('Could not retarget APLUS_COMMIT.');
+              return;
+            }
+
+            if (next !== source) {
+              const updated = await github.rest.repos.createOrUpdateFileContents({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path,
+                message: `Release A+ Solution color fix from ${target.slice(0, 12)}`,
+                content: Buffer.from(next, 'utf8').toString('base64'),
+                sha: data.sha,
+                branch: 'main',
+              });
+              core.info(`Retarget commit created: ${updated.data.commit.sha}`);
+            } else {
+              core.info('Release workflow already has the requested target and notes.');
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 2500));
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'aplus-solution-current-release.yml',
+              ref: 'main',
+            });
+            core.info(`Dispatched A+ Solution store release for ${target}`);

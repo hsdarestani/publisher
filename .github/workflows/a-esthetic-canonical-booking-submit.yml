@@ -69,10 +69,17 @@ jobs:
 
           android,_=Build.objects.get_or_create(release=release,platform='android',defaults={'status':'queued','commit_sha':source_commit})
           ios,_=Build.objects.get_or_create(release=release,platform='ios',defaults={'status':'queued','commit_sha':source_commit})
-          if android.status not in {'succeeded','running'} and not release.jobs.filter(type='build_android',status__in=['queued','running','succeeded']).exists():
+
+          def latest_job(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def has_live(kind):
+              job=latest_job(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
+
+          if android.status not in {'succeeded','running'} and not has_live('build_android'):
               android.status='queued'; android.commit_sha=source_commit; android.save(update_fields=['status','commit_sha','updated_at'])
               enqueue_job('build_android',app=app,release=release,build=android,agent=True,platform='linux')
-          if ios.status not in {'succeeded','running'} and not release.jobs.filter(type='build_ios',status__in=['queued','running','succeeded']).exists():
+          if ios.status not in {'succeeded','running'} and not has_live('build_ios'):
               ios.status='queued'; ios.commit_sha=source_commit; ios.save(update_fields=['status','commit_sha','updated_at'])
               enqueue_job('build_ios',app=app,release=release,build=ios,agent=True,platform='macos')
           PY
@@ -101,25 +108,48 @@ jobs:
           if not release: raise SystemExit('release_missing')
           android=release.builds.get(platform='android')
           ios=release.builds.get(platform='ios')
-          def active(kind): return release.jobs.filter(type=kind,status__in=['queued','running','succeeded']).exists()
+
+          def latest_job(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def live(kind):
+              job=latest_job(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
 
           g=Submission.objects.filter(release=release,platform='android').first()
           a=Submission.objects.filter(release=release,platform='ios').first()
-          if android.status=='succeeded' and not g and not active('upload_google'):
+
+          if android.status=='succeeded' and not g and not live('upload_google'):
               enqueue_job('upload_google',app=app,release=release,build=android)
-          if ios.status=='succeeded' and not a and not active('upload_apple'):
+          if ios.status=='succeeded' and not a and not live('upload_apple'):
               enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
-          if ios.status=='succeeded' and ios.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists() and not a and not active('submit_apple'):
+          if ios.status=='succeeded' and ios.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists() and not a and not live('submit_apple'):
               enqueue_job('submit_apple',app=app,release=release,build=ios)
 
           g=Submission.objects.filter(release=release,platform='android').first()
           a=Submission.objects.filter(release=release,platform='ios').first()
           gs=g.state if g else 'pending'; aps=a.state if a else 'pending'
-          failed=list(release.jobs.filter(status='failed').values_list('type','error'))
           current=list(release.jobs.filter(status__in=['queued','running']).values_list('type','status'))
-          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} failed={len(failed)}')
-          for kind,error in failed: print(f'FAILED_JOB {kind}: {(error or "")[:1200]}')
-          if gs=='in_review' and aps=='in_review': print('DONE')
+
+          hard=[]
+          deferred_apple=False
+          for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
+              job=latest_job(kind)
+              if not job or job.status!='failed':
+                  continue
+              error=(job.error or '')
+              if kind=='submit_apple' and ('cannot create a new version of the App in the current state' in error or 'ENTITY_ERROR.RELATIONSHIP.INVALID' in error):
+                  deferred_apple=True
+                  continue
+              hard.append((kind,error))
+
+          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} hard_failed={len(hard)} deferred_apple={deferred_apple}')
+          for kind,error in hard:
+              print(f'HARD_FAILED_JOB {kind}: {error[:1200]}')
+
+          if gs=='in_review' and aps=='in_review':
+              print('DONE')
+          elif gs=='in_review' and ios.status=='succeeded' and deferred_apple:
+              print('APPLE_DEFERRED_TO_RECOVERY')
           PY
             )
             ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
@@ -127,7 +157,8 @@ jobs:
               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
             echo "$STATE"
             if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
-            if printf '%s' "$STATE" | grep -q '^FAILED_JOB '; then exit 1; fi
+            if printf '%s' "$STATE" | grep -q '^APPLE_DEFERRED_TO_RECOVERY$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^HARD_FAILED_JOB '; then exit 1; fi
             sleep 30
           done
           exit 1

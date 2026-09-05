@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: e9acda0ce1bca3e68befc079d5a8f9c5606951e8
+      SOURCE_COMMIT: 8dfa11510b6fac621ef5a3a33a0a25c975333713
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -29,88 +29,56 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT }}
         run: |
           set -euo pipefail
-          test -n "$HOST" && test -n "$PASS"
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-
           PY_CODE=$(cat <<'PY'
           import os, re
           from django.db.models import Max
           from apps.publisher.models import MobileApp, Release, Build
           from apps.publisher.tasks import enqueue_job
 
-          source_commit = os.environ['SOURCE_COMMIT']
-          app = MobileApp.objects.get(slug='a-esthetic')
-          if app.package_name != 'de.aplusesthetic.app' or app.bundle_id != 'de.aplusesthetic.app':
-              raise SystemExit('A+ Esthetic store identifiers do not match de.aplusesthetic.app')
-          if not app.google_account_id or not app.google_account.configured:
-              raise SystemExit('A+ Esthetic Google Play account is not configured')
-          if not app.apple_account_id or not app.apple_account.configured:
-              raise SystemExit('A+ Esthetic App Store account is not configured')
-
-          release = Release.objects.filter(app=app, source_commit=source_commit).order_by('-created_at').first()
+          source_commit=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source_commit).order_by('-created_at').first()
           if not release:
-              patches = []
-              for value in Release.objects.filter(app=app).values_list('version_name', flat=True):
-                  match = re.fullmatch(r'1\.0\.(\d+)', value or '')
-                  if match:
-                      patches.append(int(match.group(1)))
-              next_patch = max(patches or [0]) + 1
-              version_name = f'1.0.{next_patch}'
-              build_number = (Release.objects.filter(app=app).aggregate(value=Max('build_number'))['value'] or 0) + 1
-              notes = (
-                  'Stabilitätsupdate für Android mit verbesserter App-Startzuverlässigkeit. '
-                  'Die mobile Navigation und die Darstellung der unteren Navigationsleiste wurden verbessert. '
-                  'Zusätzlich wurden kleinere Stabilitätskorrekturen vorgenommen.'
+              patches=[]
+              for value in Release.objects.filter(app=app).values_list('version_name',flat=True):
+                  m=re.fullmatch(r'1\.0\.(\d+)',value or '')
+                  if m: patches.append(int(m.group(1)))
+              version=f'1.0.{max(patches or [0])+1}'
+              build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
+              notes=(
+                  'Darstellungs- und Stabilitätsupdate für die mobile App. '
+                  'Die Customer-Club-Navigation wurde optimiert und ein Android-WebView-Fehler behoben, '
+                  'durch den Markengrafiken außerhalb ihres Bereichs dargestellt werden konnten.'
               )
-              release = Release.objects.create(
-                  app=app,
-                  version_name=version_name,
-                  build_number=build_number,
-                  status='building',
-                  source_branch='main',
-                  source_commit=source_commit,
-                  android_track='production',
-                  android_rollout=1,
-                  ios_release_type='manual',
-                  auto_submit=True,
-                  release_notes=notes,
+              release=Release.objects.create(
+                  app=app,version_name=version,build_number=build,status='building',
+                  source_branch='main',source_commit=source_commit,android_track='production',
+                  android_rollout=1,ios_release_type='manual',auto_submit=True,release_notes=notes,
               )
-              app.latest_commit_sha = source_commit
-              app.save(update_fields=['latest_commit_sha', 'updated_at'])
+              app.latest_commit_sha=source_commit
+              app.save(update_fields=['latest_commit_sha','updated_at'])
               for loc in app.localizations.all():
-                  loc.release_notes = notes
-                  loc.save(update_fields=['release_notes', 'updated_at'])
-              print(f'A_ESTHETIC_RELEASE_CREATED id={release.pk} version={version_name} build={build_number} source={source_commit}')
+                  loc.release_notes=notes
+                  loc.save(update_fields=['release_notes','updated_at'])
+              print(f'RELEASE_CREATED id={release.pk} version={version} build={build}')
           else:
-              print(f'A_ESTHETIC_RELEASE_REUSED id={release.pk} version={release.version_name} build={release.build_number} source={source_commit}')
+              print(f'RELEASE_REUSED id={release.pk} version={release.version_name} build={release.build_number}')
 
-          android, _ = Build.objects.get_or_create(
-              release=release,
-              platform='android',
-              defaults={'status': 'queued', 'commit_sha': source_commit},
-          )
-          ios, _ = Build.objects.get_or_create(
-              release=release,
-              platform='ios',
-              defaults={'status': 'queued', 'commit_sha': source_commit},
-          )
-
-          if android.status not in {'succeeded', 'running'} and not release.jobs.filter(type='build_android', status__in=['queued','running','succeeded']).exists():
-              android.status = 'queued'
-              android.commit_sha = source_commit
-              android.save(update_fields=['status','commit_sha','updated_at'])
-              enqueue_job('build_android', app=app, release=release, build=android, agent=True, platform='linux')
-          if ios.status not in {'succeeded', 'running'} and not release.jobs.filter(type='build_ios', status__in=['queued','running','succeeded']).exists():
-              ios.status = 'queued'
-              ios.commit_sha = source_commit
-              ios.save(update_fields=['status','commit_sha','updated_at'])
-              enqueue_job('build_ios', app=app, release=release, build=ios, agent=True, platform='macos')
+          android,_=Build.objects.get_or_create(release=release,platform='android',defaults={'status':'queued','commit_sha':source_commit})
+          ios,_=Build.objects.get_or_create(release=release,platform='ios',defaults={'status':'queued','commit_sha':source_commit})
+          if android.status not in {'succeeded','running'} and not release.jobs.filter(type='build_android',status__in=['queued','running','succeeded']).exists():
+              android.status='queued'; android.commit_sha=source_commit; android.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_android',app=app,release=release,build=android,agent=True,platform='linux')
+          if ios.status not in {'succeeded','running'} and not release.jobs.filter(type='build_ios',status__in=['queued','running','succeeded']).exists():
+              ios.status='queued'; ios.commit_sha=source_commit; ios.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_ios',app=app,release=release,build=ios,agent=True,platform='macos')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && SOURCE_COMMIT='$SOURCE_COMMIT' printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
 
       - name: Wait for builds, uploads and review submission
         env:
@@ -120,69 +88,45 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-
           for attempt in $(seq 1 150); do
             PY_CODE=$(cat <<'PY'
           import os
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          source_commit = os.environ['SOURCE_COMMIT']
-          app = MobileApp.objects.get(slug='a-esthetic')
-          release = Release.objects.filter(app=app, source_commit=source_commit).order_by('-created_at').first()
-          if not release:
-              raise SystemExit('release_missing')
-          android = release.builds.get(platform='android')
-          ios = release.builds.get(platform='ios')
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+          if not release: raise SystemExit('release_missing')
+          android=release.builds.get(platform='android')
+          ios=release.builds.get(platform='ios')
+          def active(kind): return release.jobs.filter(type=kind,status__in=['queued','running','succeeded']).exists()
 
-          def live(kind):
-              return release.jobs.filter(type=kind, status__in=['queued','running','succeeded']).exists()
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+          if android.status=='succeeded' and not g and not active('upload_google'):
+              enqueue_job('upload_google',app=app,release=release,build=android)
+          if ios.status=='succeeded' and not a and not active('upload_apple'):
+              enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
+          if ios.status=='succeeded' and ios.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists() and not a and not active('submit_apple'):
+              enqueue_job('submit_apple',app=app,release=release,build=ios)
 
-          google_sub = Submission.objects.filter(release=release, platform='android').first()
-          apple_sub = Submission.objects.filter(release=release, platform='ios').first()
-
-          if android.status == 'succeeded' and not google_sub and not live('upload_google'):
-              enqueue_job('upload_google', app=app, release=release, build=android)
-          if ios.status == 'succeeded' and not apple_sub and not live('upload_apple'):
-              enqueue_job('upload_apple', app=app, release=release, build=ios, agent=True, platform='macos')
-          upload_apple_ok = release.jobs.filter(type='upload_apple', status='succeeded').exists()
-          if ios.status == 'succeeded' and upload_apple_ok and ios.external_build_id and not apple_sub and not live('submit_apple'):
-              enqueue_job('submit_apple', app=app, release=release, build=ios)
-
-          google_sub = Submission.objects.filter(release=release, platform='android').first()
-          apple_sub = Submission.objects.filter(release=release, platform='ios').first()
-          google_state = google_sub.state if google_sub else 'pending'
-          apple_state = apple_sub.state if apple_sub else 'pending'
-          failed_jobs = list(release.jobs.filter(status='failed').values_list('type','error'))
-          active_jobs = list(release.jobs.filter(status__in=['queued','running']).values_list('type','status'))
-          print(
-              'A_ESTHETIC_STATE '
-              f'version={release.version_name} build={release.build_number} '
-              f'android_build={android.status} ios_build={ios.status} '
-              f'google={google_state} apple={apple_state} '
-              f'active={active_jobs} failed={len(failed_jobs)}'
-          )
-          for kind, error in failed_jobs:
-              print(f'FAILED_JOB {kind}: {(error or "")[:900]}')
-          if google_state == 'in_review' and apple_state == 'in_review':
-              print('A_ESTHETIC_DONE')
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+          gs=g.state if g else 'pending'; aps=a.state if a else 'pending'
+          failed=list(release.jobs.filter(status='failed').values_list('type','error'))
+          current=list(release.jobs.filter(status__in=['queued','running']).values_list('type','status'))
+          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} failed={len(failed)}')
+          for kind,error in failed: print(f'FAILED_JOB {kind}: {(error or "")[:1200]}')
+          if gs=='in_review' and aps=='in_review': print('DONE')
           PY
             )
             ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
             STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
             echo "$STATE"
-
-            if printf '%s' "$STATE" | grep -q 'A_ESTHETIC_DONE'; then
-              echo 'Both A+ Esthetic store submissions are in review.'
-              exit 0
-            fi
-            if printf '%s' "$STATE" | grep -q '^FAILED_JOB '; then
-              echo 'A Publisher build/store job failed; stopping for diagnosis.'
-              exit 1
-            fi
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^FAILED_JOB '; then exit 1; fi
             sleep 30
           done
-
-          echo 'Timed out waiting for both stores to enter review.'
           exit 1

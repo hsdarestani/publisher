@@ -1,0 +1,184 @@
+name: Replace A+ Esthetic Apple review with latest build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-force-latest-review.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-esthetic-force-latest-apple-review
+  cancel-in-progress: false
+
+jobs:
+  replace-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Withdraw superseded review and submit 1.0.9 Build 13
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import json, time
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          SOURCE='d7efb450b3493cf153aa680cd2a0e923345744e9'
+          EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()
+          if not release: raise SystemExit('release_missing')
+          print('TARGET_RELEASE',release.version_name,release.build_number)
+          ios=release.builds.get(platform='ios')
+          if ios.status!='succeeded' or not ios.external_build_id: raise SystemExit('ios_build_not_ready')
+
+          client=AppleStoreClient(app.apple_account)
+          app_id=client.find_app(app.bundle_id)['id']
+          target_name=release.version_name
+
+          def versions(): return client.list_versions(app_id)
+          def vstate(v):
+              attrs=v.get('attributes',{})
+              return attrs.get('appStoreState') or attrs.get('appVersionState') or ''
+          def reviews(): return client.request('GET',f'/apps/{app_id}/reviewSubmissions?limit=200').get('data',[])
+          def rstate(r): return r.get('attributes',{}).get('state') or ''
+          def items(r): return client.list_review_submission_items(r['id'])
+          def item_state(i): return i.get('attributes',{}).get('state') or ''
+          def item_version(i):
+              return str((i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id') or '')
+          def live_item(r,version_id):
+              return next((i for i in items(r) if item_version(i)==str(version_id) and item_state(i)!='REMOVED'),None)
+
+          current_versions=versions()
+          for v in current_versions:
+              print('APPLE_VERSION',v['id'],v.get('attributes',{}).get('versionString'),vstate(v))
+          target=next((v for v in current_versions if v.get('attributes',{}).get('versionString')==target_name),None)
+
+          if target:
+              for r in reviews():
+                  if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target['id']):
+                      Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':r['id']})
+                      release.status='in_review'; release.save(update_fields=['status','updated_at'])
+                      print('FINAL already_latest_in_review version='+target_name+' build='+str(release.build_number))
+                      raise SystemExit(0)
+
+          # The currently reviewed 1.0.6 is superseded by this bug-fix release.
+          # Withdraw it so the latest safe-area + Book Admin v2 build can take its slot.
+          old_active=[]
+          for v in current_versions:
+              if target and v['id']==target['id']:
+                  continue
+              if vstate(v) not in {'IN_REVIEW','WAITING_FOR_REVIEW'}:
+                  continue
+              for r in reviews():
+                  if rstate(r) in {'IN_REVIEW','WAITING_FOR_REVIEW'} and live_item(r,v['id']):
+                      old_active.append((v,r))
+                      break
+
+          reusable_id=None
+          for old,r in old_active:
+              old_name=old.get('attributes',{}).get('versionString')
+              print('APPLE_WITHDRAW_SUPERSEDED_REVIEW',old_name,r['id'])
+              client.cancel_review_submission(r['id'])
+              reusable_id=reusable_id or old['id']
+
+          if reusable_id:
+              deadline=time.time()+300
+              state=''
+              while time.time()<deadline:
+                  cur=next((v for v in versions() if v['id']==reusable_id),None)
+                  if not cur: raise SystemExit('withdrawn_version_disappeared')
+                  state=vstate(cur)
+                  print('APPLE_WAIT_EDITABLE',state)
+                  if state in EDITABLE: break
+                  time.sleep(5)
+              if state not in EDITABLE:
+                  raise SystemExit('withdrawn_version_not_editable:'+state)
+
+          current_versions=versions()
+          target=next((v for v in current_versions if v.get('attributes',{}).get('versionString')==target_name),None)
+          if target is None:
+              if reusable_id:
+                  target=client.update_version_string(reusable_id,target_name)
+                  print('APPLE_VERSION_RENAMED',target['id'],target_name)
+              else:
+                  editable=next((v for v in current_versions if vstate(v) in EDITABLE),None)
+                  if editable:
+                      target=editable if editable.get('attributes',{}).get('versionString')==target_name else client.update_version_string(editable['id'],target_name)
+                  else:
+                      target=client.create_version(app_id,target_name)
+                  print('APPLE_TARGET_READY',target['id'],target_name)
+
+          target_id=target['id']
+          client.set_build_uses_non_exempt_encryption(ios.external_build_id,False)
+          client.attach_build(target_id,ios.external_build_id)
+          print('APPLE_BUILD_ATTACHED',ios.external_build_id)
+
+          ready=None
+          for r in reviews():
+              if rstate(r)!='READY_FOR_REVIEW':
+                  continue
+              if live_item(r,target_id):
+                  ready=r; break
+              live=[i for i in items(r) if item_state(i)!='REMOVED' and item_version(i)]
+              if not live and ready is None:
+                  ready=r
+          if ready is None:
+              body={'data':{'type':'reviewSubmissions','attributes':{},'relationships':{'app':{'data':{'type':'apps','id':app_id}}}}}
+              ready=client.request('POST','/reviewSubmissions',data=json.dumps(body))['data']
+          if not live_item(ready,target_id):
+              body={'data':{'type':'reviewSubmissionItems','relationships':{'reviewSubmission':{'data':{'type':'reviewSubmissions','id':ready['id']}},'appStoreVersion':{'data':{'type':'appStoreVersions','id':target_id}}}}}
+              item=client.request('POST','/reviewSubmissionItems',data=json.dumps(body))['data']
+              print('APPLE_TARGET_ATTACHED',ready['id'],item['id'])
+
+          # Use Publisher's normal submit path. Retry once if an older queued submit lost the race.
+          for submit_attempt in range(2):
+              job=release.jobs.filter(type='submit_apple',status__in=['queued','running']).order_by('-pk').first()
+              if not job:
+                  job=enqueue_job('submit_apple',app=app,release=release,build=ios)
+              print('APPLE_SUBMIT_JOB',job.id,job.status,'attempt',submit_attempt+1)
+              deadline=time.time()+600
+              while time.time()<deadline:
+                  job.refresh_from_db()
+                  print('APPLE_SUBMIT_STATE',job.id,job.status,job.progress)
+                  if job.status in {'succeeded','failed'}:
+                      break
+                  time.sleep(10)
+              if job.status=='succeeded':
+                  break
+              if submit_attempt==0:
+                  print('APPLE_SUBMIT_RETRY_AFTER_FAILURE',(job.error or '')[:800])
+                  enqueue_job('submit_apple',app=app,release=release,build=ios)
+                  time.sleep(5)
+                  continue
+              raise SystemExit('apple_submit_failed:'+(job.error or '')[:1600])
+
+          active=None
+          for r in reviews():
+              if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target_id):
+                  active=r; break
+          if not active:
+              raise SystemExit('latest_review_not_active_after_submit')
+
+          Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':active['id']})
+          release.status='in_review'; release.save(update_fields=['status','updated_at'])
+          android=Submission.objects.filter(release=release,platform='android').first()
+          print('APPLE_ACTIVE_REVIEW',active['id'],rstate(active))
+          print('FINAL android='+str(android.state if android else 'missing'),'ios=in_review','version='+target_name,'build='+str(release.build_number))
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

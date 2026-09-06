@@ -1,4 +1,4 @@
-name: A+ Solution Build 22 Store Finalize
+name: A+ Solution 1.0.10 Build 23 Store Finalize
 
 on:
   workflow_dispatch:
@@ -14,29 +14,117 @@ permissions:
 
 env:
   SOURCE_COMMIT: '9bd756581438b97377b9e80a927c34e9272e8cf0'
-  BUILD_NUMBER: '22'
+  VERSION_NAME: '1.0.10'
+  BUILD_NUMBER: '23'
 
 jobs:
   finalize:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 110
     environment: production
     steps:
       - name: Install SSH tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass jq >/dev/null
 
-      - name: Wake current Mac agent
+      - name: Prepare 1.0.10 build 23 release
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          source = os.environ['SOURCE_COMMIT']
+          version = os.environ['VERSION_NAME']
+          build_number = int(os.environ['BUILD_NUMBER'])
+
+          cfg = dict(app.build_config or {})
+          cfg.update({
+              'android_command': 'bash frontend/scripts/build-publisher-android.sh',
+              'android_artifact': 'frontend/android/app/build/outputs/bundle/release/*.aab',
+              'ios_command': 'bash frontend/scripts/build-publisher-ios-opaque.sh',
+              'ios_artifact': 'frontend/ios/build/export/*.ipa',
+          })
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          cfg['env'] = env
+          app.build_config = cfg
+          app.save(update_fields=['build_config', 'updated_at'])
+
+          release, _ = Release.objects.get_or_create(
+              app=app,
+              version_name=version,
+              build_number=build_number,
+              defaults={
+                  'status': 'building',
+                  'source_branch': 'main',
+                  'source_commit': source,
+                  'android_track': 'production',
+                  'android_rollout': 1,
+                  'ios_release_type': 'automatic',
+                  'auto_submit': True,
+                  'release_notes': 'Customer color corrections and schedule display fixes.',
+              },
+          )
+          release.status = 'building'
+          release.source_branch = 'main'
+          release.source_commit = source
+          release.android_track = 'production'
+          release.android_rollout = 1
+          release.ios_release_type = 'automatic'
+          release.auto_submit = True
+          release.release_notes = 'Customer color corrections and schedule display fixes.'
+          release.save(update_fields=[
+              'status','source_branch','source_commit','android_track','android_rollout',
+              'ios_release_type','auto_submit','release_notes','updated_at'
+          ])
+
+          def ensure_build(platform, kind, agent_platform):
+              build, _ = Build.objects.get_or_create(
+                  release=release,
+                  platform=platform,
+                  defaults={'status': 'queued', 'commit_sha': source},
+              )
+              if build.status != 'succeeded':
+                  build.status = 'queued'
+                  build.commit_sha = source
+                  build.save(update_fields=['status','commit_sha','updated_at'])
+              exists = Job.objects.filter(
+                  release=release,
+                  type=kind,
+                  status__in=['queued','running','succeeded'],
+              ).exists()
+              if not exists and build.status != 'succeeded':
+                  enqueue_job(kind, app=app, release=release, build=build, agent=True, platform=agent_platform)
+              return build
+
+          android = ensure_build('android', 'build_android', 'linux')
+          ios = ensure_build('ios', 'build_ios', 'macos')
+          print(f'PREPARED|{release.version_name}|{release.build_number}|{android.status}|{ios.status}|{release.source_commit}')
+          PY
+
+      - name: Wake Android and iOS cloud agents
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'cloud-macos.yml',
-              ref: 'main'
-            });
+            for (const workflow_id of ['cloud-linux.yml', 'cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }
 
-      - name: Keep Build 22 moving to both stores
+      - name: Move build 23 through both stores
         id: finish
         env:
           HOST: ${{ secrets.HOST }}
@@ -48,58 +136,69 @@ jobs:
           PORT="${SSH_PORT:-22}"
           : > /tmp/store-state.txt
 
-          for i in $(seq 1 240); do
+          for i in $(seq 1 300); do
             OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+              "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
           import os, re
           from apps.publisher.models import Build, Job, MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
           app = MobileApp.objects.get(slug='a-plus-solution')
-          r = Release.objects.filter(
+          r = Release.objects.get(
               app=app,
+              version_name=os.environ['VERSION_NAME'],
               build_number=int(os.environ['BUILD_NUMBER']),
-              source_commit=os.environ['SOURCE_COMMIT'],
-          ).order_by('-created_at').first()
-          if not r:
-              raise SystemExit('BUILD22_RELEASE_NOT_FOUND')
-
-          r.auto_submit = True
-          r.android_track = 'production'
-          r.android_rollout = 1
-          r.ios_release_type = 'automatic'
-          r.save(update_fields=['auto_submit','android_track','android_rollout','ios_release_type','updated_at'])
+          )
 
           def latest_job(kind):
               return Job.objects.filter(release=r, type=kind).order_by('-created_at').first()
           def active_or_done(kind):
               return Job.objects.filter(release=r, type=kind, status__in=['queued','running','succeeded']).exists()
           def clean(value):
-              return re.sub(r'\s+', ' ', str(value or '')).replace('|','/')[:240]
+              return re.sub(r'\s+', ' ', str(value or '')).replace('|','/')[:320]
+          def retry_agent_job(kind, build, platform, max_failures=2):
+              failed = Job.objects.filter(release=r, type=kind, status='failed').count()
+              if failed <= max_failures and not active_or_done(kind):
+                  enqueue_job(kind, app=app, release=r, build=build, agent=True, platform=platform)
+          def retry_server_job(kind, build, max_failures=2):
+              failed = Job.objects.filter(release=r, type=kind, status='failed').count()
+              if failed <= max_failures and not active_or_done(kind):
+                  enqueue_job(kind, app=app, release=r, build=build)
 
-          android = Build.objects.filter(release=r, platform='android').first()
-          ios = Build.objects.filter(release=r, platform='ios').first()
+          android = Build.objects.filter(release=r, platform='android').order_by('-created_at').first()
+          ios = Build.objects.filter(release=r, platform='ios').order_by('-created_at').first()
+
+          bj_a = latest_job('build_android')
+          bj_i = latest_job('build_ios')
+          if android and android.status != 'succeeded' and bj_a and bj_a.status == 'failed':
+              android.status = 'queued'; android.save(update_fields=['status','updated_at'])
+              retry_agent_job('build_android', android, 'linux')
+          if ios and ios.status != 'succeeded' and bj_i and bj_i.status == 'failed':
+              ios.status = 'queued'; ios.save(update_fields=['status','updated_at'])
+              retry_agent_job('build_ios', ios, 'macos')
 
           if android and android.status == 'succeeded' and android.artifact and not active_or_done('submit_google'):
-              enqueue_job('submit_google', app=app, release=r, build=android)
+              retry_server_job('submit_google', android)
 
           if ios and ios.status == 'succeeded' and ios.artifact and not active_or_done('upload_apple'):
-              enqueue_job('upload_apple', app=app, release=r, build=ios, agent=True, platform='macos')
+              retry_agent_job('upload_apple', ios, 'macos')
 
           upload = latest_job('upload_apple')
           if upload and upload.status == 'succeeded' and not active_or_done('submit_apple'):
-              enqueue_job('submit_apple', app=app, release=r, build=ios)
+              retry_server_job('submit_apple', ios)
 
           g = latest_job('submit_google')
           u = latest_job('upload_apple')
           a = latest_job('submit_apple')
+          ba = latest_job('build_android')
+          bi = latest_job('build_ios')
           gs = Submission.objects.filter(release=r, platform='android').order_by('-updated_at').first()
           aps = Submission.objects.filter(release=r, platform='ios').order_by('-updated_at').first()
 
           print('STATE|' + '|'.join([
               str(r.version_name), str(r.build_number),
-              android.status if android else 'missing',
-              ios.status if ios else 'missing',
+              android.status if android else 'missing', clean(ba.error if ba else ''),
+              ios.status if ios else 'missing', clean(bi.error if bi else ''),
               g.status if g else 'missing', clean(g.error if g else ''),
               u.status if u else 'missing', clean(u.error if u else ''),
               a.status if a else 'missing', clean(a.error if a else ''),
@@ -113,19 +212,29 @@ jobs:
             test -n "$STATE"
             printf '%s\n' "$STATE" | tee /tmp/store-state.txt
 
-            IFS='|' read -r _ VERSION BUILD ANDROID IOS GOOGLE GOOGLE_ERR UPLOAD UPLOAD_ERR APPLE APPLE_ERR GSTORE ASTORE AID <<< "$STATE"
+            IFS='|' read -r _ VERSION BUILD ANDROID ANDROID_ERR IOS IOS_ERR GOOGLE GOOGLE_ERR UPLOAD UPLOAD_ERR APPLE APPLE_ERR GSTORE ASTORE AID <<< "$STATE"
 
-            if [ "$GOOGLE" = failed ]; then echo "Google submission failed: $GOOGLE_ERR" >&2; exit 1; fi
-            if [ "$UPLOAD" = failed ]; then echo "Apple upload failed: $UPLOAD_ERR" >&2; exit 1; fi
-            if [ "$APPLE" = failed ]; then echo "Apple submission failed: $APPLE_ERR" >&2; exit 1; fi
+            if [ "$GOOGLE" = failed ] && printf '%s' "$GOOGLE_ERR" | grep -qiE 'permission|credential|not configured|forbidden|unauthorized'; then
+              echo "Permanent Google submission failure: $GOOGLE_ERR" >&2; exit 1
+            fi
+            if [ "$UPLOAD" = failed ] && printf '%s' "$UPLOAD_ERR" | grep -qiE 'closed for new build submissions|higher version'; then
+              echo "Apple unexpectedly rejected version $VERSION: $UPLOAD_ERR" >&2; exit 1
+            fi
 
-            if [ "$GOOGLE" = succeeded ] && [ "$APPLE" = succeeded ]; then
-              echo "Both stores accepted the submission jobs."
+            if [ "$GOOGLE" = succeeded ] && [ "$APPLE" = succeeded ] && [ "$GSTORE" = in_review ] && [ "$ASTORE" = in_review ]; then
+              echo "Both stores are now in review."
               exit 0
             fi
 
-            # Wake a fresh macOS agent whenever the IPA exists but delivery is not finished.
-            if [ "$IOS" = succeeded ] && [ "$UPLOAD" != succeeded ]; then
+            if [ "$ANDROID" != succeeded ] || [ "$GOOGLE" != succeeded ]; then
+              curl -fsS -X POST \
+                -H "Authorization: Bearer ${{ github.token }}" \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cloud-linux.yml/dispatches" \
+                -d '{"ref":"main"}' >/dev/null || true
+            fi
+            if [ "$IOS" != succeeded ] || [ "$UPLOAD" != succeeded ]; then
               curl -fsS -X POST \
                 -H "Authorization: Bearer ${{ github.token }}" \
                 -H 'Accept: application/vnd.github+json' \
@@ -137,7 +246,7 @@ jobs:
             sleep 20
           done
 
-          echo 'Timed out before both store submissions finished.' >&2
+          echo 'Timed out before both store submissions reached review.' >&2
           exit 1
 
       - name: Publish final status
@@ -149,7 +258,7 @@ jobs:
             const state = fs.existsSync('/tmp/store-state.txt') ? fs.readFileSync('/tmp/store-state.txt','utf8').trim() : 'No state captured';
             const ok = '${{ steps.finish.outcome }}' === 'success';
             const body = [
-              ok ? '✅ A+ Solution Build 22 store finalizer completed.' : '⚠️ A+ Solution Build 22 store finalizer needs attention.',
+              ok ? '✅ A+ Solution 1.0.10 (23) is submitted to both stores and waiting on store review.' : '⚠️ A+ Solution 1.0.10 (23) store finalizer needs attention.',
               '',
               `Source commit: ${process.env.SOURCE_COMMIT}`,
               `State: \`${state}\``,

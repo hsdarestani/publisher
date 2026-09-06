@@ -1,0 +1,60 @@
+name: Inspect A+ Studio App Review access
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-review-detail-state.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Install SSH client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Inspect review-access metadata without exposing secrets
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+
+          app = MobileApp.objects.get(slug='a-studio')
+          print('PUBLISHER_REVIEW|' + json.dumps({
+              'username': app.review_username or '',
+              'password_present': bool(app.get_review_password()),
+              'requires_login': bool(app.requires_login),
+          }, sort_keys=True))
+
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = next(
+              (v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0'),
+              None,
+          )
+          if not version:
+              raise SystemExit('A+ Studio version 1.0.0 was not found in App Store Connect.')
+          detail = client.request('GET', f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data') or {}
+          attrs = detail.get('attributes') or {}
+          print('APPLE_REVIEW_ACCESS|' + json.dumps({
+              'demo_account_required': attrs.get('demoAccountRequired'),
+              'username': attrs.get('demoAccountName') or '',
+              'password_present': bool(attrs.get('demoAccountPassword')),
+              'notes_present': bool(attrs.get('notes')),
+          }, sort_keys=True))
+          PY

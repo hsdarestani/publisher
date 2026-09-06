@@ -37,8 +37,8 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          # Target the fully validated Book Admin v2 + native safe-area release.
-          SOURCE='d7efb450b3493cf153aa680cd2a0e923345744e9'
+          # Focused five-feature A+ patient app: canonical Book booking + SAMS-style Wallet.
+          SOURCE='bfbf17e3d14045344220e8d72c376f3329a553ec'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')
@@ -132,7 +132,7 @@ jobs:
               print('APPLE_VERSION_RENAMED',target['id'],target_name)
 
           if target is None:
-              editable=next((v for v in vs() if vst(v) in EDITABLE),None)
+              editable=next((v for v in versions if vst(v) in EDITABLE),None)
               if editable:
                   target=editable if editable.get('attributes',{}).get('versionString')==target_name else client.update_version_string(editable['id'],target_name)
               else:

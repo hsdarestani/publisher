@@ -114,3 +114,5 @@ jobs:
               workflow_id: 'aplus-solution-strato-store-release.yml',
               ref: 'main'
             });
+
+# 2026-09-06: credential repair retriggered after active-worker password rotation.

@@ -23,6 +23,10 @@ _ALLOWED_WORKFLOWS = {
         "hsdarestani/BrandFlowAI",
         ".github/workflows/publisher-store-review-credentials.yml@",
     ),
+    "de.aplussolution.studio": (
+        "hsdarestani/a-studio",
+        ".github/workflows/create-apple-review-account.yml@",
+    ),
 }
 
 

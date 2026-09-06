@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: d7efb450b3493cf153aa680cd2a0e923345744e9
+      SOURCE_COMMIT: bfbf17e3d14045344220e8d72c376f3329a553ec
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,10 +48,11 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'Die Book-Verwaltung in der A+ App wurde komplett überarbeitet: Termine, Kalender, Kunden '
-                  'und Verfügbarkeiten sind jetzt in einer klaren, SimplyBook-inspirierten mobilen Ansicht '
-                  'verfügbar. Zusätzlich berücksichtigt die native App Status- und Navigationsleisten sicher, '
-                  'damit Inhalte auf Android und iOS nicht mehr unter Systemelementen liegen.'
+                  'A+ Esthetic wurde auf die fünf zentralen Patientenfunktionen fokussiert. '
+                  'Die Terminbuchung verwendet jetzt direkt das zentrale A+ Book-System mit derselben Datenbasis '
+                  'und dem vollständigen Behandlungs-, Behandler- und Terminablauf. Neu gestaltet wurden außerdem '
+                  'Patientenakte, Google-Bewertungen, Empfehlungen und die digitale A+ Wallet mit persönlicher QR-Karte. '
+                  'Die Anmeldung verwendet das aktuelle A+ Esthetic Branding.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

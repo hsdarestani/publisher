@@ -1,0 +1,163 @@
+name: A+ Solution Build 22 Store Finalize
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build22-store-finalize.yml'
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+env:
+  SOURCE_COMMIT: '9bd756581438b97377b9e80a927c34e9272e8cf0'
+  BUILD_NUMBER: '22'
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Wake current Mac agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Keep Build 22 moving to both stores
+        id: finish
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          : > /tmp/store-state.txt
+
+          for i in $(seq 1 240); do
+            OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os, re
+          from apps.publisher.models import Build, Job, MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.filter(
+              app=app,
+              build_number=int(os.environ['BUILD_NUMBER']),
+              source_commit=os.environ['SOURCE_COMMIT'],
+          ).order_by('-created_at').first()
+          if not r:
+              raise SystemExit('BUILD22_RELEASE_NOT_FOUND')
+
+          r.auto_submit = True
+          r.android_track = 'production'
+          r.android_rollout = 1
+          r.ios_release_type = 'automatic'
+          r.save(update_fields=['auto_submit','android_track','android_rollout','ios_release_type','updated_at'])
+
+          def latest_job(kind):
+              return Job.objects.filter(release=r, type=kind).order_by('-created_at').first()
+          def active_or_done(kind):
+              return Job.objects.filter(release=r, type=kind, status__in=['queued','running','succeeded']).exists()
+          def clean(value):
+              return re.sub(r'\s+', ' ', str(value or '')).replace('|','/')[:240]
+
+          android = Build.objects.filter(release=r, platform='android').first()
+          ios = Build.objects.filter(release=r, platform='ios').first()
+
+          if android and android.status == 'succeeded' and android.artifact and not active_or_done('submit_google'):
+              enqueue_job('submit_google', app=app, release=r, build=android)
+
+          if ios and ios.status == 'succeeded' and ios.artifact and not active_or_done('upload_apple'):
+              enqueue_job('upload_apple', app=app, release=r, build=ios, agent=True, platform='macos')
+
+          upload = latest_job('upload_apple')
+          if upload and upload.status == 'succeeded' and not active_or_done('submit_apple'):
+              enqueue_job('submit_apple', app=app, release=r, build=ios)
+
+          g = latest_job('submit_google')
+          u = latest_job('upload_apple')
+          a = latest_job('submit_apple')
+          gs = Submission.objects.filter(release=r, platform='android').order_by('-updated_at').first()
+          aps = Submission.objects.filter(release=r, platform='ios').order_by('-updated_at').first()
+
+          print('STATE|' + '|'.join([
+              str(r.version_name), str(r.build_number),
+              android.status if android else 'missing',
+              ios.status if ios else 'missing',
+              g.status if g else 'missing', clean(g.error if g else ''),
+              u.status if u else 'missing', clean(u.error if u else ''),
+              a.status if a else 'missing', clean(a.error if a else ''),
+              gs.state if gs else '',
+              aps.state if aps else '',
+              str(aps.external_id if aps else ''),
+          ]))
+          PY
+            )"
+            STATE="$(printf '%s\n' "$OUT" | grep '^STATE|' | tail -n 1 | tr -d '\r')"
+            test -n "$STATE"
+            printf '%s\n' "$STATE" | tee /tmp/store-state.txt
+
+            IFS='|' read -r _ VERSION BUILD ANDROID IOS GOOGLE GOOGLE_ERR UPLOAD UPLOAD_ERR APPLE APPLE_ERR GSTORE ASTORE AID <<< "$STATE"
+
+            if [ "$GOOGLE" = failed ]; then echo "Google submission failed: $GOOGLE_ERR" >&2; exit 1; fi
+            if [ "$UPLOAD" = failed ]; then echo "Apple upload failed: $UPLOAD_ERR" >&2; exit 1; fi
+            if [ "$APPLE" = failed ]; then echo "Apple submission failed: $APPLE_ERR" >&2; exit 1; fi
+
+            if [ "$GOOGLE" = succeeded ] && [ "$APPLE" = succeeded ]; then
+              echo "Both stores accepted the submission jobs."
+              exit 0
+            fi
+
+            # Wake a fresh macOS agent whenever the IPA exists but delivery is not finished.
+            if [ "$IOS" = succeeded ] && [ "$UPLOAD" != succeeded ]; then
+              curl -fsS -X POST \
+                -H "Authorization: Bearer ${{ github.token }}" \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/cloud-macos.yml/dispatches" \
+                -d '{"ref":"main"}' >/dev/null || true
+            fi
+
+            sleep 20
+          done
+
+          echo 'Timed out before both store submissions finished.' >&2
+          exit 1
+
+      - name: Publish final status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const state = fs.existsSync('/tmp/store-state.txt') ? fs.readFileSync('/tmp/store-state.txt','utf8').trim() : 'No state captured';
+            const ok = '${{ steps.finish.outcome }}' === 'success';
+            const body = [
+              ok ? '✅ A+ Solution Build 22 store finalizer completed.' : '⚠️ A+ Solution Build 22 store finalizer needs attention.',
+              '',
+              `Source commit: ${process.env.SOURCE_COMMIT}`,
+              `State: \`${state}\``,
+              '',
+              `Workflow: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ].join('\n');
+            try {
+              await github.rest.issues.update({owner: context.repo.owner, repo: context.repo.repo, issue_number: 74, body, state: ok ? 'closed' : 'open'});
+            } catch (e) {
+              core.warning(`Could not update status issue: ${e.message}`);
+            }

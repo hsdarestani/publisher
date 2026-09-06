@@ -1,0 +1,488 @@
+name: A+ Studio iOS Build 11 Final Resubmit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-studio-build11-final-resubmit.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-studio-build11-final-resubmit
+  cancel-in-progress: false
+
+env:
+  ASTUDIO_COMMIT: 7fbdfac8216985897da1854f9912aae88e47ea7d
+  APP_VERSION: '1.0.0'
+  APP_BUILD: '11'
+  APPLE_REVIEW_USER: app-review-b4-31884067732@studio.aplus-solution.de
+
+jobs:
+  release-ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+
+    steps:
+      - name: Install release tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify production companion boundary
+        run: |
+          set -euo pipefail
+          body="$(curl -4 -fsS --retry 20 --retry-delay 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 20 https://studio.aplus-solution.de/api/mobile/config/)"
+          python - "$body" <<'PY'
+          import json, sys
+          data = json.loads(sys.argv[1])
+          caps = data.get('capabilities') or {}
+          assert data.get('mode') == 'customer_project_companion', data
+          for key in ('existing_account_access', 'existing_project_status', 'project_requests'):
+              assert caps.get(key) is True, (key, caps.get(key))
+          for key in (
+              'account_registration', 'project_creation', 'store_status', 'code_execution',
+              'external_app_preview', 'mobile_publishing', 'mobile_purchases'
+          ):
+              assert caps.get(key) is False, (key, caps.get(key))
+          assert caps.get('cloud_app_generation') is not True, caps.get('cloud_app_generation')
+          print('production_mobile_boundary=customer_project_companion')
+          PY
+
+      - name: Queue clean iOS Build 11 and companion-only metadata
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e ASTUDIO_COMMIT='$ASTUDIO_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import Build, Job, MobileApp, Release, Submission
+
+          commit = os.environ['ASTUDIO_COMMIT']
+          app = MobileApp.objects.get(slug='a-studio')
+          if not app.apple_account or not app.apple_account.configured:
+              raise SystemExit('A+ Studio Apple account is not configured.')
+
+          app.requires_login = True
+          app.privacy_policy_url = 'https://studio.aplus-solution.de/mobile/privacy/'
+          app.support_url = 'https://studio.aplus-solution.de/mobile/support/'
+          app.marketing_url = 'https://studio.aplus-solution.de/mobile/'
+          app.review_notes = (
+              'Guideline 2.5.2 remediation for Build 11. The iOS app is now strictly an existing-customer '
+              'project companion. Users sign in with an account provisioned outside the mobile app and can '
+              'view only customer projects already created and assigned outside the mobile app. The mobile '
+              'client provides project status, project information and coordination with the human A+ Solution '
+              'project team. Account registration, project/application creation, app building, code generation '
+              'or execution, external-app preview, build download or installation, publishing, distribution and '
+              'App Store submission controls are not present. These restrictions are also enforced by the mobile '
+              'backend. The previous review-preview/demo flow has been removed completely.'
+          )
+          config = dict(app.build_config or {})
+          config['ios_command'] = 'APP_VERSION=1.0.0 APP_BUILD_NUMBER=11 bash scripts/build-ios.sh'
+          config['ios_artifact'] = 'artifacts/a-studio.ipa'
+          app.build_config = config
+          app.save(update_fields=[
+              'requires_login', 'privacy_policy_url', 'support_url', 'marketing_url',
+              'review_notes', 'build_config', 'updated_at'
+          ])
+
+          de_description = (
+              'A+ Studio ist der mobile Kundenbereich für bestehende A+ Solution Kundenprojekte. '
+              'Melden Sie sich mit einem bereits eingerichteten Kundenkonto an, sehen Sie Projektstatus, '
+              'Projektinformationen und bestehende Abstimmungspunkte und senden Sie Fragen oder Feedback an das Projektteam.\n\n'
+              'Konten und Projekte werden außerhalb der mobilen App durch das A+ Solution Projektteam eingerichtet '
+              'und dem jeweiligen Kundenkonto zugeordnet. Die App enthält keine Käufe oder Abonnements.'
+          )
+          en_description = (
+              'A+ Studio is the mobile customer area for existing A+ Solution customer projects. '
+              'Sign in with an already configured customer account to view project status, project information '
+              'and existing coordination items, and send questions or feedback to the project team.\n\n'
+              'Accounts and projects are set up outside the mobile app by the A+ Solution project team and assigned '
+              'to the relevant customer account. The app contains no purchases or subscriptions.'
+          )
+          for loc in app.localizations.all():
+              if loc.locale.lower().startswith('de'):
+                  loc.subtitle = 'Kundenprojekte mobil'
+                  loc.short_description = 'Projektstatus & Abstimmung'
+                  loc.full_description = de_description
+                  loc.keywords = 'projekt,kundenbereich,status,abstimmung,feedback,team'
+                  loc.promotional_text = 'Bestehende Kundenprojekte mobil im Blick behalten und mit dem Projektteam abstimmen.'
+                  loc.release_notes = 'Aktualisierter Kundenbereich für bestehende Projekte mit klarerem Status und Abstimmung.'
+              else:
+                  loc.subtitle = 'Customer projects'
+                  loc.short_description = 'Project status & coordination'
+                  loc.full_description = en_description
+                  loc.keywords = 'project,customer,status,coordination,feedback,team'
+                  loc.promotional_text = 'Keep existing customer projects in view and coordinate with the project team.'
+                  loc.release_notes = 'Updated customer area for existing projects with clearer status and coordination.'
+              loc.save(update_fields=[
+                  'subtitle', 'short_description', 'full_description', 'keywords',
+                  'promotional_text', 'release_notes', 'updated_at'
+              ])
+
+          release, _ = Release.objects.update_or_create(
+              app=app,
+              version_name='1.0.0',
+              build_number=11,
+              defaults={
+                  'status': 'building',
+                  'source_branch': 'main',
+                  'source_commit': commit,
+                  'android_track': 'production',
+                  'android_rollout': 1,
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'release_notes': 'Existing-customer project companion update for Guideline 2.5.2.',
+              },
+          )
+          Job.objects.filter(
+              release=release,
+              type__in=['build_ios', 'upload_apple', 'submit_apple'],
+              status__in=['queued', 'running'],
+          ).update(status='cancelled', finished_at=timezone.now(), error='Superseded by final Build 11 resubmission.')
+          Submission.objects.filter(release=release, platform='ios').delete()
+
+          build, _ = Build.objects.get_or_create(release=release, platform='ios')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.status = 'queued'
+          build.agent = None
+          build.commit_sha = ''
+          build.artifact = ''
+          build.artifact_size = 0
+          build.artifact_checksum = ''
+          build.logs = ''
+          build.started_at = None
+          build.finished_at = None
+          build.external_build_id = ''
+          build.metadata = {}
+          build.save()
+
+          job = Job.objects.create(
+              type='build_ios', app=app, release=release, build=build,
+              payload={'source': 'a-studio-build11-final-resubmit'},
+              available_to_agents=True, required_platform='macos',
+          )
+          print('source_commit=' + commit)
+          print('release=1.0.0(11) status=building')
+          print('build_job_id=' + str(job.pk))
+          PY
+
+      - name: Wake Cloud Mac for Build 11
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for iOS Build 11
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 90); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=11,platform='ios'); j=Job.objects.filter(build=b,type='build_ios').order_by('-created_at').first(); print(b.status+'|'+((j.error if j else '') or ''))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"
+            ERROR="${DATA#*|}"
+            echo "Build 11 status: $STATUS"
+            if [ "$STATUS" = "succeeded" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then echo "Build failed: $ERROR" >&2; exit 1; fi
+            if [ "$i" -eq 90 ]; then echo 'Timed out waiting for Build 11.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Queue Build 11 App Store upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Build, Job
+          b = Build.objects.get(release__app__slug='a-studio', release__version_name='1.0.0', release__build_number=11, platform='ios')
+          if b.status != 'succeeded':
+              raise SystemExit('Build 11 is not succeeded.')
+          old = Job.objects.filter(build=b, type='upload_apple', status__in=['queued', 'running', 'succeeded']).order_by('-created_at').first()
+          if old:
+              print(f'apple_upload_job={old.pk}:{old.status}')
+          else:
+              job = Job.objects.create(
+                  type='upload_apple', app=b.release.app, release=b.release, build=b,
+                  payload={'source': 'a-studio-build11-final-resubmit'},
+                  available_to_agents=True, required_platform='macos',
+              )
+              print(f'apple_upload_job={job.pk}:queued')
+          PY
+
+      - name: Wake Cloud Mac for App Store upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Wait for App Store processing
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 100); do
+            DATA="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build,Job; b=Build.objects.get(release__app__slug='a-studio',release__version_name='1.0.0',release__build_number=11,platform='ios'); j=Job.objects.filter(build=b,type='upload_apple').order_by('-created_at').first(); print((j.status if j else 'missing')+'|'+(b.external_build_id or '-'))\"" | tail -n1)"
+            STATUS="${DATA%%|*}"
+            EXT="${DATA#*|}"
+            echo "App Store upload: $STATUS / $EXT"
+            if [ "$STATUS" = "succeeded" ] && [ "$EXT" != "-" ]; then break; fi
+            if [ "$STATUS" = "failed" ]; then echo 'App Store upload failed.' >&2; exit 1; fi
+            if [ "$i" -eq 100 ]; then echo 'Timed out waiting for App Store processing.' >&2; exit 1; fi
+            sleep 30
+          done
+
+      - name: Attach Build 11 and resubmit Guideline 2.5.2 remediation
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          EXPECTED_REVIEW_USER: ${{ env.APPLE_REVIEW_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e EXPECTED_REVIEW_USER='$EXPECTED_REVIEW_USER' web python manage.py shell" <<'PY'
+          import json, os, time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Submission
+
+          b = Build.objects.get(release__app__slug='a-studio', release__version_name='1.0.0', release__build_number=11, platform='ios')
+          if b.status != 'succeeded' or not b.external_build_id:
+              raise SystemExit(f'Build 11 not ready: {b.status} / {b.external_build_id!r}')
+          release = b.release
+          app = release.app
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = next((v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0'), None)
+          if not version:
+              version = client.ensure_version(record['id'], '1.0.0')
+          version_id = str(version['id'])
+
+          review_detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          review_attrs = review_detail.get('attributes') or {}
+          expected_user = os.environ['EXPECTED_REVIEW_USER']
+          if review_attrs.get('demoAccountName') != expected_user:
+              raise SystemExit('Existing Apple reviewer username changed unexpectedly; refusing to overwrite review access.')
+          if not review_detail.get('id'):
+              raise SystemExit('Existing Apple App Review detail is missing.')
+          review_patch = {
+              'data': {
+                  'type': 'appStoreReviewDetails',
+                  'id': review_detail['id'],
+                  'attributes': {
+                      'demoAccountRequired': True,
+                      'notes': app.review_notes,
+                  },
+              }
+          }
+          client.request('PATCH', f"/appStoreReviewDetails/{review_detail['id']}", data=json.dumps(review_patch))
+
+          remote = client.request(
+              'GET', f'/builds/{b.external_build_id}?fields[builds]=version,processingState,usesNonExemptEncryption'
+          ).get('data') or {}
+          attrs = remote.get('attributes', {})
+          if attrs.get('processingState') != 'VALID':
+              raise SystemExit(f"Apple Build 11 is not VALID: {attrs.get('processingState')}")
+          if str(attrs.get('version')) != '11':
+              raise SystemExit(f"Apple returned wrong build number: {attrs.get('version')}")
+          if attrs.get('usesNonExemptEncryption') is None:
+              client.set_build_uses_non_exempt_encryption(b.external_build_id, False)
+
+          for submission in client.list_review_submissions(record['id'], 'UNRESOLVED_ISSUES'):
+              items = client.list_review_submission_items(submission['id'])
+              for item in items:
+                  rel = item.get('relationships', {}).get('appStoreVersion', {}).get('data') or {}
+                  if str(rel.get('id')) != version_id:
+                      continue
+                  if item.get('attributes', {}).get('state') == 'REJECTED':
+                      body = {
+                          'data': {
+                              'type': 'reviewSubmissionItems',
+                              'id': item['id'],
+                              'attributes': {'resolved': True},
+                          }
+                      }
+                      client.request('PATCH', f"/reviewSubmissionItems/{item['id']}", data=json.dumps(body))
+              time.sleep(2)
+
+          for state in ('IN_REVIEW', 'WAITING_FOR_REVIEW'):
+              for submission in client.list_review_submissions(record['id'], state):
+                  item, _ = client._review_submission_matches(submission, version_id)
+                  if item:
+                      client.cancel_review_submission(submission['id'])
+          time.sleep(2)
+
+          client.attach_build(version_id, b.external_build_id)
+          for loc in app.localizations.all():
+              client.set_localization(version_id, loc)
+
+          app_infos = client.request('GET', f"/apps/{record['id']}/appInfos?limit=10").get('data') or []
+          if not app_infos:
+              raise SystemExit('No AppInfo record found for A+ Studio.')
+          app_info = app_infos[0]
+          for loc in app.localizations.all():
+              rows = client.request(
+                  'GET', f"/appInfos/{app_info['id']}/appInfoLocalizations?filter[locale]={loc.locale}&limit=1"
+              ).get('data') or []
+              if not rows:
+                  continue
+              row = rows[0]
+              attributes = {'privacyPolicyUrl': app.privacy_policy_url}
+              if loc.subtitle:
+                  attributes['subtitle'] = loc.subtitle
+              body = {'data': {'type': 'appInfoLocalizations', 'id': row['id'], 'attributes': attributes}}
+              client.request('PATCH', f"/appInfoLocalizations/{row['id']}", data=json.dumps(body))
+
+          target = None
+          target_state = None
+          for state in ('READY_FOR_REVIEW', 'UNRESOLVED_ISSUES', 'WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for submission in client.list_review_submissions(record['id'], state):
+                  item, _ = client._review_submission_matches(submission, version_id)
+                  if item:
+                      target, target_state = submission, state
+                      break
+              if target:
+                  break
+
+          if target_state in {'READY_FOR_REVIEW', 'UNRESOLVED_ISSUES'}:
+              body = {'data': {'type': 'reviewSubmissions', 'id': target['id'], 'attributes': {'submitted': True}}}
+              submission = client.request('PATCH', f"/reviewSubmissions/{target['id']}", data=json.dumps(body))['data']
+          elif target_state in {'WAITING_FOR_REVIEW', 'IN_REVIEW'}:
+              submission = target
+          else:
+              submission = client.submit_version(record['id'], version_id)['submission']
+
+          final = None
+          for _attempt in range(45):
+              for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+                  for candidate in client.list_review_submissions(record['id'], state):
+                      item, _ = client._review_submission_matches(candidate, version_id)
+                      if item:
+                          final = (state, candidate, item)
+                          break
+                  if final:
+                      break
+              if final:
+                  break
+              time.sleep(2)
+          if not final:
+              raise SystemExit('Apple did not expose Build 11 as WAITING_FOR_REVIEW or IN_REVIEW.')
+
+          attached = client.request('GET', f'/appStoreVersions/{version_id}/build').get('data') or {}
+          if str(attached.get('id')) != str(b.external_build_id):
+              raise SystemExit('Wrong Apple build attached after submission.')
+
+          detail = client.request('GET', f'/appStoreVersions/{version_id}/appStoreReviewDetail').get('data') or {}
+          detail_attrs = detail.get('attributes') or {}
+          if detail_attrs.get('demoAccountRequired') is not True:
+              raise SystemExit('App Review access is not marked as required.')
+          if detail_attrs.get('demoAccountName') != expected_user:
+              raise SystemExit('Existing Apple reviewer username was not preserved.')
+          notes = detail_attrs.get('notes') or ''
+          if 'Guideline 2.5.2 remediation for Build 11' not in notes:
+              raise SystemExit('Build 11 App Review remediation notes were not saved.')
+
+          state, submission, item = final
+          Submission.objects.update_or_create(
+              app=app, release=release, platform='ios',
+              defaults={
+                  'state': 'in_review',
+                  'external_id': submission['id'],
+                  'submitted_at': timezone.now(),
+                  'last_error': '',
+                  'raw': {
+                      'submission': submission,
+                      'item': item,
+                      'build_number': 11,
+                      'guideline_2_5_2_remediation': True,
+                      'companion_only': True,
+                      'review_access_preserved': True,
+                      'usesNonExemptEncryption': False,
+                  },
+              },
+          )
+          for old in Submission.objects.filter(app=app, platform='ios', release__build_number__lt=11, state='in_review'):
+              old.state = 'replaced_by_build_11'
+              old.save(update_fields=['state', 'updated_at'])
+          for old_release in release.__class__.objects.filter(app=app, version_name='1.0.0', build_number__lt=11, status='in_review'):
+              old_release.status = 'uploaded'
+              old_release.save(update_fields=['status', 'updated_at'])
+          release.status = 'in_review'
+          release.save(update_fields=['status', 'updated_at'])
+
+          print('APPLE_REVIEW|build=11|state=' + state + '|submission=' + str(submission['id']))
+          print('APPLE_ATTACHED_BUILD=' + str(attached.get('id')))
+          print('APPLE_REVIEW_USER_PRESERVED=true')
+          print('APPLE_REVIEW_NOTES=guideline_2_5_2_build_11')
+          PY
+
+      - name: Verify final App Review state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, MobileApp, Release
+
+          app = MobileApp.objects.get(slug='a-studio')
+          release = Release.objects.get(app=app, version_name='1.0.0', build_number=11)
+          build = Build.objects.get(release=release, platform='ios')
+          client = AppleStoreClient(app.apple_account)
+          record = client.find_app(app.bundle_id)
+          version = next(v for v in client.list_versions(record['id']) if v.get('attributes', {}).get('versionString') == '1.0.0')
+          attached = client.request('GET', f"/appStoreVersions/{version['id']}/build").get('data') or {}
+          states = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for sub in client.list_review_submissions(record['id'], state):
+                  item, _ = client._review_submission_matches(sub, version['id'])
+                  if item:
+                      states.append({'state': state, 'submission': sub['id'], 'item_state': item.get('attributes', {}).get('state')})
+          if str(attached.get('id')) != str(build.external_build_id):
+              raise SystemExit('Build 11 is not the attached App Store build.')
+          if not states:
+              raise SystemExit('Build 11 is not active in App Review.')
+          if release.status != 'in_review':
+              raise SystemExit('Publisher release is not in_review.')
+          print(json.dumps({
+              'build': 11,
+              'external_build_id': build.external_build_id,
+              'release_status': release.status,
+              'review': states,
+          }, sort_keys=True))
+          PY

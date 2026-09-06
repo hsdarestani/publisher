@@ -1,4 +1,4 @@
-name: A+ Solution 1.0.10 Build 23 Store Finalize
+name: A+ Solution 1.0.10 Build 24 Store Finalize
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ permissions:
   issues: write
 
 env:
-  SOURCE_COMMIT: '9bd756581438b97377b9e80a927c34e9272e8cf0'
+  SOURCE_COMMIT: '0745ccfe0354769ae01734446196d62dbc556899'
   VERSION_NAME: '1.0.10'
-  BUILD_NUMBER: '23'
+  BUILD_NUMBER: '24'
 
 jobs:
   finalize:
@@ -26,7 +26,7 @@ jobs:
       - name: Install SSH tooling
         run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass jq >/dev/null
 
-      - name: Prepare 1.0.10 build 23 release
+      - name: Prepare 1.0.10 build 24 release
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -57,7 +57,13 @@ jobs:
           env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
           cfg['env'] = env
           app.build_config = cfg
-          app.save(update_fields=['build_config', 'updated_at'])
+          app.review_notes = (
+              'A+ Solution is the internal workforce application used by A+ Solution GmbH. '
+              'This build improves the mobile administration navigation with a compact section selector '
+              'and includes WIW synchronization stability fixes. The supplied App Review account remains '
+              'the dedicated active employee test account. There are no in-app purchases.'
+          )
+          app.save(update_fields=['build_config', 'review_notes', 'updated_at'])
 
           release, _ = Release.objects.get_or_create(
               app=app,
@@ -71,7 +77,7 @@ jobs:
                   'android_rollout': 1,
                   'ios_release_type': 'automatic',
                   'auto_submit': True,
-                  'release_notes': 'Customer color corrections and schedule display fixes.',
+                  'release_notes': 'Mobile administration navigation improved and WIW synchronization stability fixes.',
               },
           )
           release.status = 'building'
@@ -81,7 +87,7 @@ jobs:
           release.android_rollout = 1
           release.ios_release_type = 'automatic'
           release.auto_submit = True
-          release.release_notes = 'Customer color corrections and schedule display fixes.'
+          release.release_notes = 'Mobile administration navigation improved and WIW synchronization stability fixes.'
           release.save(update_fields=[
               'status','source_branch','source_commit','android_track','android_rollout',
               'ios_release_type','auto_submit','release_notes','updated_at'
@@ -124,7 +130,7 @@ jobs:
               });
             }
 
-      - name: Move build 23 through both stores
+      - name: Move build 24 through both stores
         id: finish
         env:
           HOST: ${{ secrets.HOST }}
@@ -258,7 +264,7 @@ jobs:
             const state = fs.existsSync('/tmp/store-state.txt') ? fs.readFileSync('/tmp/store-state.txt','utf8').trim() : 'No state captured';
             const ok = '${{ steps.finish.outcome }}' === 'success';
             const body = [
-              ok ? '✅ A+ Solution 1.0.10 (23) is submitted to both stores and waiting on store review.' : '⚠️ A+ Solution 1.0.10 (23) store finalizer needs attention.',
+              ok ? '✅ A+ Solution 1.0.10 (24) is submitted to both stores and waiting on store review.' : '⚠️ A+ Solution 1.0.10 (24) store finalizer needs attention.',
               '',
               `Source commit: ${process.env.SOURCE_COMMIT}`,
               `State: \`${state}\``,

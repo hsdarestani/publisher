@@ -12,6 +12,7 @@ on:
     paths:
       - '.github/workflows/cloud-macos.yml'
 
+# Queue nudge marker: A+ Esthetic 1.0.17 (21) signing recovery.
 permissions:
   contents: read
   id-token: write
@@ -92,10 +93,12 @@ jobs:
       - name: Report cloud Mac status
         if: always()
         uses: actions/github-script@v7
+        env:
+          AGENT_OUTCOME: ${{ steps.cloud.outcome }}
         with:
           script: |
             const fs = require('fs');
-            const ok = '${{ steps.cloud.outcome }}' === 'success';
+            const ok = process.env.AGENT_OUTCOME === 'success';
             const log = fs.existsSync('/tmp/cloud-mac.log')
               ? fs.readFileSync('/tmp/cloud-mac.log', 'utf8').slice(-12000)
               : 'No cloud Mac agent log was produced.';
@@ -112,8 +115,5 @@ jobs:
             });
 
       - name: Enforce cloud Mac result
-        if: steps.cloud.outcome == 'failure'
+        if: steps.cloud.outcome != 'success'
         run: exit 1
-
-# Manual wake 2026-08-22 for A+ Solution iOS upload.
-# Wake opaque AppIcon rebuild job 499.

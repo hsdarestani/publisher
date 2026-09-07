@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 4f58d67385c974acd17ec03f2759e4050f39794a
+      SOURCE_COMMIT: d0a5370ba7144baecae6caae0f7f8156f1b9e711
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,9 +48,10 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'A+ Esthetic erhält ein neues persönliches Dashboard mit Terminen, Aktionen, Special Offers und direktem Kontakt. '
-                  'Das bisherige Guthaben wurde in der App durch A+ Punkte ersetzt. '
-                  'Zusätzlich wurden Patientenakte, Kamera- und QR-Funktionen, iOS-Abstände und das Logout-Verhalten verbessert.'
+                  'A+ Esthetic erhält ein neues Premium-Dashboard mit letztem und nächstem Termin, direkter Buchung, Kontakt und Special Offers. '
+                  'A+ Punkte ersetzen die bisherige Guthaben-Sprache; Empfehlungen und verifizierte Google-Bewertungen können automatisch Punkte auslösen. '
+                  'Die Verwaltung wurde um Patienten-Suche, vollständige Patientenakten, Punkte, WhatsApp-Vorlagen und Kampagnen erweitert. '
+                  'Zusätzlich wurden iPhone-Kamera/QR, Fotoaufnahme, Safe-Area-Abstände und das Logout-Verhalten verbessert.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',
@@ -131,6 +132,7 @@ jobs:
 
           hard=[]
           deferred_apple=False
+          deferred_google=False
           for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
               job=latest_job(kind)
               if not job or job.status!='failed':
@@ -139,16 +141,19 @@ jobs:
               if kind=='submit_apple' and ('cannot create a new version of the App in the current state' in error or 'ENTITY_ERROR.RELATIONSHIP.INVALID' in error):
                   deferred_apple=True
                   continue
+              if kind=='upload_google' and ('CHANGES_ALREADY_IN_REVIEW' in error or 'already have changes in review' in error):
+                  deferred_google=True
+                  continue
               hard.append((kind,error))
 
-          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} hard_failed={len(hard)} deferred_apple={deferred_apple}')
+          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} hard_failed={len(hard)} deferred_apple={deferred_apple} deferred_google={deferred_google}')
           for kind,error in hard:
               print(f'HARD_FAILED_JOB {kind}: {error[:1200]}')
 
           if gs=='in_review' and aps=='in_review':
               print('DONE')
-          elif gs=='in_review' and ios.status=='succeeded' and deferred_apple:
-              print('APPLE_DEFERRED_TO_RECOVERY')
+          elif android.status=='succeeded' and ios.status=='succeeded' and (deferred_apple or deferred_google):
+              print('STORE_REVIEW_DEFERRED')
           PY
             )
             ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
@@ -156,7 +161,7 @@ jobs:
               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
             echo "$STATE"
             if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
-            if printf '%s' "$STATE" | grep -q '^APPLE_DEFERRED_TO_RECOVERY$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^STORE_REVIEW_DEFERRED$'; then exit 0; fi
             if printf '%s' "$STATE" | grep -q '^HARD_FAILED_JOB '; then exit 1; fi
             sleep 30
           done

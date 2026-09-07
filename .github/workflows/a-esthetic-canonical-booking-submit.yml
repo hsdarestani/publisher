@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: a-esthetic-store-submit
+  group: a-esthetic-store-submit-v2
   cancel-in-progress: true
 
 jobs:

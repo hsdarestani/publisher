@@ -10,8 +10,6 @@ on:
 permissions:
   contents: read
 
-environment: production
-
 jobs:
   finalize:
     runs-on: ubuntu-latest

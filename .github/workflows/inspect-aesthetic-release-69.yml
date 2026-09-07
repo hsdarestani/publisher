@@ -1,0 +1,39 @@
+name: Inspect A+ Esthetic release 69
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/inspect-aesthetic-release-69.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect release 69 on Publisher production
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from apps.publisher.models import Release, Submission
+            r = Release.objects.get(pk=69)
+            print(f'RELEASE id={r.pk} version={r.version_name} build={r.build_number} status={r.status} source={r.source_commit}')
+            for b in r.builds.order_by('platform'):
+                print(f'BUILD platform={b.platform} status={b.status} external={b.external_build_id or ""}')
+            for s in Submission.objects.filter(release=r).order_by('platform'):
+                print(f'SUBMISSION platform={s.platform} state={s.state}')
+            for j in r.jobs.order_by('pk'):
+                error = (j.error or '').replace('\n',' ')[:700]
+                print(f'JOB id={j.pk} type={j.type} status={j.status} error={error}')
+            PY

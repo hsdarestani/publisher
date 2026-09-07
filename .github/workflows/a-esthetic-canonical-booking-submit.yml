@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 0a20fe65a6b3c79db867350bb0d6651e7bf6e15d
+      SOURCE_COMMIT: 8793dfc41d0927bdaf6972d0697183dc0f4d4c43
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,9 +48,9 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'A+ Esthetic wurde weiter optimiert. Der persönliche Wallet-QR-Code ist jetzt deutlich größer und leichter zu scannen. '
-                  'Apple Wallet wird plattformgerecht nur auf dem iPhone angeboten und dort nativ über PassKit geöffnet. '
-                  'Zusätzlich wurden Patientenakte, Safe-Area-Abstände und Logout-Verhalten weiter verbessert.'
+                  'A+ Esthetic erhält ein neues persönliches Dashboard mit Terminen, Aktionen, Special Offers und direktem Kontakt. '
+                  'Das bisherige Guthaben wurde in der App durch A+ Punkte ersetzt. '
+                  'Zusätzlich wurden Patientenakte, Kamera- und QR-Funktionen, iOS-Abstände und das Logout-Verhalten verbessert.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

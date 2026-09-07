@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: bfbf17e3d14045344220e8d72c376f3329a553ec
+      SOURCE_COMMIT: 52def7bd670cef0ca75469e5524d59aca6bb3ed0
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,11 +48,10 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'A+ Esthetic wurde auf die fünf zentralen Patientenfunktionen fokussiert. '
-                  'Die Terminbuchung verwendet jetzt direkt das zentrale A+ Book-System mit derselben Datenbasis '
-                  'und dem vollständigen Behandlungs-, Behandler- und Terminablauf. Neu gestaltet wurden außerdem '
-                  'Patientenakte, Google-Bewertungen, Empfehlungen und die digitale A+ Wallet mit persönlicher QR-Karte. '
-                  'Die Anmeldung verwendet das aktuelle A+ Esthetic Branding.'
+                  'A+ Esthetic wurde visuell und funktional umfassend modernisiert. '
+                  'Die Patientenoberfläche bietet jetzt ein deutlich hochwertigeres mobiles Erlebnis mit neuer Navigation, '
+                  'verbesserter Terminbuchung, modernisierten Bewertungen und Empfehlungen, einer veredelten digitalen A+ Wallet '
+                  'sowie einer vollständig überarbeiteten Patientenakte. Zusätzlich wurden mobile Abstände, Safe Areas und Logout-Verhalten optimiert.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: a5f29a3fdd4a9bbed63b81f6794f760adbc8eb7c
+      SOURCE_COMMIT: 4f58d67385c974acd17ec03f2759e4050f39794a
     steps:
       - name: Prepare Publisher release and queue native builds
         env:

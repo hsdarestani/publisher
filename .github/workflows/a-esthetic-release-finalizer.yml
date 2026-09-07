@@ -1,0 +1,78 @@
+name: A+ Esthetic release finalizer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-release-finalizer.yml'
+
+permissions:
+  contents: read
+
+environment: production
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      SOURCE_COMMIT: 4f58d67385c974acd17ec03f2759e4050f39794a
+    steps:
+      - name: Inspect and repair A+ Esthetic release queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('release_missing')
+
+          print(f'RELEASE id={release.pk} version={release.version_name} build={release.build_number} status={release.status} auto_submit={release.auto_submit}')
+          for build in release.builds.order_by('platform'):
+              print(f'BUILD platform={build.platform} status={build.status} external_build_id={build.external_build_id!r} artifact={bool(build.artifact)} commit={build.commit_sha}')
+          for job in release.jobs.order_by('pk'):
+              print(f'JOB id={job.pk} type={job.type} status={job.status} error={(job.error or "")[:500]!r}')
+          for sub in Submission.objects.filter(release=release).order_by('platform'):
+              print(f'SUBMISSION platform={sub.platform} state={sub.state} external_id={getattr(sub,"external_id",None)!r}')
+
+          android=release.builds.get(platform='android')
+          ios=release.builds.get(platform='ios')
+
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def live(kind):
+              job=latest(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
+
+          google=Submission.objects.filter(release=release,platform='android').first()
+          apple=Submission.objects.filter(release=release,platform='ios').first()
+
+          if android.status=='succeeded' and not google and not live('upload_google'):
+              job=enqueue_job('upload_google',app=app,release=release,build=android)
+              print(f'ENQUEUED upload_google id={job.pk}')
+          if ios.status=='succeeded' and not apple and not live('upload_apple'):
+              job=enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
+              print(f'ENQUEUED upload_apple id={job.pk}')
+          if ios.status=='succeeded' and ios.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists() and not apple and not live('submit_apple'):
+              job=enqueue_job('submit_apple',app=app,release=release,build=ios)
+              print(f'ENQUEUED submit_apple id={job.pk}')
+
+          print('FINALIZER_OK')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"

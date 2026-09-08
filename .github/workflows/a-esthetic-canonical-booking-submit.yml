@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: d0a5370ba7144baecae6caae0f7f8156f1b9e711
+      SOURCE_COMMIT: c10967863b8987fa5489253c215f222fc7e2fafe
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,10 +48,9 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'A+ Esthetic erhält ein neues Premium-Dashboard mit letztem und nächstem Termin, direkter Buchung, Kontakt und Special Offers. '
-                  'A+ Punkte ersetzen die bisherige Guthaben-Sprache; Empfehlungen und verifizierte Google-Bewertungen können automatisch Punkte auslösen. '
-                  'Die Verwaltung wurde um Patienten-Suche, vollständige Patientenakten, Punkte, WhatsApp-Vorlagen und Kampagnen erweitert. '
-                  'Zusätzlich wurden iPhone-Kamera/QR, Fotoaufnahme, Safe-Area-Abstände und das Logout-Verhalten verbessert.'
+                  'Das Patient-Dashboard wurde weiter verfeinert: Google-Bewertungen öffnen jetzt direkt Google statt einer internen Bewertungsseite. '
+                  'Dashboard- und Punkte-Navigation zeigen vollständige Icons, Kontakt- und Instagram-Aktionen sind als hochwertige Buttons ausgeführt. '
+                  'Zusätzlich wurde die Special-Offer-Darstellung verbessert und eine sichtbare Testkampagne für die Dashboard-Vorschau hinzugefügt.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

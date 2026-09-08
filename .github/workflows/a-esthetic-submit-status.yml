@@ -37,8 +37,8 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          # Focused five-feature A+ patient app: canonical Book booking + SAMS-style Wallet.
-          SOURCE='bfbf17e3d14045344220e8d72c376f3329a553ec'
+          # Latest A+ patient app dashboard polish release.
+          SOURCE='c10967863b8987fa5489253c215f222fc7e2fafe'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')
@@ -140,7 +140,14 @@ jobs:
               print('APPLE_TARGET_READY',target['id'],target_name)
 
           target_id=target['id']
-          client.set_build_uses_non_exempt_encryption(ios.external_build_id,False)
+          try:
+              client.set_build_uses_non_exempt_encryption(ios.external_build_id,False)
+              print('APPLE_ENCRYPTION_SET')
+          except Exception as exc:
+              text=str(exc)
+              if 'You cannot update when the value is already set.' not in text:
+                  raise
+              print('APPLE_ENCRYPTION_ALREADY_SET')
           client.attach_build(target_id,ios.external_build_id)
           print('APPLE_BUILD_ATTACHED',ios.external_build_id)
 

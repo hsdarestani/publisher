@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 30
     environment: production
     steps:
-      - name: Withdraw superseded review and submit 1.0.9 Build 13
+      - name: Withdraw superseded review and submit 1.0.18 Build 22
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -35,7 +35,7 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          SOURCE='d7efb450b3493cf153aa680cd2a0e923345744e9'
+          SOURCE='d0a5370ba7144baecae6caae0f7f8156f1b9e711'
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           app=MobileApp.objects.get(slug='a-esthetic')
           release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()
@@ -74,8 +74,6 @@ jobs:
                       print('FINAL already_latest_in_review version='+target_name+' build='+str(release.build_number))
                       raise SystemExit(0)
 
-          # The currently reviewed 1.0.6 is superseded by this bug-fix release.
-          # Withdraw it so the latest safe-area + Book Admin v2 build can take its slot.
           old_active=[]
           for v in current_versions:
               if target and v['id']==target['id']:
@@ -143,7 +141,6 @@ jobs:
               item=client.request('POST','/reviewSubmissionItems',data=json.dumps(body))['data']
               print('APPLE_TARGET_ATTACHED',ready['id'],item['id'])
 
-          # Use Publisher's normal submit path. Retry once if an older queued submit lost the race.
           for submit_attempt in range(2):
               job=release.jobs.filter(type='submit_apple',status__in=['queued','running']).order_by('-pk').first()
               if not job:

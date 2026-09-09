@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update -qq >/dev/null
           sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Reconcile Publisher reviewer credential with production demo account
+      - name: Wait for Publisher hotfix and verify reviewer credential
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -39,52 +39,28 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           export SSHPASS="$PASS"
-          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" 'bash -se' <<'REMOTE'
-          set -euo pipefail
-          REVIEW_JSON="$(
-            cd /opt/aplus-publisher
-            docker compose exec -T web python - <<'PY'
-          import json
-          import os
-          import django
-          os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
-          django.setup()
-          from apps.publisher.models import MobileApp
-          app = MobileApp.objects.get(slug="a-bau")
-          password = app.get_review_password()
-          assert app.review_username == "demo", f"Unexpected review username: {app.review_username!r}"
-          assert password, "Publisher review password is missing"
-          print(json.dumps({"username": app.review_username, "password": password}))
-          PY
-          )"
-          REVIEW_USER="$(REVIEW_JSON="$REVIEW_JSON" python3 - <<'PY'
-          import json, os
-          print(json.loads(os.environ["REVIEW_JSON"])["username"])
-          PY
-          )"
-          REVIEW_PASS="$(REVIEW_JSON="$REVIEW_JSON" python3 - <<'PY'
-          import json, os
-          print(json.loads(os.environ["REVIEW_JSON"])["password"])
-          PY
-          )"
-          unset REVIEW_JSON
-          export REVIEW_USER REVIEW_PASS
-          cd /opt/kayi
-          docker compose exec -T -e REVIEW_USER -e REVIEW_PASS web python manage.py shell <<'PY'
-          import os
-          from django.contrib.auth import authenticate, get_user_model
-          username = os.environ["REVIEW_USER"]
-          password = os.environ["REVIEW_PASS"]
-          User = get_user_model()
-          user, _ = User.objects.get_or_create(username=username)
-          user.is_active = True
-          user.set_password(password)
-          user.save()
-          assert authenticate(username=username, password=password) is not None
-          print("A+Bau reviewer login demo is synchronized and verified.")
-          PY
-          unset REVIEW_USER REVIEW_PASS
-          REMOTE
+          for i in $(seq 1 90); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web sh -lc \"grep -Fq 'Aufträge, Termine, Zeiterfassung, Baustellendoku, Aufmaß und Finanzen.' /app/apps/signing/management/commands/bootstrap_a_bau.py\""; then
+              break
+            fi
+            if [ "$i" = "90" ]; then
+              echo "Publisher metadata hotfix did not reach production." >&2
+              exit 2
+            fi
+            sleep 5
+          done
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python - <<'PY'
+import os, django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+django.setup()
+from apps.publisher.models import MobileApp
+app = MobileApp.objects.get(slug='a-bau')
+assert app.review_username == 'demo', app.review_username
+assert app.get_review_password(), 'Publisher review password missing'
+print('A+Bau Publisher reviewer credential is ready for Store review.')
+PY"
 
       - name: Queue current A+Bau source for both stores
         env:

@@ -1,0 +1,27 @@
+name: Kick A+Bau 2.2.3 build 22010
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22010-kick.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch canonical A+Bau release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run a-bau-release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            -f app_version=2.2.3 \
+            -f build_number=22010
+          echo "Dispatched A+Bau 2.2.3 build 22010 through canonical Publisher release."

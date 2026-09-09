@@ -1,0 +1,126 @@
+name: Recover A+Bau 2.2.3 build 22009 Google submission
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22009-google-recover.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  recover-google:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Recover stale Google job and enqueue one clean retry
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          JOB_ID="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY' | tail -n 1
+          import os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Job
+          from apps.publisher.job_recovery import recover_stale_internal_jobs
+          from apps.publisher.tasks import enqueue_job
+          app = MobileApp.objects.get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.3', build_number=22009)
+          build = release.builds.get(platform='android', status='succeeded')
+          recovered = recover_stale_internal_jobs(
+              app=app,
+              release=release,
+              job_types={'upload_google','submit_google'},
+              stale_after_minutes=0,
+          )
+          print('recovered=' + ','.join(map(str,recovered)))
+          for job in Job.objects.filter(
+              app=app,
+              release=release,
+              type__in=['upload_google','submit_google'],
+              status='queued',
+          ):
+              job.status='failed'
+              job.error='Superseded by clean A+Bau 22009 Google recovery retry.'
+              job.save(update_fields=['status','error','updated_at'])
+          job = enqueue_job('upload_google', app=app, release=release, build=build)
+          print(job.pk)
+          PY
+          )"
+          test -n "$JOB_ID"
+          echo "google_retry_job_id=$JOB_ID"
+          echo "JOB_ID=$JOB_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for Google retry result
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          SSH=(sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST")
+          for i in $(seq 1 60); do
+            OUT="$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python -" <<PY
+          import os, django, json
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import Job
+          job=Job.objects.get(pk=int("$JOB_ID"))
+          print(json.dumps({'id':job.pk,'status':job.status,'error':job.error or '','result':job.result or {}}))
+          PY
+          )"
+            echo "$OUT"
+            STATUS="$(printf '%s' "$OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+            if [ "$STATUS" = succeeded ]; then
+              break
+            fi
+            if [ "$STATUS" = failed ]; then
+              echo "Google retry failed." >&2
+              exit 3
+            fi
+            sleep 10
+          done
+
+      - name: Verify Publisher submission state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
+          import os, django, json
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-bau')
+          release=Release.objects.get(app=app,version_name='2.2.3',build_number=22009)
+          sub=Submission.objects.filter(app=app,release=release,platform='android').first()
+          print(json.dumps({
+              'release_status': release.status,
+              'android_submission_state': sub.state if sub else 'missing',
+              'android_external_id': sub.external_id if sub else '',
+              'review_username': app.review_username,
+              'review_credentials_ready': bool(app.review_username and app.get_review_password()),
+          }, indent=2))
+          if not sub:
+              raise SystemExit('Android submission record missing')
+          if sub.state not in {'in_review','ready_for_review'}:
+              raise SystemExit('Unexpected Android submission state: ' + sub.state)
+          PY

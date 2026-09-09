@@ -26,4 +26,4 @@ jobs:
             -f build_number=22009
           echo "Dispatched A+Bau 2.2.3 build 22009 through canonical Publisher release."
 
-# retry-google-manual-review-gate
+# retry-google-manual-review-gate-v3

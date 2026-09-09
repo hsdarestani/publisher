@@ -1,0 +1,75 @@
+name: Probe A+Bau 2.2.3 build 22009 live state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22009-live-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Read live Publisher state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
+          import json, os, django
+          from django.utils import timezone
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          django.setup()
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.google_play import GooglePlayClient
+          app = MobileApp.objects.select_related('google_account','apple_account').get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.3', build_number=22009)
+          google_test = GooglePlayClient(app.google_account).test(app.package_name)
+          out = {
+              'checked_at': timezone.now().isoformat(),
+              'release_status': release.status,
+              'review_username': app.review_username,
+              'review_credentials_ready': bool(app.review_username and app.get_review_password()),
+              'google_api_ok': google_test.ok,
+              'google_api_message': google_test.message,
+              'builds': {
+                  b.platform: {
+                      'status': b.status,
+                      'external_build_id': b.external_build_id or '',
+                      'artifact': bool(b.artifact),
+                  } for b in release.builds.all()
+              },
+              'jobs': [
+                  {
+                      'id': j.pk,
+                      'type': j.type,
+                      'status': j.status,
+                      'error': j.error or '',
+                      'created_at': j.created_at.isoformat(),
+                      'finished_at': j.finished_at.isoformat() if j.finished_at else '',
+                  } for j in release.jobs.order_by('created_at')
+              ],
+              'submissions': {
+                  s.platform: {
+                      'state': s.state,
+                      'external_id': s.external_id or '',
+                      'last_error': s.last_error or '',
+                      'submitted_at': s.submitted_at.isoformat() if s.submitted_at else '',
+                  } for s in Submission.objects.filter(app=app, release=release)
+              },
+          }
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY

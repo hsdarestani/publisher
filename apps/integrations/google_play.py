@@ -435,17 +435,31 @@ class GooglePlayClient:
                 "Google Play requires manual review submission for %s; validating with changesNotSentForReview=true.",
                 edit.package_name,
             )
-            return self._edit_request(
+            result = self._edit_request(
                 edit,
                 "POST",
                 path,
                 json_body={},
                 params={"changesNotSentForReview": "true"},
             )
+            edit.diagnostics["changes_not_sent_for_review"] = True
+            return result
 
     def _commit_edit(self, edit: EditSession):
         path = f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:commit"
         params = {"changesInReviewBehavior": "ERROR_IF_IN_REVIEW"}
+        manual_review = bool(edit.diagnostics.get("changes_not_sent_for_review"))
+        if manual_review:
+            committed = self._edit_request(
+                edit,
+                "POST",
+                path,
+                json_body={},
+                params={**params, "changesNotSentForReview": "true"},
+            )
+            if isinstance(committed, dict):
+                committed["_changes_not_sent_for_review"] = True
+            return committed
         try:
             return self._edit_request(
                 edit,
@@ -461,24 +475,37 @@ class GooglePlayClient:
                 "Google Play requires manual review submission for %s; committing with changesNotSentForReview=true.",
                 edit.package_name,
             )
-            return self._edit_request(
+            committed = self._edit_request(
                 edit,
                 "POST",
                 path,
                 json_body={},
                 params={**params, "changesNotSentForReview": "true"},
             )
+            if isinstance(committed, dict):
+                committed["_changes_not_sent_for_review"] = True
+            edit.diagnostics["changes_not_sent_for_review"] = True
+            return committed
 
     def _delete_edit(self, edit: EditSession):
         response = edit.session.delete(
             f"{edit.api_base}/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}",
             timeout=60,
         )
-        if not response.ok:
-            raise self._api_error(
-                "The test edit was created, but Google rejected cleanup.",
-                [self._response_summary(edit.endpoint, response)],
-            )
+        if response.ok:
+            return
+        body = response.text.lower()
+        if response.status_code in {400, 404} and (
+            "edit has been deleted" in body
+            or "edit has expired" in body
+            or "this edit has been deleted" in body
+        ):
+            logger.info("Google Play edit %s was already gone during cleanup.", edit.edit_id)
+            return
+        raise self._api_error(
+            "The test edit was created, but Google rejected cleanup.",
+            [self._response_summary(edit.endpoint, response)],
+        )
 
     def _safe_delete_edit(self, edit: EditSession):
         try:

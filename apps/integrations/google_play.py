@@ -411,22 +411,63 @@ class GooglePlayClient:
             )
         return response.json() if response.content else {}
 
-    def _validate_edit(self, edit: EditSession):
-        return self._edit_request(
-            edit,
-            "POST",
-            f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:validate",
-            json_body={},
+    @staticmethod
+    def _requires_manual_review_send(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "Changes cannot be sent for review automatically" in message
+            or "changesNotSentForReview" in message
         )
 
+    def _validate_edit(self, edit: EditSession):
+        path = f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:validate"
+        try:
+            return self._edit_request(
+                edit,
+                "POST",
+                path,
+                json_body={},
+            )
+        except IntegrationError as exc:
+            if not self._requires_manual_review_send(exc):
+                raise
+            logger.info(
+                "Google Play requires manual review submission for %s; validating with changesNotSentForReview=true.",
+                edit.package_name,
+            )
+            return self._edit_request(
+                edit,
+                "POST",
+                path,
+                json_body={},
+                params={"changesNotSentForReview": "true"},
+            )
+
     def _commit_edit(self, edit: EditSession):
-        return self._edit_request(
-            edit,
-            "POST",
-            f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:commit",
-            json_body={},
-            params={"changesInReviewBehavior": "ERROR_IF_IN_REVIEW"},
-        )
+        path = f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:commit"
+        params = {"changesInReviewBehavior": "ERROR_IF_IN_REVIEW"}
+        try:
+            return self._edit_request(
+                edit,
+                "POST",
+                path,
+                json_body={},
+                params=params,
+            )
+        except IntegrationError as exc:
+            if not self._requires_manual_review_send(exc):
+                raise
+            logger.info(
+                "Google Play requires manual review submission for %s; committing with changesNotSentForReview=true.",
+                edit.package_name,
+            )
+            return self._edit_request(
+                edit,
+                "POST",
+                path,
+                json_body={},
+                params={**params, "changesNotSentForReview": "true"},
+            )
 
     def _delete_edit(self, edit: EditSession):
         response = edit.session.delete(

@@ -1,0 +1,101 @@
+name: Finalize A+Bau 22010 Google review state
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-bau-22010-google-finalize.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  finalize-google:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Wait for idempotent Google submit fix in production
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          for i in $(seq 1 60); do
+            if sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T web grep -q already_submitted /app/apps/publisher/tasks.py"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Google idempotency fix was not deployed." >&2
+          exit 2
+
+      - name: Reconcile duplicate submit job and verify production track
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"; export SSHPASS="$PASS"
+          sshpass -e ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T web python -" <<'PY'
+          import os, django
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from django.utils import timezone
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.tasks import handle_submit_google
+
+          app = MobileApp.objects.select_related('google_account').get(slug='a-bau')
+          release = Release.objects.get(app=app, version_name='2.2.3', build_number=22010)
+          build = release.builds.get(platform='android', status='succeeded')
+          submission = Submission.objects.get(app=app, release=release, platform='android')
+          assert submission.state == 'in_review', submission.state
+
+          job = Job.objects.create(type='submit_google', app=app, release=release, build=build)
+          job.status = 'running'
+          job.started_at = timezone.now()
+          job.save(update_fields=['status', 'started_at', 'updated_at'])
+          result = handle_submit_google(job)
+          assert result.get('already_submitted') is True, result
+          job.status = 'succeeded'
+          job.result = result
+          job.progress = 100
+          job.error = ''
+          job.finished_at = timezone.now()
+          job.save(update_fields=['status', 'result', 'progress', 'error', 'finished_at', 'updated_at'])
+          Job.objects.filter(
+              app=app, release=release, type='submit_google', status='failed'
+          ).exclude(pk=job.pk).update(
+              status='cancelled',
+              error='Superseded: Google release was already committed by upload_google.',
+              updated_at=timezone.now(),
+          )
+
+          client = GooglePlayClient(app.google_account)
+          edit = client._open_edit(app.package_name)
+          try:
+              track = client._edit_request(
+                  edit, 'GET',
+                  f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks/{client._q(release.android_track)}',
+              )
+              match = next(
+                  (item for item in track.get('releases', [])
+                   if str(release.build_number) in {str(v) for v in item.get('versionCodes', [])}),
+                  None,
+              )
+              assert match, track
+              print('GOOGLE_REVIEW_STATE=IN_REVIEW')
+              print('version_code=' + str(release.build_number))
+              print('track=' + release.android_track)
+              print('track_release_status=' + str(match.get('status', '')))
+              print('duplicate_submit_reconciled=true')
+          finally:
+              client._safe_delete_edit(edit)
+          PY

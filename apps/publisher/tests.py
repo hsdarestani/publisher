@@ -8,8 +8,9 @@ from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 
 from .github_actions import wake_cloud_agent
-from .models import MobileApp, AppLocalization, Release, Build, BuildAgent, Job, StoreAccount
+from .models import MobileApp, AppLocalization, Release, Build, BuildAgent, Job, StoreAccount, Submission
 from .readiness import evaluate_release
+from .tasks import handle_submit_google
 
 
 class PublisherTests(TestCase):
@@ -61,6 +62,28 @@ class PublisherTests(TestCase):
         account.save()
         self.assertNotIn("secret", account.credential_blob)
         self.assertEqual(account.get_credentials()["private_key"], "secret")
+
+    @patch("apps.publisher.tasks.handle_upload_google")
+    def test_submit_google_is_idempotent_after_successful_upload(self, upload):
+        submission = Submission.objects.create(
+            app=self.app,
+            release=self.release,
+            platform="android",
+            state="in_review",
+            external_id="1",
+        )
+        job = Job.objects.create(
+            type="submit_google",
+            app=self.app,
+            release=self.release,
+            build=self.release.builds.get(platform="android"),
+        )
+
+        result = handle_submit_google(job)
+
+        self.assertEqual(result["submission_id"], submission.pk)
+        self.assertTrue(result["already_submitted"])
+        upload.assert_not_called()
 
     def test_agent_claim(self):
         agent, token = BuildAgent.create_with_token(name="linux-1", platform="linux")

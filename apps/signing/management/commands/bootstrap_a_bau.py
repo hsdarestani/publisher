@@ -166,7 +166,7 @@ class Command(BaseCommand):
             defaults={
                 "title": "A+Bau",
                 "subtitle": "Baustelle. Büro. Im Griff.",
-                "short_description": "Aufträge, Termine, Zeiterfassung, Baustellendoku, Aufmaß und Finanzen in einer App.",
+                "short_description": "Aufträge, Termine, Zeiterfassung, Baustellendoku, Aufmaß und Finanzen.",
                 "full_description": full,
                 "keywords": "Handwerk,Bau,Auftrag,Zeiterfassung,Aufmaß,Baustelle,Rechnung,Termin,Projekt",
                 "promotional_text": "Von der Baustelle bis zur Rechnung: A+Bau verbindet Einsätze, Freigaben, Aufmaß, Finanzen und Büroarbeit in einem Ablauf.",

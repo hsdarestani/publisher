@@ -432,18 +432,14 @@ class GooglePlayClient:
             if not self._requires_manual_review_send(exc):
                 raise
             logger.info(
-                "Google Play requires manual review submission for %s; validating with changesNotSentForReview=true.",
+                "Google Play requires manual review submission for %s; defer this special validation gate to commit.",
                 edit.package_name,
             )
-            result = self._edit_request(
-                edit,
-                "POST",
-                path,
-                json_body={},
-                params={"changesNotSentForReview": "true"},
-            )
             edit.diagnostics["changes_not_sent_for_review"] = True
-            return result
+            return {
+                "manual_review_required": True,
+                "validation_deferred_to_commit": True,
+            }
 
     def _commit_edit(self, edit: EditSession):
         path = f"/applications/{self._q(edit.package_name)}/edits/{edit.edit_id}:commit"

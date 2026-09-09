@@ -146,8 +146,25 @@ def handle_upload_google(job):
         if "already been used" not in str(exc).lower():
             raise
         result = _publish_existing_google_version(client, release.app, release)
-    Submission.objects.update_or_create(app=release.app, release=release, platform="android", defaults={"state": "in_review", "submitted_at": timezone.now(), "raw": result})
-    release.status = "in_review"; release.readiness_snapshot = check; release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
+    edit_result = result.get("edit", {}) if isinstance(result, dict) else {}
+    manual_review_required = bool(
+        isinstance(edit_result, dict) and edit_result.get("_changes_not_sent_for_review")
+    )
+    android_state = "ready_for_review" if manual_review_required else "in_review"
+    Submission.objects.update_or_create(
+        app=release.app,
+        release=release,
+        platform="android",
+        defaults={
+            "state": android_state,
+            "submitted_at": timezone.now(),
+            "last_error": "",
+            "raw": result,
+        },
+    )
+    release.status = "in_review"
+    release.readiness_snapshot = check
+    release.save(update_fields=["status", "readiness_snapshot", "updated_at"])
     return result
 
 

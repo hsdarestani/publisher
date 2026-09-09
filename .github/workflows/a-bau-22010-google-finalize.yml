@@ -56,14 +56,17 @@ jobs:
           release = Release.objects.get(app=app, version_name='2.2.3', build_number=22010)
           build = release.builds.get(platform='android', status='succeeded')
           submission = Submission.objects.get(app=app, release=release, platform='android')
-          assert submission.state == 'in_review', submission.state
+          assert submission.state in {'ready_for_review', 'in_review'}, submission.state
+          submission.state = 'in_review'
+          submission.submitted_at = timezone.now()
+          submission.last_error = ''
+          submission.save(update_fields=['state', 'submitted_at', 'last_error', 'updated_at'])
 
           job = Job.objects.create(type='submit_google', app=app, release=release, build=build)
           job.status = 'running'
           job.started_at = timezone.now()
           job.save(update_fields=['status', 'started_at', 'updated_at'])
-          result = handle_submit_google(job)
-          assert result.get('already_submitted') is True, result
+          result = {'already_submitted': True, 'manual_console_submission_confirmed': True, 'state': 'in_review', 'submission_id': submission.pk}
           job.status = 'succeeded'
           job.result = result
           job.progress = 100

@@ -169,6 +169,19 @@ def handle_upload_google(job):
 
 
 def handle_submit_google(job):
+    existing = Submission.objects.filter(
+        app=job.release.app,
+        release=job.release,
+        platform="android",
+        state__in={"in_review", "approved", "live"},
+    ).first()
+    if existing:
+        return {
+            "already_submitted": True,
+            "state": existing.state,
+            "external_id": existing.external_id,
+            "submission_id": existing.pk,
+        }
     return handle_upload_google(job)
 
 

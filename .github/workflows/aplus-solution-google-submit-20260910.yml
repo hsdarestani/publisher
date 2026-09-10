@@ -1,0 +1,157 @@
+name: A+ Solution Google Play Submit 2026-09-10
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-google-submit-20260910.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_ID: '76'
+  BUILD_ID: '132'
+  EXPECTED_VERSION: '1.0.12'
+  EXPECTED_BUILD_NUMBER: '27'
+  EXPECTED_SOURCE_COMMIT: '9726a924720901228fadb1103491d01c2753c4bb'
+
+jobs:
+  submit-google:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Verify exact Publisher release and queue Google Play submit
+        id: queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T \
+              -e RELEASE_ID='$RELEASE_ID' \
+              -e BUILD_ID='$BUILD_ID' \
+              -e EXPECTED_VERSION='$EXPECTED_VERSION' \
+              -e EXPECTED_BUILD_NUMBER='$EXPECTED_BUILD_NUMBER' \
+              -e EXPECTED_SOURCE_COMMIT='$EXPECTED_SOURCE_COMMIT' \
+              web python manage.py shell" <<'PY'
+          import json, os
+          from apps.publisher.models import Build, Job, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          r = Release.objects.select_related('app').get(id=os.environ['RELEASE_ID'])
+          b = Build.objects.get(id=os.environ['BUILD_ID'], release=r, platform='android')
+          assert r.app.slug == 'a-plus-solution'
+          assert r.version_name == os.environ['EXPECTED_VERSION']
+          assert r.build_number == int(os.environ['EXPECTED_BUILD_NUMBER'])
+          assert r.source_commit == os.environ['EXPECTED_SOURCE_COMMIT']
+          assert r.android_track == 'production'
+          assert float(r.android_rollout) >= 1
+          assert b.status == 'succeeded' and b.artifact
+          assert r.app.google_account and r.app.google_account.configured
+
+          sub = Submission.objects.filter(app=r.app, release=r, platform='android').first()
+          active = Job.objects.filter(release=r, type='submit_google', status__in=['queued','running']).order_by('-created_at').first()
+          if sub and sub.state in {'in_review','approved','live'}:
+              job = Job.objects.filter(release=r, type='submit_google', status='succeeded').order_by('-created_at').first()
+              mode = 'already_submitted'
+          elif active:
+              job = active
+              mode = 'already_active'
+          else:
+              job = enqueue_job('submit_google', app=r.app, release=r, build=b)
+              mode = 'queued'
+
+          print('SUBMIT_META='+json.dumps({
+              'release_id': r.id,
+              'version': r.version_name,
+              'build_number': r.build_number,
+              'build_id': b.id,
+              'artifact': b.artifact.name,
+              'job_id': job.id if job else None,
+              'mode': mode,
+              'existing_submission_state': sub.state if sub else '',
+          }, separators=(',',':')))
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^SUBMIT_META=//p' | tail -n 1)"
+          test -n "$META"
+          printf '%s\n' "$META" | jq .
+          echo "job_id=$(printf '%s' "$META" | jq -r '.job_id // empty')" >> "$GITHUB_OUTPUT"
+          echo "mode=$(printf '%s' "$META" | jq -r '.mode')" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Google Play submission result
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          JOB_ID: ${{ steps.queue.outputs.job_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 80); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T \
+                -e RELEASE_ID='$RELEASE_ID' \
+                -e JOB_ID='$JOB_ID' \
+                web python manage.py shell" <<'PY' 2>/dev/null || true
+          import json, os, re
+          from apps.publisher.models import Job, Release, Submission
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          job_id = (os.environ.get('JOB_ID') or '').strip()
+          job = Job.objects.filter(id=job_id).first() if job_id else Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first()
+          sub = Submission.objects.filter(release=r,platform='android').first()
+          print('SUBMIT_STATE='+json.dumps({
+              'job_status': job.status if job else '',
+              'job_error': re.sub(r'\s+',' ',str(job.error or ''))[:700] if job else '',
+              'submission_state': sub.state if sub else '',
+              'submission_id': sub.id if sub else None,
+              'release_status': r.status,
+              'external_id': sub.external_id if sub else '',
+          }, separators=(',',':')))
+          PY
+            )"
+            JSON="$(printf '%s\n' "$STATE" | sed -n 's/^SUBMIT_STATE=//p' | tail -n 1)"
+            if [ -z "$JSON" ]; then
+              echo "Publisher temporarily unavailable ($i/80)"
+              sleep 15
+              continue
+            fi
+            printf '%s\n' "$JSON" | jq .
+            JOB_STATUS="$(printf '%s' "$JSON" | jq -r '.job_status')"
+            SUB_STATE="$(printf '%s' "$JSON" | jq -r '.submission_state')"
+            if [ "$JOB_STATUS" = 'failed' ]; then
+              echo "Google Play submit failed: $(printf '%s' "$JSON" | jq -r '.job_error')" >&2
+              exit 1
+            fi
+            if [[ "$SUB_STATE" =~ ^(ready_for_review|in_review|approved|live)$ ]] && { [ "$JOB_STATUS" = 'succeeded' ] || [ -z "$JOB_STATUS" ]; }; then
+              echo "Google Play submission reached state: $SUB_STATE"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for Google Play submission.' >&2
+          exit 1
+
+      - name: Summary
+        run: |
+          echo '### A+ Solution Google Play submission' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Version: **1.0.12**' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Build: **27**' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Track: **production**' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Rollout: **100%**' >> "$GITHUB_STEP_SUMMARY"
+          echo '- iOS: **untouched**' >> "$GITHUB_STEP_SUMMARY"

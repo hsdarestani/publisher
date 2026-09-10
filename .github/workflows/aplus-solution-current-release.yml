@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '1f383b6de87314715a61cb74bd1b84d7e75861c9'
+  APLUS_COMMIT: 'c15c28a2a9de18aad517e7cf588eb4d479685c93'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -42,7 +42,7 @@ jobs:
                 exit 1
               fi
               if [ "$STATE" = 'closed' ] && printf '%s' "$BODY" | grep -Fq 'Overall: **success**'; then
-                curl -fsS --retry 12 --retry-delay 5 https://solution.smarbiz.sbs/health/ >/dev/null
+                curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
                 echo "Exact production commit is live: $APLUS_COMMIT"
                 exit 0
               fi
@@ -70,7 +70,7 @@ jobs:
           REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
           echo "::add-mask::$REVIEW_PASSWORD"
           export REVIEW_PASSWORD
-          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://solution.smarbiz.sbs/api/auth/login/
+          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://app.aplus-solution.de/api/auth/login/
           import json, os
           print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
           PY
@@ -120,7 +120,7 @@ jobs:
           cfg['ios_command']='bash frontend/scripts/build-publisher-ios-opaque.sh'
           cfg['ios_artifact']='frontend/ios/build/export/*.ipa'
           env=dict(cfg.get('env') or {})
-          env['VITE_API_URL']='https://solution.smarbiz.sbs/api'
+          env['VITE_API_URL']='https://app.aplus-solution.de/api'
           cfg['env']=env
           app.build_config=cfg
           app.requires_login=True
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, contracts/documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This update fixes direct shift date selection, PDF exports and native file sharing, explicit all-worker/all-customer filters, '
-              'location-only schedule cards, the copy review transition and readable notification settings. There are no in-app purchases.'
+              'This update improves Service shift positions, keeps shift notes visible with a Finish action, and improves notification delivery reliability. '
+              'There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Korrekturen für Kalender, PDF-Export mit Teilen/Speichern, Filter, Schichtkopien und Benachrichtigungstexte.'
+              loc.release_notes='Verbesserungen für Service-Positionen, sichtbare Schichtnotizen und zuverlässigere Benachrichtigungen.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Kalender und PDF-Export korrigiert; Schichtkopien mit Animation und lesbare Benachrichtigungseinstellungen.'
+          release.release_notes='Verbesserungen für Service-Positionen, sichtbare Schichtnotizen und zuverlässigere Benachrichtigungen.'
           release.save()
 
           queued=[]
@@ -239,7 +239,7 @@ jobs:
         with:
           script: |
             for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
-              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.owner ? context.repo.repo : context.repo.repo, workflow_id, ref: 'main'});
+              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id, ref: 'main'});
             }
 
       - name: Wait for signed Android AAB and iOS IPA

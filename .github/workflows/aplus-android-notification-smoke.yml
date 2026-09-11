@@ -25,7 +25,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass jq unzip >/dev/null
 
-      - name: Queue Android-only signed smoke APK
+      - name: Queue or reuse Android-only signed smoke APK
         id: queue
         env:
           HOST: ${{ secrets.HOST }}
@@ -53,27 +53,53 @@ jobs:
           app.build_config = cfg
           app.save(update_fields=['build_config','updated_at'])
 
-          build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=26) + 1
-          release = Release.objects.create(
-              app=app,
-              version_name='1.0.11',
-              build_number=build_number,
-              status='building',
-              source_branch='main',
-              source_commit=os.environ['APLUS_COMMIT'],
-              android_track='internal',
-              android_rollout=1,
-              auto_submit=False,
-              release_notes='Android notification icon/sound smoke APK.',
-          )
-          build = Build.objects.create(release=release, platform='android', status='queued')
-          job = enqueue_job(
-              'build_android', app=app, release=release, build=build,
-              payload={'source':'notification-smoke'}, agent=True, platform='linux'
-          )
+          marker = 'Android notification icon/sound smoke APK.'
+          release = Release.objects.filter(
+              app=app, source_commit=os.environ['APLUS_COMMIT'], release_notes=marker
+          ).order_by('-created_at').first()
+
+          if release is None:
+              build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=26) + 1
+              release = Release.objects.create(
+                  app=app,
+                  version_name='1.0.11',
+                  build_number=build_number,
+                  status='building',
+                  source_branch='main',
+                  source_commit=os.environ['APLUS_COMMIT'],
+                  android_track='internal',
+                  android_rollout=1,
+                  auto_submit=False,
+                  release_notes=marker,
+              )
+              build = Build.objects.create(release=release, platform='android', status='queued')
+              job = enqueue_job(
+                  'build_android', app=app, release=release, build=build,
+                  payload={'source':'notification-smoke'}, agent=True, platform='linux'
+              )
+          else:
+              build = release.builds.filter(platform='android').order_by('-created_at').first()
+              if build is None:
+                  build = Build.objects.create(release=release, platform='android', status='queued')
+              job = Job.objects.filter(build=build, type='build_android').order_by('-created_at').first()
+              if build.status in {'failed','cancelled'}:
+                  build.status='queued'; build.logs=''; build.finished_at=None; build.external_build_id=''; build.metadata={}
+                  if build.artifact:
+                      build.artifact.delete(save=False)
+                  build.artifact=''; build.artifact_size=0; build.artifact_checksum=''; build.save()
+                  job = enqueue_job(
+                      'build_android', app=app, release=release, build=build,
+                      payload={'source':'notification-smoke-retry'}, agent=True, platform='linux'
+                  )
+              elif build.status == 'queued' and not Job.objects.filter(build=build, type='build_android', status__in=['queued','running']).exists():
+                  job = enqueue_job(
+                      'build_android', app=app, release=release, build=build,
+                      payload={'source':'notification-smoke-resume'}, agent=True, platform='linux'
+                  )
+
           print('SMOKE_META=' + json.dumps({
               'release_id': str(release.id), 'build_id': str(build.id),
-              'job_id': str(job.id), 'build_number': build_number,
+              'job_id': str(job.id) if job else '', 'build_number': release.build_number,
           }, separators=(',',':')))
           PY
           )"
@@ -107,8 +133,16 @@ jobs:
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 240); do
             STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-              "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build,Job; b=Build.objects.get(id=os.environ['BUILD_ID']); j=Job.objects.filter(build=b,type='build_android').order_by('-created_at').first(); print(f'{b.status}|{bool(b.artifact)}|{(j.error if j else \"\")[:500]}')\"" \
-              | tail -n1 | tr -d '\r')"
+              "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell" <<'PY'
+          import os, re
+          from apps.publisher.models import Build, Job
+          b = Build.objects.get(id=os.environ['BUILD_ID'])
+          j = Job.objects.filter(build=b, type='build_android').order_by('-created_at').first()
+          error = re.sub(r'\s+', ' ', str(j.error or ''))[:500] if j else ''
+          print(f'{b.status}|{bool(b.artifact)}|{error}')
+          PY
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
             echo "Android smoke build: $STATE"
             if [[ "$STATE" == failed* ]]; then exit 1; fi
             if [[ "$STATE" == succeeded\|True\|* ]]; then exit 0; fi
@@ -128,8 +162,14 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           REMOTE_PATH="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build; b=Build.objects.get(id=os.environ['BUILD_ID']); print(b.artifact.path)\"" \
-            | tail -n1 | tr -d '\r')"
+            "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Build
+          b = Build.objects.get(id=os.environ['BUILD_ID'])
+          print(b.artifact.path)
+          PY
+          )"
+          REMOTE_PATH="$(printf '%s\n' "$REMOTE_PATH" | tail -n1 | tr -d '\r')"
           test -n "$REMOTE_PATH"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && rm -f /tmp/aplus-notification-smoke.apk && docker compose cp web:'$REMOTE_PATH' /tmp/aplus-notification-smoke.apk && test -s /tmp/aplus-notification-smoke.apk"
@@ -149,7 +189,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BUILD_NUMBER: ${{ steps.queue.outputs.build_number }}
         run: |
-          body=$(printf 'A+ Android notification smoke build finished.\n\n- Source commit: `%s`\n- Android build number: **%s**\n- Signed APK artifact: **%s**\n- Store submission: **not performed**\n- Run: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "${BUILD_NUMBER:-unknown}" "${{ job.status }}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          body=$(printf 'A+ Android notification smoke build finished.\n\n- Source commit: `%s`\n- Android build number: **%s**\n- Workflow result: **%s**\n- Store submission: **not performed**\n- Run: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "${BUILD_NUMBER:-unknown}" "${{ job.status }}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search 'A+ Android notification smoke in:title' --json number,title --jq '.[] | select(.title == "A+ Android notification smoke") | .number' | head -n1)
           if [ -n "$existing" ]; then
             gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"

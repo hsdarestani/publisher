@@ -1,0 +1,62 @@
+name: A+ Android smoke dedicated runner
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-android-smoke-runner.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+jobs:
+  cloud-linux-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout A+ Publisher agent
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+
+      - name: Wait for Publisher health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 18 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/
+
+      - name: Claim and execute queued Android work
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '3'
+          PUBLISHER_POLL_INTERVAL: '5'
+          PUBLISHER_WATCH_SECONDS: '300'
+        run: python agents/custom_cloud_linux.py

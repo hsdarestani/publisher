@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: c10967863b8987fa5489253c215f222fc7e2fafe
+      SOURCE_COMMIT: d3cd63fdd35477b6d274d724d8c89faf54dd6d27
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,9 +48,9 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'Das Patient-Dashboard wurde weiter verfeinert: Google-Bewertungen öffnen jetzt direkt Google statt einer internen Bewertungsseite. '
-                  'Dashboard- und Punkte-Navigation zeigen vollständige Icons, Kontakt- und Instagram-Aktionen sind als hochwertige Buttons ausgeführt. '
-                  'Zusätzlich wurde die Special-Offer-Darstellung verbessert und eine sichtbare Testkampagne für die Dashboard-Vorschau hinzugefügt.'
+                  'Finale mobile Optimierungen: mehr seitlicher Abstand für eine ruhigere Darstellung auf kleinen Displays. '
+                  'Außerdem wurden Scroll-Locks und festhängende Overlays bereinigt, damit Seiten im Web und in den nativen Apps zuverlässig scrollbar bleiben. '
+                  'Die aktuelle Buchungs- und Kundenclub-Anbindung bleibt unverändert erhalten.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

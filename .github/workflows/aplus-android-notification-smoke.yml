@@ -1,0 +1,158 @@
+name: A+ Android notification smoke APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-android-notification-smoke.yml'
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+env:
+  APLUS_COMMIT: '95900035d88ef49a82a47d1cffe5008286bcfbc7'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq unzip >/dev/null
+
+      - name: Queue Android-only signed smoke APK
+        id: queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          assert app.google_account and app.google_account.configured
+          cfg = dict(app.build_config or {})
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          env['REQUIRE_NATIVE_PUSH'] = '1'
+          cfg['env'] = env
+          cfg['android_command'] = 'bash frontend/scripts/build-publisher-android-smoke.sh'
+          cfg['android_artifact'] = 'frontend/android/app/build/outputs/apk/release/*.apk'
+          app.build_config = cfg
+          app.save(update_fields=['build_config','updated_at'])
+
+          build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=26) + 1
+          release = Release.objects.create(
+              app=app,
+              version_name='1.0.11',
+              build_number=build_number,
+              status='building',
+              source_branch='main',
+              source_commit=os.environ['APLUS_COMMIT'],
+              android_track='internal',
+              android_rollout=1,
+              auto_submit=False,
+              release_notes='Android notification icon/sound smoke APK.',
+          )
+          build = Build.objects.create(release=release, platform='android', status='queued')
+          job = enqueue_job(
+              'build_android', app=app, release=release, build=build,
+              payload={'source':'notification-smoke'}, agent=True, platform='linux'
+          )
+          print('SMOKE_META=' + json.dumps({
+              'release_id': str(release.id), 'build_id': str(build.id),
+              'job_id': str(job.id), 'build_number': build_number,
+          }, separators=(',',':')))
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^SMOKE_META=//p' | tail -n1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | jq -r '.release_id')" >> "$GITHUB_OUTPUT"
+          echo "build_id=$(printf '%s' "$META" | jq -r '.build_id')" >> "$GITHUB_OUTPUT"
+          echo "build_number=$(printf '%s' "$META" | jq -r '.build_number')" >> "$GITHUB_OUTPUT"
+
+      - name: Wake cloud Android builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for signed APK
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          BUILD_ID: ${{ steps.queue.outputs.build_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build,Job; b=Build.objects.get(id=os.environ['BUILD_ID']); j=Job.objects.filter(build=b,type='build_android').order_by('-created_at').first(); print(f'{b.status}|{bool(b.artifact)}|{(j.error if j else \"\")[:500]}')\"" \
+              | tail -n1 | tr -d '\r')"
+            echo "Android smoke build: $STATE"
+            if [[ "$STATE" == failed* ]]; then exit 1; fi
+            if [[ "$STATE" == succeeded\|True\|* ]]; then exit 0; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for signed Android smoke APK.' >&2
+          exit 1
+
+      - name: Copy signed APK from Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          BUILD_ID: ${{ steps.queue.outputs.build_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          REMOTE_PATH="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build; b=Build.objects.get(id=os.environ['BUILD_ID']); print(b.artifact.path)\"" \
+            | tail -n1 | tr -d '\r')"
+          test -n "$REMOTE_PATH"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && rm -f /tmp/aplus-notification-smoke.apk && docker compose cp web:'$REMOTE_PATH' /tmp/aplus-notification-smoke.apk && test -s /tmp/aplus-notification-smoke.apk"
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/aplus-notification-smoke.apk /tmp/aplus-notification-smoke.apk
+          test -s /tmp/aplus-notification-smoke.apk
+          unzip -l /tmp/aplus-notification-smoke.apk | grep -q 'res/raw/solution_signature.wav'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aplus-android-notification-smoke-apk
+          path: /tmp/aplus-notification-smoke.apk
+          if-no-files-found: error
+
+      - name: Publish smoke status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_NUMBER: ${{ steps.queue.outputs.build_number }}
+        run: |
+          body=$(printf 'A+ Android notification smoke build finished.\n\n- Source commit: `%s`\n- Android build number: **%s**\n- Signed APK artifact: **%s**\n- Store submission: **not performed**\n- Run: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "${BUILD_NUMBER:-unknown}" "${{ job.status }}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search 'A+ Android notification smoke in:title' --json number,title --jq '.[] | select(.title == "A+ Android notification smoke") | .number' | head -n1)
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title 'A+ Android notification smoke' --body "$body"
+          fi

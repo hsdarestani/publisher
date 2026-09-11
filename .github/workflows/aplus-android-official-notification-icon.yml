@@ -1,0 +1,268 @@
+name: A+ Android official notification icon release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-android-official-notification-icon.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+env:
+  APLUS_COMMIT: 'ed98ca9dd93fcb549428ae671e4441aee40511b2'
+  STATUS_ISSUE: '88'
+  APP_VERSION: '1.0.11'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Prepare Android-only production release
+        id: prepare
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' -e APP_VERSION='$APP_VERSION' web python manage.py shell" <<'PY'
+          import json, os
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          assert app.google_account and app.google_account.configured
+          assert app.repository_url
+
+          # Restore the normal signed AAB builder; the earlier smoke workflow used APK output.
+          cfg = dict(app.build_config or {})
+          cfg['android_command'] = 'bash frontend/scripts/build-publisher-android.sh'
+          cfg['android_artifact'] = 'frontend/android/app/build/outputs/bundle/release/*.aab'
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          env['REQUIRE_NATIVE_PUSH'] = '1'
+          cfg['env'] = env
+          app.build_config = cfg
+          app.save(update_fields=['build_config', 'updated_at'])
+
+          # Google versionCode must be globally unique. Include Publisher's smoke builds
+          # as well as every code already visible in Google Play.
+          db_max = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=0)
+          google_max = 0
+          gp = GooglePlayClient(app.google_account)
+          edit = None
+          try:
+              edit = gp._open_edit(app.package_name)
+              tracks = gp._edit_request(
+                  edit, 'GET',
+                  f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}/tracks'
+              ).get('tracks', [])
+              for track in tracks:
+                  for rel in track.get('releases') or []:
+                      for code in rel.get('versionCodes') or []:
+                          try:
+                              google_max = max(google_max, int(code))
+                          except (TypeError, ValueError):
+                              pass
+          finally:
+              if edit:
+                  gp._safe_delete_edit(edit)
+
+          build_number = max(db_max, google_max) + 1
+          version = os.environ['APP_VERSION']
+          source_commit = os.environ['APLUS_COMMIT']
+          release, _ = Release.objects.get_or_create(app=app, version_name=version, build_number=build_number)
+          release.status = 'building'
+          release.source_branch = 'main'
+          release.source_commit = source_commit
+          release.android_track = 'production'
+          release.android_rollout = 1
+          release.auto_submit = False
+          release.release_notes = 'Offizielles A+ Benachrichtigungssymbol für Android; Signatur-Benachrichtigungston unverändert.'
+          release.save()
+
+          build, _ = Build.objects.get_or_create(release=release, platform='android')
+          build.status = 'queued'
+          build.logs = ''
+          build.finished_at = None
+          build.external_build_id = ''
+          build.metadata = {}
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.artifact = ''
+          build.artifact_size = 0
+          build.artifact_checksum = ''
+          build.save()
+
+          job = enqueue_job(
+              'build_android', app=app, release=release, build=build,
+              payload={'source': 'official-notification-icon-google'},
+              agent=True, platform='linux'
+          )
+          print('RELEASE_META=' + json.dumps({
+              'release_id': str(release.id),
+              'build_id': str(build.id),
+              'build_job_id': str(job.id),
+              'version': version,
+              'build': build_number,
+              'db_max': db_max,
+              'google_max': google_max,
+          }, separators=(',', ':')))
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^RELEASE_META=//p' | tail -n1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | jq -r '.release_id')" >> "$GITHUB_OUTPUT"
+          echo "build_id=$(printf '%s' "$META" | jq -r '.build_id')" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | jq -r '.build')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish build-start status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+        run: |
+          body=$(printf 'A+ Android official notification icon release is running.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Exact source artwork: `notif-icon.svg` (Ms Madi + glyph)\n- Android small icon: exact monochrome glyph outline\n- Signature Motif sound: unchanged\n- Apple: no rebuild (Android-only change)\n- Google Play production: **building**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null
+
+      - name: Wake Android cloud builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for signed Android AAB
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          BUILD_ID: ${{ steps.prepare.outputs.build_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e BUILD_ID='$BUILD_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Build, Job
+          b = Build.objects.get(id=os.environ['BUILD_ID'])
+          j = Job.objects.filter(build=b, type='build_android').order_by('-created_at').first()
+          error = re.sub(r'\s+', ' ', str(j.error or '')).replace('|', '/')[:500] if j else ''
+          print('|'.join([b.status, 'artifact' if b.artifact else '', j.status if j else 'missing', error]))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
+            echo "Android build state: $STATE"
+            IFS='|' read -r BST ART JST ERR <<< "$STATE"
+            if [ "$BST" = 'failed' ] || [ "$JST" = 'failed' ]; then echo "$ERR" >&2; exit 1; fi
+            if [ "$BST" = 'succeeded' ] && [ "$ART" = 'artifact' ]; then exit 0; fi
+            sleep 15
+          done
+          echo 'Timed out waiting for signed Android AAB.' >&2
+          exit 1
+
+      - name: Queue Google Play production submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import Job, Release
+          from apps.publisher.tasks import enqueue_job
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          app = r.app
+          build = r.builds.get(platform='android')
+          assert build.status == 'succeeded' and build.artifact
+          active = Job.objects.filter(release=r, type='submit_google', status__in=['queued','running','succeeded']).first()
+          if active:
+              print('google_job=' + str(active.id))
+          else:
+              print('google_job=' + str(enqueue_job('submit_google', app=app, release=r, build=build).id))
+          PY
+
+      - name: Wait for Google Play result
+        id: google
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 180); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
+          import os, re
+          from apps.publisher.models import Job, Release, Submission
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          j = Job.objects.filter(release=r, type='submit_google').order_by('-created_at').first()
+          s = Submission.objects.filter(release=r, platform='android').first()
+          error = re.sub(r'\s+', ' ', str(j.error or '')).replace('|', '/')[:500] if j else ''
+          print('|'.join([j.status if j else 'missing', error, s.state if s else '']))
+          POLL
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
+            echo "Google Play state: $STATE"
+            IFS='|' read -r JST ERR SUBSTATE <<< "$STATE"
+            if [ "$JST" = 'failed' ]; then echo "$ERR" >&2; exit 1; fi
+            if [ "$JST" = 'succeeded' ] && [ -n "$SUBSTATE" ]; then
+              echo "submission_state=$SUBSTATE" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for Google Play submission.' >&2
+          exit 1
+
+      - name: Publish final Google status
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+          SUBMISSION_STATE: ${{ steps.google.outputs.submission_state }}
+        run: |
+          body=$(printf '✅ A+ Android official notification icon build completed and was delivered to Google Play.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Exact source artwork: `notif-icon.svg` (Ms Madi + glyph)\n- Android small icon: exact monochrome glyph outline\n- Signature Motif sound: unchanged\n- Apple: no rebuild required (Android-only resource change)\n- Google Play production submission state: **%s**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$SUBMISSION_STATE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=closed >/dev/null
+
+      - name: Publish failure status
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          BUILD: ${{ steps.prepare.outputs.build }}
+        run: |
+          body=$(printf '❌ A+ Android official notification icon release hit a blocker.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Workflow: %s/%s/actions/runs/%s\n\nOpen the failed step for the exact blocker.' "$APLUS_COMMIT" "${VERSION:-pending}" "${BUILD:-pending}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null

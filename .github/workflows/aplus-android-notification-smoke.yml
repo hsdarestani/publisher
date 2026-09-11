@@ -13,6 +13,7 @@ permissions:
 
 env:
   APLUS_COMMIT: '2e76178324e969ce5956e2cde23522a9ed926919'
+  SMOKE_ATTEMPT: 'urgent-runner'
 
 jobs:
   build:

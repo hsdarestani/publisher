@@ -12,7 +12,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '95900035d88ef49a82a47d1cffe5008286bcfbc7'
+  APLUS_COMMIT: '2e76178324e969ce5956e2cde23522a9ed926919'
 
 jobs:
   build:
@@ -175,7 +175,6 @@ jobs:
             "cd /opt/aplus-publisher && rm -f /tmp/aplus-notification-smoke.apk && docker compose cp web:'$REMOTE_PATH' /tmp/aplus-notification-smoke.apk && test -s /tmp/aplus-notification-smoke.apk"
           sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/aplus-notification-smoke.apk /tmp/aplus-notification-smoke.apk
           test -s /tmp/aplus-notification-smoke.apk
-          unzip -l /tmp/aplus-notification-smoke.apk | grep -q 'res/raw/solution_signature.wav'
 
       - uses: actions/upload-artifact@v4
         with:

@@ -21,11 +21,12 @@ permissions:
   issues: write
 
 concurrency:
-  # Keep recurring agents serialized, but an explicit workflow_dispatch is an
-  # urgent build request and gets its own slot instead of waiting behind the
-  # five-minute watch queue. Publisher's claim endpoint still guarantees that
-  # only one runner owns a build job.
-  group: aplus-cloud-linux-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'serialized' }}
+  # Every cloud runner maps to the same logical Publisher BuildAgent. Running
+  # more than one at a time lets a later OIDC claim recover (and take over) the
+  # job that the first runner is still building, so the first runner's artifact
+  # completion callback is rejected. Serialize every trigger, including urgent
+  # workflow_dispatch runs, to keep job ownership stable through upload.
+  group: aplus-cloud-linux-serialized
   cancel-in-progress: false
 
 jobs:

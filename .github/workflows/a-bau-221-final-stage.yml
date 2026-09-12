@@ -1,0 +1,14 @@
+name: Superseded A+Bau Google staging workflow
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Superseded by a-bau-221-final-auto-review.yml"

@@ -67,9 +67,8 @@ jobs:
               build.agent = None
               build.started_at = None
               build.finished_at = None
-              build.error = ''
               build.save(update_fields=[
-                  'status', 'agent', 'started_at', 'finished_at', 'error', 'updated_at'
+                  'status', 'agent', 'started_at', 'finished_at', 'updated_at'
               ])
               job = enqueue_job(
                   job_type,

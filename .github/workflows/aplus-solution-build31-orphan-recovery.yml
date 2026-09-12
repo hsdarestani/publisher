@@ -1,0 +1,99 @@
+name: Recover A+ Solution Build 31 orphan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build31-orphan-recovery.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Requeue only missing Build 31 artifacts
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import BuildAgent, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          release = Release.objects.get(
+              app=app,
+              version_name='1.0.12',
+              build_number=31,
+              source_commit='ec0c7865c70f088dc60a78c4870d3336e56d0544',
+          )
+
+          queued = []
+          for platform, job_type, runner in (
+              ('android', 'build_android', 'linux'),
+              ('ios', 'build_ios', 'macos'),
+          ):
+              build = release.builds.get(platform=platform)
+              if build.status == 'succeeded' and build.artifact:
+                  print(f'{platform}=already_ready')
+                  continue
+
+              active = Job.objects.filter(
+                  build=build,
+                  type=job_type,
+                  status__in=['queued', 'running'],
+              )
+              active_ids = list(active.values_list('id', flat=True))
+              BuildAgent.objects.filter(current_job_id__in=active_ids).update(current_job=None)
+              active.update(
+                  status='failed',
+                  error='Recovered orphaned cloud build after concurrent agent ownership race.',
+                  finished_at=timezone.now(),
+              )
+
+              build.status = 'queued'
+              build.agent = None
+              build.started_at = None
+              build.finished_at = None
+              build.error = ''
+              build.save(update_fields=[
+                  'status', 'agent', 'started_at', 'finished_at', 'error', 'updated_at'
+              ])
+              job = enqueue_job(
+                  job_type,
+                  app=app,
+                  release=release,
+                  build=build,
+                  payload={'source': 'build31-orphan-recovery'},
+                  agent=True,
+                  platform=runner,
+              )
+              queued.append(f'{platform}:{job.id}')
+
+          print('queued=' + ','.join(queued))
+          PY
+
+      - name: Wake serialized cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml', 'cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }

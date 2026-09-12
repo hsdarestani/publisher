@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: d3cd63fdd35477b6d274d724d8c89faf54dd6d27
+      SOURCE_COMMIT: da0833c82b363f9411d2af7187c500d2a539ef57
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -48,9 +48,9 @@ jobs:
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
               notes=(
-                  'Finale mobile Optimierungen: mehr seitlicher Abstand für eine ruhigere Darstellung auf kleinen Displays. '
-                  'Außerdem wurden Scroll-Locks und festhängende Overlays bereinigt, damit Seiten im Web und in den nativen Apps zuverlässig scrollbar bleiben. '
-                  'Die aktuelle Buchungs- und Kundenclub-Anbindung bleibt unverändert erhalten.'
+                  'Behebt blockiertes Scrollen in den Patientenansichten auf Android und iOS. '
+                  'Mobile Abstände wurden vergrößert, damit Inhalte nicht mehr an den Displayrändern kleben. '
+                  'Außerdem bleibt die Abmeldung aus der Verwaltung innerhalb der App.'
               )
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',

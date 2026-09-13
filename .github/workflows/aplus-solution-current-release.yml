@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '704849d0df4248a1f5a142155af9e542fe968822'
+  APLUS_COMMIT: '0a82c74a4406d02aba79ec21023c497b66f4c091'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This update fixes the mobile employee picker so eligible workers are selected from their assigned Zeitplan groups and includes improved OpenShift claim notifications for administrators. '
+              'This update improves the mobile Dienstplan experience, employee profile photos, shift presentation, iOS usability and AI-assisted shift creation. '
               'There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Korrigierte Mitarbeiterauswahl nach zugewiesenen Zeitplan-Gruppen und verbesserte Admin-Benachrichtigungen bei übernommenen OpenShifts.'
+              loc.release_notes='Verbesserter mobiler Dienstplan, Profilbilder, iOS-Bedienung und KI-gestützte Schichterstellung.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Korrigierte Mitarbeiterauswahl nach zugewiesenen Zeitplan-Gruppen und verbesserte Admin-Benachrichtigungen bei übernommenen OpenShifts.'
+          release.release_notes='Verbesserter mobiler Dienstplan, Profilbilder, iOS-Bedienung und KI-gestützte Schichterstellung.'
           release.save()
 
           queued=[]

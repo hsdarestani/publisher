@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'ec0c7865c70f088dc60a78c4870d3336e56d0544'
+  APLUS_COMMIT: '704849d0df4248a1f5a142155af9e542fe968822'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This update improves employee shift lists and time tracking, disables employee contract access, adds profile photo upload, improves privacy in public rankings, and clarifies deleted-shift notifications. '
+              'This update fixes the mobile employee picker so eligible workers are selected from their assigned Zeitplan groups and includes improved OpenShift claim notifications for administrators. '
               'There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Verbesserte Schichtlisten und Zeiterfassung, Profilfoto-Upload, mehr Datenschutz und klarere Schichtbenachrichtigungen.'
+              loc.release_notes='Korrigierte Mitarbeiterauswahl nach zugewiesenen Zeitplan-Gruppen und verbesserte Admin-Benachrichtigungen bei übernommenen OpenShifts.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Verbesserte Schichtlisten und Zeiterfassung, Profilfoto-Upload, mehr Datenschutz und klarere Schichtbenachrichtigungen.'
+          release.release_notes='Korrigierte Mitarbeiterauswahl nach zugewiesenen Zeitplan-Gruppen und verbesserte Admin-Benachrichtigungen bei übernommenen OpenShifts.'
           release.save()
 
           queued=[]

@@ -1,4 +1,4 @@
-name: Upload A+ Solution staging Android to Internal Testing
+name: Monitor A+ Solution staging store delivery
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  upload-android:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -19,11 +19,11 @@ jobs:
       PASS: ${{ secrets.PASS }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
     steps:
-      - name: Install SSH client helper
+      - name: Install SSH helper
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Queue Google Internal Testing upload
+      - name: Read release, build, job and submission state
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -31,39 +31,16 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          from apps.publisher.models import MobileApp, Release, Build, Job
-          from apps.publisher.tasks import enqueue_job
+          from apps.publisher.models import MobileApp, Release, Job, Submission
           import json
-
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
           release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
-          build = Build.objects.get(release=release, platform='android')
-          assert build.status == 'succeeded', f'Android build not ready: {build.status}'
-          assert release.android_track == 'internal', f'Unsafe Android track: {release.android_track}'
-          assert app.package_name == 'de.aplussolution.staging', f'Unsafe package: {app.package_name}'
-          release.auto_submit = False
-          release.save(update_fields=['auto_submit', 'updated_at'])
-
-          active = Job.objects.filter(
-              release=release,
-              build=build,
-              type='upload_google',
-              status__in=['queued', 'running', 'succeeded'],
-          ).order_by('-created_at').first()
-          if active is None:
-              active = enqueue_job('upload_google', app=app, release=release, build=build)
-              created = True
-          else:
-              created = False
-
-          print('ANDROID_INTERNAL=' + json.dumps({
-              'package': app.package_name,
-              'track': release.android_track,
-              'build_id': build.id,
-              'artifact_size': build.artifact_size,
-              'job_id': active.id,
-              'job_status': active.status,
-              'created': created,
-          }, sort_keys=True))
+          print('RELEASE=' + json.dumps({'id':release.id,'status':release.status,'source_commit':release.source_commit,'android_track':release.android_track,'auto_submit':release.auto_submit}, sort_keys=True))
+          for build in release.builds.order_by('platform'):
+              print('BUILD=' + json.dumps({'id':build.id,'platform':build.platform,'status':build.status,'artifact':build.artifact.name if build.artifact else '','artifact_size':build.artifact_size,'checksum':bool(build.artifact_checksum),'external_build_id':build.external_build_id}, sort_keys=True))
+          for job in Job.objects.filter(release=release).order_by('id'):
+              print('JOB=' + json.dumps({'id':job.id,'type':job.type,'status':job.status,'progress':job.progress,'build_id':job.build_id,'error':job.error[-800:] if job.error else '','result':job.result}, sort_keys=True, default=str))
+          for submission in Submission.objects.filter(release=release).order_by('platform'):
+              print('SUBMISSION=' + json.dumps({'platform':submission.platform,'state':submission.state,'external_id':submission.external_id,'last_error':submission.last_error,'raw':submission.raw}, sort_keys=True, default=str))
           PY
           REMOTE

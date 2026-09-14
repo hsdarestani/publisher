@@ -1,0 +1,104 @@
+name: Inspect A+ Solution Publisher staging state
+
+on:
+  push:
+    branches: [ops/aplussolution-staging]
+    paths:
+      - '.github/workflows/aplussolution-staging-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - name: Install SSH client helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Inspect Publisher database safely
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp, StoreAccount, BuildAgent, Release, Build, Job
+          from django.utils import timezone
+          import json
+
+          print('=== MOBILE APPS ===')
+          for app in MobileApp.objects.order_by('name'):
+              if 'solution' in app.name.lower() or 'aplus' in app.slug.lower() or 'aplus' in app.repository_url.lower():
+                  print(json.dumps({
+                      'id': app.id,
+                      'name': app.name,
+                      'slug': app.slug,
+                      'status': app.status,
+                      'platform': app.platform,
+                      'framework': app.framework,
+                      'package_name': app.package_name,
+                      'bundle_id': app.bundle_id,
+                      'google_app_id': app.google_app_id,
+                      'apple_app_id': app.apple_app_id,
+                      'repository_url': app.repository_url,
+                      'default_branch': app.default_branch,
+                      'google_account_id': app.google_account_id,
+                      'apple_account_id': app.apple_account_id,
+                      'build_config': app.build_config,
+                  }, sort_keys=True))
+
+          print('=== STORE ACCOUNTS ===')
+          for account in StoreAccount.objects.order_by('provider','name'):
+              print(json.dumps({
+                  'id': account.id,
+                  'provider': account.provider,
+                  'name': account.name,
+                  'organization': account.organization,
+                  'enabled': account.enabled,
+                  'status': account.status,
+                  'configured': account.configured,
+              }, sort_keys=True))
+
+          print('=== BUILD AGENTS ===')
+          for agent in BuildAgent.objects.order_by('name'):
+              print(json.dumps({
+                  'id': agent.id,
+                  'name': agent.name,
+                  'platform': agent.platform,
+                  'enabled': agent.enabled,
+                  'online': agent.online,
+                  'hostname': agent.hostname,
+                  'last_seen_at': agent.last_seen_at.isoformat() if agent.last_seen_at else None,
+                  'current_job_id': agent.current_job_id,
+                  'labels': agent.labels,
+                  'capabilities': agent.capabilities,
+              }, sort_keys=True))
+
+          print('=== RECENT APLUS JOBS ===')
+          for job in Job.objects.filter(app__repository_url__icontains='aplussolution').select_related('app','release','build').order_by('-created_at')[:12]:
+              print(json.dumps({
+                  'id': job.id,
+                  'app': job.app.name if job.app else None,
+                  'type': job.type,
+                  'status': job.status,
+                  'required_platform': job.required_platform,
+                  'available_to_agents': job.available_to_agents,
+                  'release_id': job.release_id,
+                  'build_id': job.build_id,
+                  'error': job.error[-300:] if job.error else '',
+                  'created_at': job.created_at.isoformat(),
+              }, sort_keys=True))
+          PY
+          REMOTE

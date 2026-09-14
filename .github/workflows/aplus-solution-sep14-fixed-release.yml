@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'b713a0f5ab0cf4a23a73e37fab81776e395ad259'
+  APLUS_COMMIT: 'ae47c31c552164f7c37f2e371d5463165fe55950'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -117,11 +117,11 @@ jobs:
           app.review_notes=(
               'A+ Solution is the internal workforce application used by A+ Solution GmbH for employee scheduling, availability, OpenShifts, time tracking, absences, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
-              'This replacement build adds Service Zeitplan peer visibility so Service employees can see shifts of other Service Zeitplan members while retaining their own and OpenShifts, and includes the latest shift reassignment, date/time and notification fixes. There are no in-app purchases.'
+              'This replacement build aligns the employee Service Zeitplan with the administration schedule design while preserving employee permissions, keeps own shifts and OpenShifts, shows other Service Zeitplan members, and adds adjacent-week swipe previews plus direct navigation to the selected day. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
-          notes='Service-Zeitplan erweitert: Service-Mitarbeiter sehen jetzt zusätzlich die Schichten anderer Service-Zeitplan-Mitglieder sowie weiterhin eigene Schichten und OpenShifts.'
+          notes='Dienstplan verbessert: Service-Zeitplan im Admin-Design, übersichtlichere OpenShifts, flüssiger Wochenwechsel mit Vorschau und direkte Navigation zum ausgewählten Tag.'
           if loc:
               loc.release_notes=notes
               loc.save(update_fields=['release_notes','updated_at'])

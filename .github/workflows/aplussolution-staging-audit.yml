@@ -1,4 +1,4 @@
-name: Verify A+ Solution staging iOS upload
+name: Query A+ Solution staging build in App Store Connect
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Verify App Store Connect delivery state
+      - name: Query Apple and Publisher state
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -31,35 +31,38 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.integrations.apple_store import AppleStoreClient
           import json
+
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
           release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
           build = Build.objects.get(release=release, platform='ios')
-          job = Job.objects.get(pk=2565)
-          submit_jobs = list(Job.objects.filter(release=release, type='submit_apple').values('id','status','error'))
-          submission = Submission.objects.filter(release=release, platform='ios').first()
-          print('STATE=' + json.dumps({
-              'app_bundle': app.bundle_id,
-              'release_status': release.status,
+          upload = Job.objects.get(pk=2565)
+          client = AppleStoreClient(app.apple_account)
+          app_record = client.find_app(app.bundle_id)
+          apple_builds = client.list_builds(app_record['id'], build_number=release.build_number, limit=10)
+
+          print('APPLE_STATE=' + json.dumps({
+              'bundle_id': app.bundle_id,
+              'app_store_app_id': app_record['id'],
+              'publisher_build_status': build.status,
+              'publisher_external_build_id': build.external_build_id,
+              'upload_job_status': upload.status,
+              'upload_job_progress': upload.progress,
+              'upload_job_error': upload.error,
               'auto_submit': release.auto_submit,
-              'build_status': build.status,
-              'artifact_size': build.artifact_size,
-              'external_build_id': build.external_build_id,
-              'upload_job': {
-                  'id': job.id,
-                  'status': job.status,
-                  'progress': job.progress,
-                  'error': job.error[-1500:] if job.error else '',
-                  'result': job.result,
-                  'logs_tail': (job.logs or '')[-8000:],
-              },
-              'submit_apple_jobs': submit_jobs,
-              'submission': ({
-                  'state': submission.state,
-                  'external_id': submission.external_id,
-                  'last_error': submission.last_error,
-              } if submission else None),
+              'submit_apple_jobs': list(Job.objects.filter(release=release, type='submit_apple').values('id','status','error')),
+              'apple_builds': [
+                  {
+                      'id': item.get('id'),
+                      'version': item.get('attributes', {}).get('version'),
+                      'processing_state': item.get('attributes', {}).get('processingState'),
+                      'uploaded_date': item.get('attributes', {}).get('uploadedDate'),
+                      'expired': item.get('attributes', {}).get('expired'),
+                  }
+                  for item in apple_builds
+              ],
           }, default=str))
           PY
           REMOTE

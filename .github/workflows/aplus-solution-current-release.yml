@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'a8b46f1c082e693cb06072cc750e131507cbe7c5'
+  APLUS_COMMIT: 'c15c3186b67c90035850ead2d75de3fd800990ae'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -129,13 +129,13 @@ jobs:
               'availability, OpenShifts, time tracking, absences, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This build updates the native app icon while retaining the current scheduling, profile photo, iOS usability and AI-assisted shift improvements. '
-              'There are no in-app purchases.'
+              'This build fixes mobile Dienstplan date grouping and sticky day headers, improves profile-photo and no-photo avatar layout, '
+              'removes the global search from Team time tracking, and retains the updated app icon. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Neues App-Icon sowie die aktuellen Verbesserungen für Dienstplan, Profilbilder, iOS und KI-gestützte Schichterstellung.'
+              loc.release_notes='Korrigierte Tageszuordnung und Sticky-Datumsleisten im mobilen Dienstplan, verbesserte Profilbilder/Fallbacks und aufgeräumte Team-Zeiterfassung.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Neues App-Icon sowie die aktuellen Verbesserungen für Dienstplan, Profilbilder, iOS und KI-gestützte Schichterstellung.'
+          release.release_notes='Korrigierte Tageszuordnung und Sticky-Datumsleisten im mobilen Dienstplan, verbesserte Profilbilder/Fallbacks und aufgeräumte Team-Zeiterfassung.'
           release.save()
 
           queued=[]

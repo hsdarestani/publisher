@@ -1,0 +1,96 @@
+name: A+ Solution Sep14 Replacement Kickoff
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-sep14-replacement.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+jobs:
+  kickoff:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Point current release workflow at fixed production commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/aplus-solution-current-release.yml')
+          text = path.read_text()
+          old = "APLUS_COMMIT: 'c15c3186b67c90035850ead2d75de3fd800990ae'"
+          new = "APLUS_COMMIT: '760be0330c2b0eb5af32b7c6502e71372385b2d2'"
+          if old not in text and new not in text:
+              raise SystemExit('Expected APLUS_COMMIT marker not found')
+          text = text.replace(old, new)
+          text = text.replace(
+              'This build fixes mobile Dienstplan date grouping and sticky day headers, improves profile-photo and no-photo avatar layout, removes the global search from Team time tracking, and retains the updated app icon. There are no in-app purchases.',
+              'This build fixes admin shift reassignment persistence (including WIW-synced shifts), corrects employee Dienstplan day/date/time display, prevents duplicate shift-update notifications, and includes the latest Dienstplan UI fixes and updated app icon. There are no in-app purchases.'
+          )
+          old_de = 'Korrigierte Tageszuordnung und Sticky-Datumsleisten im mobilen Dienstplan, verbesserte Profilbilder/Fallbacks und aufgeräumte Team-Zeiterfassung.'
+          new_de = 'Korrigierte Mitarbeiter-Zuweisung im Dienstplan, korrekte Tages- und Uhrzeitdarstellung sowie Schutz vor doppelten Schicht-Benachrichtigungen.'
+          text = text.replace(old_de, new_de)
+          path.write_text(text)
+          PY
+          if git diff --quiet -- .github/workflows/aplus-solution-current-release.yml; then
+            echo 'Release workflow already points at the fixed commit.'
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add .github/workflows/aplus-solution-current-release.yml
+            git commit -m 'Release fixed A+ Solution production build'
+            git push origin HEAD:main
+          fi
+
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Cancel prior active Apple review before replacement build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          client = AppleStoreClient(app.apple_account)
+          apple_app = client.find_app(app.bundle_id)
+          canceled = []
+          for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+              for submission in client.list_review_submissions(apple_app['id'], state):
+                  client.cancel_review_submission(submission['id'])
+                  canceled.append(str(submission['id']))
+          print('canceled_prior_reviews=' + ','.join(canceled))
+          PY
+
+      - name: Dispatch replacement release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run aplus-solution-current-release.yml --ref main
+
+      - name: Mark replacement in progress
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(printf 'A+ Solution replacement release is starting.\n\n- Source commit: `760be0330c2b0eb5af32b7c6502e71372385b2d2`\n- Production: **live and verified**\n- Prior Apple review: **cancel requested before replacement submission**\n- Replacement Android/iOS builds: **starting**\n')
+          gh api --method PATCH repos/${GITHUB_REPOSITORY}/issues/74 -f body="$body" -f state=open >/dev/null

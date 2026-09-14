@@ -1,4 +1,4 @@
-name: Inspect A+ Solution Publisher staging state
+name: Provision A+ Solution staging in Publisher
 
 on:
   push:
@@ -9,11 +9,12 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  inspect:
+  provision:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       HOST: ${{ secrets.HOST }}
       PASS: ${{ secrets.PASS }}
@@ -24,7 +25,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
-      - name: Inspect Publisher database safely
+      - name: Provision staging app, signing and build jobs
         run: |
           set -euo pipefail
           test -n "$HOST"
@@ -34,71 +35,164 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          from apps.publisher.models import MobileApp, StoreAccount, BuildAgent, Release, Build, Job
-          from django.utils import timezone
+          from apps.publisher.models import MobileApp, AppLocalization, Release, Build, Job
+          from apps.publisher.tasks import enqueue_job
+          from apps.signing.services import ensure_android_signing, ensure_ios_signing
+          from django.db import transaction
           import json
 
-          print('=== MOBILE APPS ===')
-          for app in MobileApp.objects.order_by('name'):
-              if 'solution' in app.name.lower() or 'aplus' in app.slug.lower() or 'aplus' in app.repository_url.lower():
-                  print(json.dumps({
-                      'id': app.id,
-                      'name': app.name,
-                      'slug': app.slug,
-                      'status': app.status,
-                      'platform': app.platform,
-                      'framework': app.framework,
-                      'package_name': app.package_name,
-                      'bundle_id': app.bundle_id,
-                      'google_app_id': app.google_app_id,
-                      'apple_app_id': app.apple_app_id,
-                      'repository_url': app.repository_url,
-                      'default_branch': app.default_branch,
-                      'google_account_id': app.google_account_id,
-                      'apple_account_id': app.apple_account_id,
-                      'build_config': app.build_config,
-                  }, sort_keys=True))
+          PROD_SLUG = 'a-plus-solution'
+          STAGING_SLUG = 'a-plus-solution-staging'
+          STAGING_COMMIT = 'e6cad3367c589bee8b8de70ae0322d4960722d8c'
 
-          print('=== STORE ACCOUNTS ===')
-          for account in StoreAccount.objects.order_by('provider','name'):
-              print(json.dumps({
-                  'id': account.id,
-                  'provider': account.provider,
-                  'name': account.name,
-                  'organization': account.organization,
-                  'enabled': account.enabled,
-                  'status': account.status,
-                  'configured': account.configured,
-              }, sort_keys=True))
+          with transaction.atomic():
+              prod = MobileApp.objects.select_related('google_account', 'apple_account').get(slug=PROD_SLUG)
+              staging, created = MobileApp.objects.get_or_create(
+                  slug=STAGING_SLUG,
+                  defaults={'name': 'A+ Solution Staging'},
+              )
 
-          print('=== BUILD AGENTS ===')
-          for agent in BuildAgent.objects.order_by('name'):
-              print(json.dumps({
-                  'id': agent.id,
-                  'name': agent.name,
-                  'platform': agent.platform,
-                  'enabled': agent.enabled,
-                  'online': agent.online,
-                  'hostname': agent.hostname,
-                  'last_seen_at': agent.last_seen_at.isoformat() if agent.last_seen_at else None,
-                  'current_job_id': agent.current_job_id,
-                  'labels': agent.labels,
-                  'capabilities': agent.capabilities,
-              }, sort_keys=True))
+              staging.name = 'A+ Solution Staging'
+              staging.client_name = prod.client_name or 'A+ Solution GmbH'
+              staging.platform = 'both'
+              staging.framework = prod.framework
+              staging.status = 'active'
+              staging.package_name = 'de.aplussolution.staging'
+              staging.bundle_id = 'de.aplussolution.staging'
+              staging.repository_url = prod.repository_url
+              staging.default_branch = 'staging'
+              staging.repository_token_blob = prod.repository_token_blob
+              staging.privacy_policy_url = prod.privacy_policy_url
+              staging.support_url = prod.support_url
+              staging.marketing_url = prod.marketing_url
+              staging.category = prod.category
+              staging.content_rating = prod.content_rating
+              staging.requires_login = prod.requires_login
+              staging.review_username = prod.review_username
+              staging.review_password_blob = prod.review_password_blob
+              staging.review_notes = prod.review_notes
+              staging.google_account = prod.google_account
+              staging.apple_account = prod.apple_account
+              staging.tech_stack = prod.tech_stack
+              staging.build_config = {
+                  'android_command': 'bash frontend/scripts/build-publisher-android-staging.sh',
+                  'android_artifact': 'frontend/android/app/build/outputs/bundle/release/*.aab',
+                  'ios_command': 'bash frontend/scripts/build-publisher-ios-staging.sh',
+                  'ios_artifact': 'frontend/ios/build/export/*.ipa',
+                  'env': {
+                      'APP_ENV': 'staging',
+                      'CAPACITOR_APP_ID': 'de.aplussolution.staging',
+                      'CAPACITOR_APP_NAME': 'A+ Solution Staging',
+                      'VITE_APP_ENV': 'staging',
+                      'VITE_API_URL': 'https://staging.app.aplus-solution.de/api',
+                      'IOS_BUNDLE_ID': 'de.aplussolution.staging',
+                  },
+              }
+              staging.save()
 
-          print('=== RECENT APLUS JOBS ===')
-          for job in Job.objects.filter(app__repository_url__icontains='aplussolution').select_related('app','release','build').order_by('-created_at')[:12]:
-              print(json.dumps({
-                  'id': job.id,
-                  'app': job.app.name if job.app else None,
-                  'type': job.type,
-                  'status': job.status,
-                  'required_platform': job.required_platform,
-                  'available_to_agents': job.available_to_agents,
-                  'release_id': job.release_id,
-                  'build_id': job.build_id,
-                  'error': job.error[-300:] if job.error else '',
-                  'created_at': job.created_at.isoformat(),
-              }, sort_keys=True))
+              for loc in prod.localizations.all():
+                  AppLocalization.objects.update_or_create(
+                      app=staging,
+                      locale=loc.locale,
+                      defaults={
+                          'title': 'A+ Solution Staging',
+                          'subtitle': loc.subtitle,
+                          'short_description': loc.short_description,
+                          'full_description': loc.full_description,
+                          'keywords': loc.keywords,
+                          'promotional_text': loc.promotional_text,
+                          'release_notes': loc.release_notes,
+                      },
+                  )
+
+          android_signing = ensure_android_signing(staging)
+          ios_profile = ensure_ios_signing(staging)
+
+          release, release_created = Release.objects.get_or_create(
+              app=staging,
+              version_name='1.0.0',
+              build_number=1,
+              defaults={
+                  'status': 'draft',
+                  'source_branch': 'staging',
+                  'source_commit': STAGING_COMMIT,
+                  'android_track': 'internal',
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'release_notes': 'First isolated A+ Solution staging build.',
+              },
+          )
+          if not release_created:
+              release.source_branch = 'staging'
+              release.source_commit = STAGING_COMMIT
+              release.android_track = 'internal'
+              release.ios_release_type = 'manual'
+              release.auto_submit = False
+              release.save(update_fields=['source_branch', 'source_commit', 'android_track', 'ios_release_type', 'auto_submit', 'updated_at'])
+
+          queued = []
+          for platform, job_type, required_platform in (
+              ('android', 'build_android', 'linux'),
+              ('ios', 'build_ios', 'macos'),
+          ):
+              build, _ = Build.objects.get_or_create(release=release, platform=platform)
+              active = Job.objects.filter(
+                  release=release,
+                  build=build,
+                  type=job_type,
+                  status__in=['queued', 'running', 'succeeded'],
+              ).order_by('-created_at').first()
+              if active is None:
+                  build.status = 'queued'
+                  build.logs = ''
+                  build.save(update_fields=['status', 'logs', 'updated_at'])
+                  job = enqueue_job(
+                      job_type,
+                      app=staging,
+                      release=release,
+                      build=build,
+                      agent=True,
+                      platform=required_platform,
+                  )
+                  queued.append({'platform': platform, 'job_id': job.id})
+              else:
+                  queued.append({'platform': platform, 'job_id': active.id, 'existing_status': active.status})
+
+          release.status = 'building'
+          release.save(update_fields=['status', 'updated_at'])
+
+          print('STAGING_PUBLISHER_RESULT=' + json.dumps({
+              'app_id': staging.id,
+              'app_created': created,
+              'slug': staging.slug,
+              'package_name': staging.package_name,
+              'bundle_id': staging.bundle_id,
+              'branch': staging.default_branch,
+              'google_account_id': staging.google_account_id,
+              'apple_account_id': staging.apple_account_id,
+              'android_signing_ready': bool(android_signing.id),
+              'android_certificate_sha256_present': bool(android_signing.certificate_sha256),
+              'ios_profile_ready': bool(ios_profile.id),
+              'ios_profile_name': ios_profile.profile_name,
+              'release_id': release.id,
+              'release_created': release_created,
+              'release_version': release.version_name,
+              'build_number': release.build_number,
+              'auto_submit': release.auto_submit,
+              'queued': queued,
+          }, sort_keys=True))
           PY
           REMOTE
+
+      - name: Wake cloud Android and iOS agents
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml', 'cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }

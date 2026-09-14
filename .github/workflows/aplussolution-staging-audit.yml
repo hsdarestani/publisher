@@ -1,4 +1,4 @@
-name: Upload A+ Solution staging iOS to App Store Connect
+name: Verify A+ Solution staging iOS upload
 
 on:
   push:
@@ -9,10 +9,9 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
-  upload-ios:
+  inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -24,8 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-
-      - name: Queue staging App Store Connect upload only
+      - name: Verify App Store Connect delivery state
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -33,71 +31,35 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          from apps.publisher.models import MobileApp, Release, Build, Job
-          from apps.publisher.tasks import enqueue_job
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
           import json
-
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
           release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
           build = Build.objects.get(release=release, platform='ios')
-
-          assert app.bundle_id == 'de.aplussolution.staging', f'Unsafe bundle: {app.bundle_id}'
-          assert build.status == 'succeeded', f'iOS build not ready: {build.status}'
-          assert bool(build.artifact), 'iOS IPA artifact missing'
-          assert build.artifact_size > 0, 'iOS IPA is empty'
-          assert bool(build.artifact_checksum), 'iOS IPA checksum missing'
-
-          release.auto_submit = False
-          release.save(update_fields=['auto_submit', 'updated_at'])
-
-          # Never create an App Store review submission from this staging upload.
-          assert not Job.objects.filter(
-              release=release,
-              type='submit_apple',
-              status__in=['queued', 'running', 'succeeded'],
-          ).exists(), 'A staging submit_apple job already exists; refusing to continue.'
-
-          active = Job.objects.filter(
-              release=release,
-              build=build,
-              type='upload_apple',
-              status__in=['queued', 'running', 'succeeded'],
-          ).order_by('-created_at').first()
-
-          if active is None:
-              active = enqueue_job(
-                  'upload_apple',
-                  app=app,
-                  release=release,
-                  build=build,
-                  agent=True,
-                  platform='macos',
-              )
-              active.append_log('Staging-only upload to App Store Connect/TestFlight. App Review submission is disabled.')
-              created = True
-          else:
-              created = False
-
-          print('IOS_UPLOAD=' + json.dumps({
-              'bundle_id': app.bundle_id,
-              'release_id': release.id,
-              'build_id': build.id,
-              'artifact_size': build.artifact_size,
-              'job_id': active.id,
-              'job_status': active.status,
-              'created': created,
+          job = Job.objects.get(pk=2565)
+          submit_jobs = list(Job.objects.filter(release=release, type='submit_apple').values('id','status','error'))
+          submission = Submission.objects.filter(release=release, platform='ios').first()
+          print('STATE=' + json.dumps({
+              'app_bundle': app.bundle_id,
+              'release_status': release.status,
               'auto_submit': release.auto_submit,
-          }, sort_keys=True))
+              'build_status': build.status,
+              'artifact_size': build.artifact_size,
+              'external_build_id': build.external_build_id,
+              'upload_job': {
+                  'id': job.id,
+                  'status': job.status,
+                  'progress': job.progress,
+                  'error': job.error[-1500:] if job.error else '',
+                  'result': job.result,
+                  'logs_tail': (job.logs or '')[-8000:],
+              },
+              'submit_apple_jobs': submit_jobs,
+              'submission': ({
+                  'state': submission.state,
+                  'external_id': submission.external_id,
+                  'last_error': submission.last_error,
+              } if submission else None),
+          }, default=str))
           PY
           REMOTE
-
-      - name: Wake cloud Mac
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'cloud-macos.yml',
-              ref: 'main'
-            });

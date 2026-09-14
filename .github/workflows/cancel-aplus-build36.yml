@@ -1,0 +1,31 @@
+name: Stop A+ Solution Build 36
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cancel-aplus-build36.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel build 36 release and builders
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for run_id in 34847697867 34847761795 34847511592 34847860559 34847858149; do
+            echo "Cancelling run ${run_id}"
+            curl --silent --show-error --fail-with-body \
+              -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/actions/runs/${run_id}/cancel" || true
+          done

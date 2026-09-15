@@ -1,4 +1,4 @@
-name: Build A+ Solution staging push release
+name: Monitor A+ Solution staging push release
 
 on:
   push:
@@ -9,23 +9,21 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
-  queue-builds:
+  monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       HOST: ${{ secrets.HOST }}
       PASS: ${{ secrets.PASS }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Install SSH helper
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Queue isolated staging build 2
+      - name: Read staging build 2 status
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -34,113 +32,49 @@ jobs:
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
           import json
-          from apps.publisher.models import MobileApp, Release, Build, Job
-          from apps.publisher.tasks import enqueue_job
+          from apps.publisher.models import MobileApp, Release, Job, Submission
 
-          SOURCE = '2f845ad2d6b34cc539867af3cde30d1c50907e11'
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
-          assert app.package_name == 'de.aplussolution.staging', app.package_name
-          assert app.bundle_id == 'de.aplussolution.staging', app.bundle_id
-          assert app.default_branch == 'staging', app.default_branch
-
-          release, _ = Release.objects.get_or_create(
-              app=app,
-              version_name='1.0.0',
-              build_number=2,
-              defaults={
-                  'source_branch': 'staging',
-                  'source_commit': SOURCE,
-                  'android_track': 'internal',
-                  'ios_release_type': 'manual',
-                  'auto_submit': False,
-                  'status': 'draft',
-              },
-          )
-          release.source_branch = 'staging'
-          release.source_commit = SOURCE
-          release.android_track = 'internal'
-          release.ios_release_type = 'manual'
-          release.auto_submit = False
-          if release.status in {'failed', 'rejected'}:
-              release.status = 'draft'
-          release.save(update_fields=[
-              'source_branch', 'source_commit', 'android_track',
-              'ios_release_type', 'auto_submit', 'status', 'updated_at'
-          ])
-
-          queued = []
-          for platform, job_type, agent_platform in (
-              ('android', 'build_android', 'linux'),
-              ('ios', 'build_ios', 'macos'),
-          ):
-              build, _ = Build.objects.get_or_create(
-                  release=release,
-                  platform=platform,
-                  defaults={'status': 'queued', 'commit_sha': SOURCE},
-              )
-              if build.status != 'succeeded':
-                  build.status = 'queued'
-                  build.commit_sha = SOURCE
-                  build.agent = None
-                  build.started_at = None
-                  build.finished_at = None
-                  build.save(update_fields=[
-                      'status', 'commit_sha', 'agent', 'started_at',
-                      'finished_at', 'updated_at'
-                  ])
-              existing = Job.objects.filter(
-                  release=release,
-                  build=build,
-                  type=job_type,
-                  status__in=['queued', 'running', 'succeeded'],
-              ).order_by('-created_at').first()
-              if build.status == 'succeeded':
-                  job = existing
-              elif existing and existing.status in {'queued', 'running'}:
-                  job = existing
-              else:
-                  job = enqueue_job(
-                      job_type,
-                      app=app,
-                      release=release,
-                      build=build,
-                      agent=True,
-                      platform=agent_platform,
-                  )
-              queued.append({
-                  'platform': platform,
-                  'build_id': build.id,
-                  'build_status': build.status,
-                  'job_id': job.id if job else None,
-                  'job_status': job.status if job else None,
+          release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
+          builds = []
+          for b in release.builds.order_by('platform'):
+              builds.append({
+                  'id': b.id,
+                  'platform': b.platform,
+                  'status': b.status,
+                  'commit_sha': b.commit_sha,
+                  'artifact': b.artifact.name if b.artifact else '',
+                  'artifact_size': b.artifact_size,
+                  'checksum': bool(b.artifact_checksum),
+                  'external_build_id': b.external_build_id,
               })
-
-          assert release.auto_submit is False
+          jobs = []
+          for j in Job.objects.filter(release=release).order_by('id'):
+              jobs.append({
+                  'id': j.id,
+                  'type': j.type,
+                  'status': j.status,
+                  'progress': j.progress,
+                  'required_platform': j.required_platform,
+                  'error': j.error[-1200:] if j.error else '',
+                  'logs_tail': j.logs[-1800:] if j.logs else '',
+              })
+          submissions = list(Submission.objects.filter(release=release).values('platform','state','external_id','submitted_at','last_error'))
+          assert app.package_name == 'de.aplussolution.staging'
+          assert app.bundle_id == 'de.aplussolution.staging'
           assert release.android_track == 'internal'
+          assert release.auto_submit is False
           assert not Job.objects.filter(release=release, type='submit_apple').exists()
-          print('STAGING_BUILD_2=' + json.dumps({
-              'app_id': app.id,
+          print('STAGING_BUILD_2_STATUS=' + json.dumps({
               'release_id': release.id,
-              'version': release.version_name,
-              'build_number': release.build_number,
+              'release_status': release.status,
               'source_commit': release.source_commit,
               'android_track': release.android_track,
               'ios_release_type': release.ios_release_type,
               'auto_submit': release.auto_submit,
-              'jobs': queued,
-          }))
+              'builds': builds,
+              'jobs': jobs,
+              'submissions': submissions,
+          }, default=str))
           PY
           REMOTE
-      - name: Wake Linux and Mac build agents
-        env:
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          for workflow in cloud-linux.yml cloud-macos.yml; do
-            curl --fail-with-body -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/$REPO/actions/workflows/$workflow/dispatches" \
-              -d '{"ref":"main"}'
-          done

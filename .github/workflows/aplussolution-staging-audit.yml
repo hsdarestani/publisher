@@ -53,7 +53,7 @@ jobs:
           if not bundle:
               raise RuntimeError(f'Apple Bundle ID not found: {app.bundle_id}')
 
-          capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities?limit=50").get('data', [])
+          capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities").get('data', [])
           push = next((item for item in capabilities if item.get('attributes', {}).get('capabilityType') == 'PUSH_NOTIFICATIONS'), None)
           if not push:
               body = {

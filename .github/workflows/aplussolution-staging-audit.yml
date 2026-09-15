@@ -1,4 +1,4 @@
-name: Query A+ Solution staging build in App Store Connect
+name: Enable A+ Solution staging iOS push
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  enable-push:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -23,7 +23,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Query Apple and Publisher state
+      - name: Enable Apple push and regenerate staging profile
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -31,38 +31,80 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          from apps.publisher.models import MobileApp, Release, Build, Job
-          from apps.integrations.apple_store import AppleStoreClient
+          import base64
           import json
+          import plistlib
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          from apps.integrations.apple_store import AppleStoreClient, IntegrationError
+          from apps.publisher.models import MobileApp
+          from apps.signing.models import IOSProvisioningProfile
+          from apps.signing.services import ensure_ios_app_store_profile
 
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
-          release = Release.objects.get(app=app, version_name='1.0.0', build_number=1)
-          build = Build.objects.get(release=release, platform='ios')
-          upload = Job.objects.get(pk=2565)
-          client = AppleStoreClient(app.apple_account)
-          app_record = client.find_app(app.bundle_id)
-          apple_builds = client.list_builds(app_record['id'], build_number=release.build_number, limit=10)
+          assert app.bundle_id == 'de.aplussolution.staging', app.bundle_id
+          assert app.apple_account_id, 'Staging app has no Apple account.'
 
-          print('APPLE_STATE=' + json.dumps({
-              'bundle_id': app.bundle_id,
-              'app_store_app_id': app_record['id'],
-              'publisher_build_status': build.status,
-              'publisher_external_build_id': build.external_build_id,
-              'upload_job_status': upload.status,
-              'upload_job_progress': upload.progress,
-              'upload_job_error': upload.error,
-              'auto_submit': release.auto_submit,
-              'submit_apple_jobs': list(Job.objects.filter(release=release, type='submit_apple').values('id','status','error')),
-              'apple_builds': [
-                  {
-                      'id': item.get('id'),
-                      'version': item.get('attributes', {}).get('version'),
-                      'processing_state': item.get('attributes', {}).get('processingState'),
-                      'uploaded_date': item.get('attributes', {}).get('uploadedDate'),
-                      'expired': item.get('attributes', {}).get('expired'),
+          client = AppleStoreClient(app.apple_account)
+          bundle_data = client.request('GET', f'/bundleIds?filter[identifier]={app.bundle_id}&limit=10').get('data', [])
+          bundle = next((item for item in bundle_data if item.get('attributes', {}).get('identifier') == app.bundle_id), None)
+          if not bundle:
+              raise RuntimeError(f'Apple Bundle ID not found: {app.bundle_id}')
+
+          capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities?limit=50").get('data', [])
+          push = next((item for item in capabilities if item.get('attributes', {}).get('capabilityType') == 'PUSH_NOTIFICATIONS'), None)
+          if not push:
+              body = {
+                  'data': {
+                      'type': 'bundleIdCapabilities',
+                      'attributes': {'capabilityType': 'PUSH_NOTIFICATIONS'},
+                      'relationships': {
+                          'bundleId': {'data': {'type': 'bundleIds', 'id': bundle['id']}}
+                      },
                   }
-                  for item in apple_builds
-              ],
+              }
+              push = client.request('POST', '/bundleIdCapabilities', data=json.dumps(body)).get('data')
+
+          old = IOSProvisioningProfile.objects.filter(app=app).first()
+          if old:
+              if old.apple_profile_id:
+                  try:
+                      client.request('DELETE', f'/profiles/{old.apple_profile_id}')
+                  except IntegrationError as exc:
+                      if '404' not in str(exc):
+                          raise
+              old.delete()
+
+          profile = ensure_ios_app_store_profile(app)
+          creds = profile.get_credentials()
+          profile_b64 = creds.get('profile_content_base64', '')
+          if not profile_b64:
+              raise RuntimeError('Regenerated profile has no profile content.')
+
+          with tempfile.TemporaryDirectory(prefix='aplus-profile-check-') as tmp:
+              der = Path(tmp) / 'profile.mobileprovision'
+              der.write_bytes(base64.b64decode(profile_b64))
+              decoded = subprocess.run(
+                  ['openssl', 'smime', '-inform', 'der', '-verify', '-noverify', '-in', str(der)],
+                  check=True,
+                  capture_output=True,
+              ).stdout
+              plist = plistlib.loads(decoded)
+          entitlements = plist.get('Entitlements', {})
+          aps = entitlements.get('aps-environment')
+          if aps != 'production':
+              raise RuntimeError(f'Push-enabled profile missing production aps-environment: {aps!r}')
+
+          print('IOS_PUSH_READY=' + json.dumps({
+              'bundle_id': app.bundle_id,
+              'push_capability_id': push.get('id') if push else None,
+              'profile_id': profile.apple_profile_id,
+              'profile_uuid': profile.profile_uuid,
+              'profile_name': profile.profile_name,
+              'aps_environment': aps,
+              'expires_at': profile.expires_at,
           }, default=str))
           PY
           REMOTE

@@ -1,4 +1,4 @@
-name: Enable A+ Solution staging iOS push
+name: Build A+ Solution staging push release
 
 on:
   push:
@@ -9,21 +9,23 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  enable-push:
+  queue-builds:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       HOST: ${{ secrets.HOST }}
       PASS: ${{ secrets.PASS }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Install SSH helper
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Enable Apple push and regenerate staging profile
+      - name: Queue isolated staging build 2
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -31,80 +33,114 @@ jobs:
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          import base64
           import json
-          import plistlib
-          import subprocess
-          import tempfile
-          from pathlib import Path
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.publisher.tasks import enqueue_job
 
-          from apps.integrations.apple_store import AppleStoreClient, IntegrationError
-          from apps.publisher.models import MobileApp
-          from apps.signing.models import IOSProvisioningProfile
-          from apps.signing.services import ensure_ios_app_store_profile
-
+          SOURCE = '2f845ad2d6b34cc539867af3cde30d1c50907e11'
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
+          assert app.package_name == 'de.aplussolution.staging', app.package_name
           assert app.bundle_id == 'de.aplussolution.staging', app.bundle_id
-          assert app.apple_account_id, 'Staging app has no Apple account.'
+          assert app.default_branch == 'staging', app.default_branch
 
-          client = AppleStoreClient(app.apple_account)
-          bundle_data = client.request('GET', f'/bundleIds?filter[identifier]={app.bundle_id}&limit=10').get('data', [])
-          bundle = next((item for item in bundle_data if item.get('attributes', {}).get('identifier') == app.bundle_id), None)
-          if not bundle:
-              raise RuntimeError(f'Apple Bundle ID not found: {app.bundle_id}')
+          release, _ = Release.objects.get_or_create(
+              app=app,
+              version_name='1.0.0',
+              build_number=2,
+              defaults={
+                  'source_branch': 'staging',
+                  'source_commit': SOURCE,
+                  'android_track': 'internal',
+                  'ios_release_type': 'manual',
+                  'auto_submit': False,
+                  'status': 'draft',
+              },
+          )
+          release.source_branch = 'staging'
+          release.source_commit = SOURCE
+          release.android_track = 'internal'
+          release.ios_release_type = 'manual'
+          release.auto_submit = False
+          if release.status in {'failed', 'rejected'}:
+              release.status = 'draft'
+          release.save(update_fields=[
+              'source_branch', 'source_commit', 'android_track',
+              'ios_release_type', 'auto_submit', 'status', 'updated_at'
+          ])
 
-          capabilities = client.request('GET', f"/bundleIds/{bundle['id']}/bundleIdCapabilities").get('data', [])
-          push = next((item for item in capabilities if item.get('attributes', {}).get('capabilityType') == 'PUSH_NOTIFICATIONS'), None)
-          if not push:
-              body = {
-                  'data': {
-                      'type': 'bundleIdCapabilities',
-                      'attributes': {'capabilityType': 'PUSH_NOTIFICATIONS'},
-                      'relationships': {
-                          'bundleId': {'data': {'type': 'bundleIds', 'id': bundle['id']}}
-                      },
-                  }
-              }
-              push = client.request('POST', '/bundleIdCapabilities', data=json.dumps(body)).get('data')
+          queued = []
+          for platform, job_type, agent_platform in (
+              ('android', 'build_android', 'linux'),
+              ('ios', 'build_ios', 'macos'),
+          ):
+              build, _ = Build.objects.get_or_create(
+                  release=release,
+                  platform=platform,
+                  defaults={'status': 'queued', 'commit_sha': SOURCE},
+              )
+              if build.status != 'succeeded':
+                  build.status = 'queued'
+                  build.commit_sha = SOURCE
+                  build.agent = None
+                  build.started_at = None
+                  build.finished_at = None
+                  build.save(update_fields=[
+                      'status', 'commit_sha', 'agent', 'started_at',
+                      'finished_at', 'updated_at'
+                  ])
+              existing = Job.objects.filter(
+                  release=release,
+                  build=build,
+                  type=job_type,
+                  status__in=['queued', 'running', 'succeeded'],
+              ).order_by('-created_at').first()
+              if build.status == 'succeeded':
+                  job = existing
+              elif existing and existing.status in {'queued', 'running'}:
+                  job = existing
+              else:
+                  job = enqueue_job(
+                      job_type,
+                      app=app,
+                      release=release,
+                      build=build,
+                      agent=True,
+                      platform=agent_platform,
+                  )
+              queued.append({
+                  'platform': platform,
+                  'build_id': build.id,
+                  'build_status': build.status,
+                  'job_id': job.id if job else None,
+                  'job_status': job.status if job else None,
+              })
 
-          old = IOSProvisioningProfile.objects.filter(app=app).first()
-          if old:
-              if old.apple_profile_id:
-                  try:
-                      client.request('DELETE', f'/profiles/{old.apple_profile_id}')
-                  except IntegrationError as exc:
-                      if '404' not in str(exc):
-                          raise
-              old.delete()
-
-          profile = ensure_ios_app_store_profile(app)
-          creds = profile.get_credentials()
-          profile_b64 = creds.get('profile_content_base64', '')
-          if not profile_b64:
-              raise RuntimeError('Regenerated profile has no profile content.')
-
-          with tempfile.TemporaryDirectory(prefix='aplus-profile-check-') as tmp:
-              der = Path(tmp) / 'profile.mobileprovision'
-              der.write_bytes(base64.b64decode(profile_b64))
-              decoded = subprocess.run(
-                  ['openssl', 'smime', '-inform', 'der', '-verify', '-noverify', '-in', str(der)],
-                  check=True,
-                  capture_output=True,
-              ).stdout
-              plist = plistlib.loads(decoded)
-          entitlements = plist.get('Entitlements', {})
-          aps = entitlements.get('aps-environment')
-          if aps != 'production':
-              raise RuntimeError(f'Push-enabled profile missing production aps-environment: {aps!r}')
-
-          print('IOS_PUSH_READY=' + json.dumps({
-              'bundle_id': app.bundle_id,
-              'push_capability_id': push.get('id') if push else None,
-              'profile_id': profile.apple_profile_id,
-              'profile_uuid': profile.profile_uuid,
-              'profile_name': profile.profile_name,
-              'aps_environment': aps,
-              'expires_at': profile.expires_at,
-          }, default=str))
+          assert release.auto_submit is False
+          assert release.android_track == 'internal'
+          assert not Job.objects.filter(release=release, type='submit_apple').exists()
+          print('STAGING_BUILD_2=' + json.dumps({
+              'app_id': app.id,
+              'release_id': release.id,
+              'version': release.version_name,
+              'build_number': release.build_number,
+              'source_commit': release.source_commit,
+              'android_track': release.android_track,
+              'ios_release_type': release.ios_release_type,
+              'auto_submit': release.auto_submit,
+              'jobs': queued,
+          }))
           PY
           REMOTE
+      - name: Wake Linux and Mac build agents
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for workflow in cloud-linux.yml cloud-macos.yml; do
+            curl --fail-with-body -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPO/actions/workflows/$workflow/dispatches" \
+              -d '{"ref":"main"}'
+          done

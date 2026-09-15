@@ -1,4 +1,4 @@
-name: Monitor A+ Solution staging push release
+name: Deliver A+ Solution staging push build 2
 
 on:
   push:
@@ -9,72 +9,95 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  monitor:
+  deliver:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       HOST: ${{ secrets.HOST }}
       PASS: ${{ secrets.PASS }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Install SSH helper
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Read staging build 2 status
+      - name: Queue only safe completed staging uploads
+        id: queue
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'REMOTE'
+          output="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
           import json
-          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.models import MobileApp, Release, Job
+          from apps.publisher.tasks import enqueue_job
 
           app = MobileApp.objects.get(slug='a-plus-solution-staging')
           release = Release.objects.get(app=app, version_name='1.0.0', build_number=2)
-          builds = []
-          for b in release.builds.order_by('platform'):
-              builds.append({
-                  'id': b.id,
-                  'platform': b.platform,
-                  'status': b.status,
-                  'commit_sha': b.commit_sha,
-                  'artifact': b.artifact.name if b.artifact else '',
-                  'artifact_size': b.artifact_size,
-                  'checksum': bool(b.artifact_checksum),
-                  'external_build_id': b.external_build_id,
-              })
-          jobs = []
-          for j in Job.objects.filter(release=release).order_by('id'):
-              jobs.append({
-                  'id': j.id,
-                  'type': j.type,
-                  'status': j.status,
-                  'progress': j.progress,
-                  'required_platform': j.required_platform,
-                  'error': j.error[-1200:] if j.error else '',
-                  'logs_tail': j.logs[-1800:] if j.logs else '',
-              })
-          submissions = list(Submission.objects.filter(release=release).values('platform','state','external_id','submitted_at','last_error'))
-          assert app.package_name == 'de.aplussolution.staging'
-          assert app.bundle_id == 'de.aplussolution.staging'
-          assert release.android_track == 'internal'
+          assert app.package_name == 'de.aplussolution.staging', app.package_name
+          assert app.bundle_id == 'de.aplussolution.staging', app.bundle_id
+          assert release.android_track == 'internal', release.android_track
+          release.auto_submit = False
+          release.ios_release_type = 'manual'
+          release.save(update_fields=['auto_submit', 'ios_release_type', 'updated_at'])
+          assert not Job.objects.filter(release=release, type='submit_apple').exists()
+
+          result = {'android': 'not_ready', 'ios': 'not_ready', 'wake_mac': False}
+
+          android = release.builds.get(platform='android')
+          if android.status == 'succeeded' and android.artifact:
+              existing = Job.objects.filter(
+                  release=release, build=android, type='upload_google',
+                  status__in=['queued', 'running', 'succeeded'],
+              ).order_by('-created_at').first()
+              if existing:
+                  result['android'] = f'existing:{existing.id}:{existing.status}'
+              else:
+                  job = enqueue_job('upload_google', app=app, release=release, build=android)
+                  result['android'] = f'queued:{job.id}'
+
+          ios = release.builds.get(platform='ios')
+          if ios.status == 'succeeded' and ios.artifact:
+              existing = Job.objects.filter(
+                  release=release, build=ios, type='upload_apple',
+                  status__in=['queued', 'running', 'succeeded'],
+              ).order_by('-created_at').first()
+              if existing:
+                  result['ios'] = f'existing:{existing.id}:{existing.status}'
+                  result['wake_mac'] = existing.status in {'queued', 'running'}
+              else:
+                  job = enqueue_job(
+                      'upload_apple', app=app, release=release, build=ios,
+                      agent=True, platform='macos'
+                  )
+                  result['ios'] = f'queued:{job.id}'
+                  result['wake_mac'] = True
+
           assert release.auto_submit is False
           assert not Job.objects.filter(release=release, type='submit_apple').exists()
-          print('STAGING_BUILD_2_STATUS=' + json.dumps({
-              'release_id': release.id,
-              'release_status': release.status,
-              'source_commit': release.source_commit,
-              'android_track': release.android_track,
-              'ios_release_type': release.ios_release_type,
-              'auto_submit': release.auto_submit,
-              'builds': builds,
-              'jobs': jobs,
-              'submissions': submissions,
-          }, default=str))
+          print('DELIVERY=' + json.dumps(result))
           PY
           REMOTE
+          )"
+          printf '%s\n' "$output"
+          delivery="$(printf '%s\n' "$output" | sed -n 's/^DELIVERY=//p' | tail -n1)"
+          test -n "$delivery"
+          wake_mac="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["wake_mac"] else "0")' "$delivery")"
+          echo "wake_mac=$wake_mac" >> "$GITHUB_OUTPUT"
+      - name: Wake Mac uploader when needed
+        if: steps.queue.outputs.wake_mac == '1'
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/actions/workflows/cloud-macos.yml/dispatches" \
+            -d '{"ref":"main"}'

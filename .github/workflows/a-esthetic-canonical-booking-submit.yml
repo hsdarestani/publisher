@@ -1,4 +1,4 @@
-name: Build and submit latest A+ Esthetic update
+name: Build and submit latest A+ Esthetic icon update
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 88cab229fca125bfa0e253e438f6ec1fe50eb558
+      SOURCE_COMMIT: 70d993b2cdd75184fc95afe4164e1eedef7d6844
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -32,13 +32,46 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           PY_CODE=$(cat <<'PY'
-          import os, re
+          import hashlib, io, os, re, requests
+          from PIL import Image
+          from django.core.files.base import ContentFile
           from django.db.models import Max
-          from apps.publisher.models import MobileApp, Release, Build
+          from apps.publisher.models import AppAsset, MobileApp, Release, Build
           from apps.publisher.tasks import enqueue_job
 
           source_commit=os.environ['SOURCE_COMMIT']
           app=MobileApp.objects.get(slug='a-esthetic')
+
+          # Keep Publisher's Google Play listing icon in sync with the exact
+          # iconesth.png committed in the app repository. Google Play requires
+          # a 512x512 listing icon, so normalize it here without changing the
+          # launcher artwork used by the native builds.
+          icon_url=f'https://raw.githubusercontent.com/hsdarestani/a_esthetic/{source_commit}/iconesth.png'
+          response=requests.get(icon_url,timeout=30)
+          response.raise_for_status()
+          image=Image.open(io.BytesIO(response.content)).convert('RGB')
+          if image.size != (512,512):
+              image=image.resize((512,512),Image.Resampling.LANCZOS)
+          output=io.BytesIO()
+          image.save(output,format='PNG',optimize=True)
+          icon_bytes=output.getvalue()
+          icon_checksum=hashlib.sha256(icon_bytes).hexdigest()
+          icon,_=AppAsset.objects.get_or_create(
+              app=app,kind='icon',platform='shared',locale='de-DE',
+              defaults={'device_type':'','sort_order':0,'width':512,'height':512},
+          )
+          if icon.checksum != icon_checksum or not icon.file:
+              icon.file.save('a-esthetic-icon-512.png',ContentFile(icon_bytes),save=False)
+              icon.device_type=''
+              icon.sort_order=0
+              icon.width=512
+              icon.height=512
+              icon.checksum=icon_checksum
+              icon.save()
+              print(f'ICON_UPDATED checksum={icon_checksum}')
+          else:
+              print(f'ICON_CURRENT checksum={icon_checksum}')
+
           release=Release.objects.filter(app=app,source_commit=source_commit).order_by('-created_at').first()
           if not release:
               patches=[]
@@ -47,11 +80,7 @@ jobs:
                   if m: patches.append(int(m.group(1)))
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
-              notes=(
-                  'Verbessert Banner mit Coverbildern und lesbarer Darstellung, Datei-Uploads und Ladeanzeigen. '
-                  'Der obere Abstand in der Patienten-App wurde korrigiert. '
-                  'Die Anmeldung bleibt länger erhalten und Verbindungsfehler führen nicht mehr zu unnötigen Abmeldungen.'
-              )
+              notes='Das App-Symbol wurde mit dem neuen A+ Esthetic Design aktualisiert.'
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',
                   source_branch='main',source_commit=source_commit,android_track='production',

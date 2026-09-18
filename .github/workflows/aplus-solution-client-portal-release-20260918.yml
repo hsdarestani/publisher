@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '5c336a188d50d08a5cf8790da7f9b5fac45df7c9'
+  APLUS_COMMIT: '7b55be646b638b4f58b51d3eec9ab79f16ebca1a'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -79,11 +79,12 @@ jobs:
           app.review_notes = (
               'A+ Solution is the workforce application used by A+ Solution GmbH for scheduling, time tracking, OpenShifts, documents, notifications and customer coordination. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
-              'This release improves the mobile customer portal, including customer documents, personnel requests, shift notes and customer requests for shift time/date changes or cancellation with administrator approval. '
-              'It also keeps scoped read-only customer access restricted to the permitted location. There are no in-app purchases.'
+              'This release includes the latest mobile scheduling and time-tracking updates: smooth contiguous week swiping, compact employee/service labels, improved daily hour totals, '
+              'manual post-shift time reporting with employee confirmation and administrator approval/editing, attendance PDF reporting, reminder notifications, and mobile attendance layout fixes. '
+              'It also keeps the current A+ Solution app icon and existing customer-portal improvements. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
-          notes = 'Kundenportal verbessert: Dokumente und Personalanfragen, Schichtnotizen sowie Änderungs- und Stornierungsanfragen mit Freigabe durch die Disposition.'
+          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung: flüssiger Wochenwechsel, Arbeitszeitmeldung und Freigabe, Stunden-PDF, Erinnerungen und Layout-Korrekturen.'
           loc = app.localizations.filter(locale='de-DE').first()
           if loc:
               loc.release_notes = notes
@@ -185,7 +186,7 @@ jobs:
           VERSION: ${{ steps.prepare.outputs.version }}
           BUILD: ${{ steps.prepare.outputs.build }}
         run: |
-          body=$(printf 'A+ Solution client portal release is running.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Android AAB: **building**\n- iOS IPA: **building**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          body=$(printf 'A+ Solution latest mobile release is running.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Android AAB: **building**\n- iOS IPA: **building**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null
 
       - name: Wake Android and iOS Publisher builders
@@ -348,7 +349,7 @@ jobs:
           VERSION: ${{ steps.prepare.outputs.version }}
           BUILD: ${{ steps.prepare.outputs.build }}
         run: |
-          body=$(printf '✅ A+ Solution client portal release was built by Publisher and submitted to both stores.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Google Play production: **submitted**\n- App Store Connect: **submitted for review**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          body=$(printf '✅ A+ Solution latest mobile release was built by Publisher and submitted to both stores.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Google Play production: **submitted**\n- App Store Connect: **submitted for review**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "$VERSION" "$BUILD" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=closed >/dev/null
 
       - name: Publish failure status
@@ -358,5 +359,5 @@ jobs:
           VERSION: ${{ steps.prepare.outputs.version }}
           BUILD: ${{ steps.prepare.outputs.build }}
         run: |
-          body=$(printf '❌ A+ Solution client portal release hit a blocker.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "${VERSION:-pending}" "${BUILD:-pending}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          body=$(printf '❌ A+ Solution latest mobile release hit a blocker.\n\n- Source commit: `%s`\n- Version: **%s**\n- Build: **%s**\n- Workflow: %s/%s/actions/runs/%s\n' "$APLUS_COMMIT" "${VERSION:-pending}" "${BUILD:-pending}" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null

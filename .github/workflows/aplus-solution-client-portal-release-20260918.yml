@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'a4bc4a1caa39c671f3caa44f08ee46bff932d488'
+  APLUS_COMMIT: '2628a632a404dd2f4dadc7aa89625f15984364ea'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -94,10 +94,10 @@ jobs:
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'This release includes the latest mobile scheduling and time-tracking updates: smooth contiguous week swiping, compact employee/service labels, improved daily hour totals, '
               'manual post-shift time reporting with employee confirmation and administrator approval/editing, attendance PDF reporting, reminder notifications, and mobile attendance layout fixes. '
-              'It also adds the new premium animated A+ Solution launch intro, improves resume/session recovery after the app has been left in the background, prevents the legacy schedule from appearing after transient network failures, normalizes the native app icon, and fixes the Android Arbeitszeit-PDF screen so legacy schedule PDF back-button styling cannot create a duplicate green back bar. There are no in-app purchases.'
+              'It also uses the newly approved transparent A+ Solution icon artwork, normalized for both Android and iOS without a white outer frame, and keeps the current animated launch intro. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
-          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung: stabileres Wiederaufnehmen nach Hintergrundbetrieb, korrigierte Dienstplan-Anzeige, optimiertes App-Icon und korrigierte Arbeitszeit-PDF-Darstellung auf Android.'
+          notes = 'Aktualisierte A+ Solution App mit korrigiertem App-Icon ohne weißen Rand sowie den aktuellen Dienstplan-, Zeiterfassungs- und App-Start-Verbesserungen.'
           loc = app.localizations.filter(locale='de-DE').first()
           if loc:
               loc.release_notes = notes

@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '2628a632a404dd2f4dadc7aa89625f15984364ea'
+  APLUS_COMMIT: '0f5cd325155853c7636fac146a863e358de2a4e7'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -94,10 +94,10 @@ jobs:
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'This release includes the latest mobile scheduling and time-tracking updates: smooth contiguous week swiping, compact employee/service labels, improved daily hour totals, '
               'manual post-shift time reporting with employee confirmation and administrator approval/editing, attendance PDF reporting, reminder notifications, and mobile attendance layout fixes. '
-              'It also uses the newly approved transparent A+ Solution icon artwork, normalized for both Android and iOS without a white outer frame, and keeps the current animated launch intro. There are no in-app purchases.'
+              'It also includes the corrected native-safe A+ Solution launch animation with an unobstructed logo, safe spacing and edge-only ribbon effects, while keeping the approved app icon. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
-          notes = 'Aktualisierte A+ Solution App mit korrigiertem App-Icon ohne weißen Rand sowie den aktuellen Dienstplan-, Zeiterfassungs- und App-Start-Verbesserungen.'
+          notes = 'Korrigierter nativer App-Start mit sauberem A+ Solution Logo, sicheren Abständen und dezenten Randanimationen; außerdem aktuelles App-Icon sowie Dienstplan- und Zeiterfassungsverbesserungen.'
           loc = app.localizations.filter(locale='de-DE').first()
           if loc:
               loc.release_notes = notes

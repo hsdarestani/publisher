@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: '8d8886d8aeb54dd15973b618b122afb58c957310'
+  APLUS_COMMIT: 'a4bc4a1caa39c671f3caa44f08ee46bff932d488'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -33,8 +33,21 @@ jobs:
           set -euo pipefail
           HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | jq -r '.commit.sha')"
           test "$HEAD" = "$APLUS_COMMIT"
-          RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
-          printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null
+          VERIFIED=0
+          for i in $(seq 1 80); do
+            RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null; then
+              VERIFIED=1
+              break
+            fi
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled"))' >/dev/null; then
+              echo "A+ Solution deploy failed for $APLUS_COMMIT" >&2
+              exit 1
+            fi
+            echo "Waiting for A+ Solution production deploy ($i/80)…"
+            sleep 15
+          done
+          test "$VERIFIED" = "1"
           curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
           echo "Verified deployed source commit: $APLUS_COMMIT"
 
@@ -81,10 +94,10 @@ jobs:
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'This release includes the latest mobile scheduling and time-tracking updates: smooth contiguous week swiping, compact employee/service labels, improved daily hour totals, '
               'manual post-shift time reporting with employee confirmation and administrator approval/editing, attendance PDF reporting, reminder notifications, and mobile attendance layout fixes. '
-              'It also adds the new premium animated A+ Solution launch intro, improves resume/session recovery after the app has been left in the background, prevents the legacy schedule from appearing after transient network failures, and normalizes the native app icon to remove accidental white framing. There are no in-app purchases.'
+              'It also adds the new premium animated A+ Solution launch intro, improves resume/session recovery after the app has been left in the background, prevents the legacy schedule from appearing after transient network failures, normalizes the native app icon, and fixes the Android Arbeitszeit-PDF screen so legacy schedule PDF back-button styling cannot create a duplicate green back bar. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
-          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung sowie neuer animierter A+ Solution App-Start: stabileres Wiederaufnehmen nach Hintergrundbetrieb, korrigierte Dienstplan-Anzeige und optimiertes App-Icon ohne weißen Rand.'
+          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung: stabileres Wiederaufnehmen nach Hintergrundbetrieb, korrigierte Dienstplan-Anzeige, optimiertes App-Icon und korrigierte Arbeitszeit-PDF-Darstellung auf Android.'
           loc = app.localizations.filter(locale='de-DE').first()
           if loc:
               loc.release_notes = notes

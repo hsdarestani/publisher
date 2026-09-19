@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'e4d83a5578e6c62267c0d66df7c49053739588ed'
+  APLUS_COMMIT: '8d8886d8aeb54dd15973b618b122afb58c957310'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -81,10 +81,10 @@ jobs:
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'This release includes the latest mobile scheduling and time-tracking updates: smooth contiguous week swiping, compact employee/service labels, improved daily hour totals, '
               'manual post-shift time reporting with employee confirmation and administrator approval/editing, attendance PDF reporting, reminder notifications, and mobile attendance layout fixes. '
-              'It also adds the new premium animated A+ Solution launch intro while keeping the current app icon and existing customer-portal improvements. There are no in-app purchases.'
+              'It also adds the new premium animated A+ Solution launch intro, improves resume/session recovery after the app has been left in the background, prevents the legacy schedule from appearing after transient network failures, and normalizes the native app icon to remove accidental white framing. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
-          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung sowie neuer animierter A+ Solution App-Start: flüssiger Wochenwechsel, Arbeitszeitmeldung und Freigabe, Stunden-PDF, Erinnerungen und Layout-Korrekturen.'
+          notes = 'Aktualisierte mobile Dienstplanung und Zeiterfassung sowie neuer animierter A+ Solution App-Start: stabileres Wiederaufnehmen nach Hintergrundbetrieb, korrigierte Dienstplan-Anzeige und optimiertes App-Icon ohne weißen Rand.'
           loc = app.localizations.filter(locale='de-DE').first()
           if loc:
               loc.release_notes = notes

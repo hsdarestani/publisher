@@ -135,8 +135,8 @@ jobs:
           }, separators=(',',':')))
           PY
           )"
-          printf '%s\\n' "$OUT"
-          META="$(printf '%s\\n' "$OUT" | sed -n 's/^BUILD_META_JSON=//p' | tail -n 1)"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^BUILD_META_JSON=//p' | tail -n 1)"
           test -n "$META"
           echo "release_id=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['release_id'])")" >> "$GITHUB_OUTPUT"
           echo "version=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")" >> "$GITHUB_OUTPUT"
@@ -179,7 +179,7 @@ jobs:
           print('|'.join(values))
           PY
             )"
-            STATE="$(printf '%s\\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
             echo "Native build state: $STATE"
             if [[ "$STATE" == *":failed:"* ]]; then
               echo "$STATE" >&2

@@ -1,0 +1,176 @@
+name: A+ Solution Splash Rollback Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-splash-rollback-build-20260920.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APLUS_COMMIT: '6e567d2032a89b910541ec7bcad816172d99839b'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify source commit is still current
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | python3 -c "import json,sys; print(json.load(sys.stdin)['commit']['sha'])")"
+          test "$HEAD" = "$APLUS_COMMIT"
+          echo "Building exact A+ Solution commit: $APLUS_COMMIT"
+
+      - name: Queue Android and iOS builds in Publisher
+        id: queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          cfg = dict(app.build_config or {})
+          cfg['android_command'] = 'bash frontend/scripts/build-publisher-android.sh'
+          cfg['android_artifact'] = 'frontend/android/app/build/outputs/bundle/release/*.aab'
+          cfg['ios_command'] = 'bash frontend/scripts/build-publisher-ios-opaque.sh'
+          cfg['ios_artifact'] = 'frontend/ios/build/export/*.ipa'
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          cfg['env'] = env
+          app.build_config = cfg
+          app.save(update_fields=['build_config','updated_at'])
+
+          previous = Release.objects.filter(app=app).order_by('-build_number').first()
+          version_name = previous.version_name if previous else '1.0.0'
+          build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=0) + 1
+
+          release = Release.objects.create(
+              app=app,
+              version_name=version_name,
+              build_number=build_number,
+              status='building',
+              source_branch='main',
+              source_commit=os.environ['APLUS_COMMIT'],
+              android_track='internal',
+              android_rollout=1,
+              ios_release_type='manual',
+              auto_submit=False,
+              release_notes='Restores the previous A+ Solution launch splash. Build only; no store submission.'
+          )
+
+          queued = []
+          for platform, job_type, runner in [
+              ('android','build_android','linux'),
+              ('ios','build_ios','macos'),
+          ]:
+              build = Build.objects.create(release=release, platform=platform, status='queued')
+              job = enqueue_job(
+                  job_type,
+                  app=app,
+                  release=release,
+                  build=build,
+                  payload={'source':'splash-rollback-build-only'},
+                  agent=True,
+                  platform=runner,
+              )
+              queued.append(str(job.id))
+
+          print('BUILD_META_JSON='+json.dumps({
+              'release_id': str(release.id),
+              'version': version_name,
+              'build': build_number,
+              'jobs': queued,
+          }, separators=(',',':')))
+          PY
+          )"
+          printf '%s
+' "$OUT"
+          META="$(printf '%s
+' "$OUT" | sed -n 's/^BUILD_META_JSON=//p' | tail -n 1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['release_id'])")" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['build'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Wake Android and iOS builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }
+
+      - name: Wait for signed AAB and IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.queue.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
+          import os, re
+          from apps.publisher.models import Build, Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          values = []
+          for platform, job_type in [('android','build_android'),('ios','build_ios')]:
+              b = Build.objects.get(release=r, platform=platform)
+              failed = Job.objects.filter(build=b, type=job_type, status='failed').order_by('-created_at').first()
+              err = re.sub(r'\s+', ' ', str(failed.error or '')).replace('|','/')[:300] if failed else ''
+              values.append(':'.join([platform, b.status, 'artifact' if b.artifact else '', err]))
+          print('|'.join(values))
+          PY
+            )"
+            STATE="$(printf '%s
+' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Native build state: $STATE"
+            if [[ "$STATE" == *":failed:"* ]]; then
+              echo "$STATE" >&2
+              exit 1
+            fi
+            if [[ "$STATE" == android:succeeded:artifact:*"|"ios:succeeded:artifact:* ]]; then
+              echo "Both build artifacts are ready."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for builds." >&2
+          exit 1
+
+      - name: Confirm build-only completion
+        run: |
+          echo "A+ Solution build-only release completed."
+          echo "Source: $APLUS_COMMIT"
+          echo "Version: ${{ steps.queue.outputs.version }}"
+          echo "Build: ${{ steps.queue.outputs.build }}"
+          echo "No Google Play or App Store submission was queued."

@@ -11,6 +11,7 @@ permissions:
   contents: read
   actions: write
   issues: write
+  id-token: write
 
 env:
   APLUS_COMMIT: '91609fc22c010a71b41f917a30f459e41f72e81a'
@@ -51,7 +52,7 @@ jobs:
           curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
           echo "Exact production commit is live and healthy: $APLUS_COMMIT"
 
-      - name: Validate App Review login on production
+      - name: Verify or repair App Review login on production
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -60,29 +61,78 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          REVIEW_SECRET_B64="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); assert a.review_username=='store-review@aplus-solution.de'; p=a.get_review_password(); assert p; print(base64.b64encode(p.encode()).decode())\"" \
-            | tail -n 1 | tr -d '\r')"
-          test -n "$REVIEW_SECRET_B64"
-          echo "::add-mask::$REVIEW_SECRET_B64"
-          REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
-          echo "::add-mask::$REVIEW_PASSWORD"
-          export REVIEW_PASSWORD
-          CODE="$(python3 - <<'PY' | curl -sS -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://app.aplus-solution.de/api/auth/login/
+
+          read_publisher_password() {
+            sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); assert a.review_username=='store-review@aplus-solution.de'; p=a.get_review_password(); assert p; print(base64.b64encode(p.encode()).decode())\"" \
+              | tail -n 1 | tr -d '\r'
+          }
+
+          verify_login() {
+            export REVIEW_PASSWORD="$1"
+            CODE="$(python3 - <<'PY' | curl -sS --retry 3 --retry-all-errors --retry-delay 2 -o /tmp/login.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://app.aplus-solution.de/api/auth/login/
           import json, os
           print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
           PY
-          )"
-          test "$CODE" = '200'
-          python3 - <<'PY'
+            )"
+            [ "$CODE" = '200' ] || return 1
+            python3 - <<'PY'
           import json
           data=json.load(open('/tmp/login.json'))
           user=data.get('user') or {}
           assert data.get('access') and data.get('refresh')
           assert user.get('email') == 'store-review@aplus-solution.de'
           assert user.get('role') == 'worker'
-          print('reviewer_login=verified')
           PY
+          }
+
+          REVIEW_SECRET_B64="$(read_publisher_password)"
+          test -n "$REVIEW_SECRET_B64"
+          echo "::add-mask::$REVIEW_SECRET_B64"
+          REVIEW_PASSWORD="$(printf '%s' "$REVIEW_SECRET_B64" | base64 -d)"
+          echo "::add-mask::$REVIEW_PASSWORD"
+
+          if verify_login "$REVIEW_PASSWORD"; then
+            echo 'reviewer_login=verified'
+            exit 0
+          fi
+
+          echo 'Stored App Review credential is stale; rotating and synchronizing it now.'
+          REVIEW_PASSWORD="$(openssl rand -base64 48 | tr -d '\n/+=' | head -c 36)"
+          test "${#REVIEW_PASSWORD}" -ge 30
+          echo "::add-mask::$REVIEW_PASSWORD"
+          REVIEW_B64="$(printf '%s' "$REVIEW_PASSWORD" | base64 -w0)"
+          echo "::add-mask::$REVIEW_B64"
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e REVIEW_B64='$REVIEW_B64' web python manage.py shell -c \"import base64,os; from apps.publisher.models import MobileApp; p=base64.b64decode(os.environ['REVIEW_B64']).decode(); a=MobileApp.objects.get(slug='a-plus-solution'); a.requires_login=True; a.review_username='store-review@aplus-solution.de'; a.set_review_password(p); a.save(update_fields=['requires_login','review_username','review_password_blob','updated_at']); assert a.get_review_password()==p; print('publisher_review_credential=rotated')\""
+
+          OIDC_JSON="$(curl --fail --silent --show-error \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=aplus-store-review-sync")"
+          export OIDC_JSON
+          OIDC_TOKEN="$(python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ['OIDC_JSON'])['value'])
+          PY
+          )"
+          test -n "$OIDC_TOKEN"
+          echo "::add-mask::$OIDC_TOKEN"
+          export REVIEW_PASSWORD
+
+          SYNC_CODE="$(python3 - <<'PY' | curl -sS -o /tmp/review-sync.json -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            --data-binary @- https://app.aplus-solution.de/api/auth/store-review/sync/
+          import json, os
+          print(json.dumps({'password': os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          echo "review_credential_sync_http=$SYNC_CODE"
+          test "$SYNC_CODE" = '200'
+
+          verify_login "$REVIEW_PASSWORD"
+          echo 'reviewer_login=repaired_and_verified'
 
       - name: Prepare next release and queue Android + iOS builds
         id: prepare

@@ -31,6 +31,7 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
           import json
+          from apps.integrations.google_play import GooglePlayClient
           from apps.publisher.models import Job, Release, Submission
 
           rows=[]
@@ -54,5 +55,20 @@ jobs:
                   'jobs':jobs,
                   'submissions':subs,
               })
-          print('STATUS_JSON='+json.dumps(rows,separators=(',',':')))
+          app = Release.objects.filter(app__slug='a-plus-solution').first().app
+          gp = GooglePlayClient(app.google_account)
+          edit = None
+          google = {'production_version_codes': [], 'tracks': []}
+          try:
+              edit = gp._open_edit(app.package_name)
+              tracks = gp._edit_request(edit,'GET',f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}/tracks').get('tracks',[])
+              google['tracks'] = tracks
+              for track in tracks:
+                  if track.get('track') == 'production':
+                      for rel in track.get('releases') or []:
+                          google['production_version_codes'].extend([str(x) for x in (rel.get('versionCodes') or [])])
+          finally:
+              if edit:
+                  gp._safe_delete_edit(edit)
+          print('STATUS_JSON='+json.dumps({'releases':rows,'google':google},separators=(',',':')))
           PY

@@ -13,7 +13,7 @@ permissions:
   issues: write
 
 env:
-  APLUS_COMMIT: 'c15c3186b67c90035850ead2d75de3fd800990ae'
+  APLUS_COMMIT: '91609fc22c010a71b41f917a30f459e41f72e81a'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -27,31 +27,29 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass jq >/dev/null
 
-      - name: Wait for exact A+ production deployment
+      - name: Verify exact A+ production deployment
         shell: bash
         run: |
           set -euo pipefail
-          for i in $(seq 1 160); do
-            JSON="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/issues/84)"
-            STATE="$(printf '%s' "$JSON" | jq -r '.state')"
-            BODY="$(printf '%s' "$JSON" | jq -r '.body // ""')"
-            if printf '%s' "$BODY" | grep -Fq "Commit: $APLUS_COMMIT"; then
-              if printf '%s' "$BODY" | grep -Fq 'Overall: **failed**'; then
-                echo 'Exact production deployment failed.' >&2
-                printf '%s\n' "$BODY" >&2
-                exit 1
-              fi
-              if [ "$STATE" = 'closed' ] && printf '%s' "$BODY" | grep -Fq 'Overall: **success**'; then
-                curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
-                echo "Exact production commit is live: $APLUS_COMMIT"
-                exit 0
-              fi
+          HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | jq -r '.commit.sha')"
+          test "$HEAD" = "$APLUS_COMMIT"
+          VERIFIED=0
+          for i in $(seq 1 80); do
+            RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null; then
+              VERIFIED=1
+              break
             fi
-            echo "Waiting for production commit $APLUS_COMMIT ($i/160)..."
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled"))' >/dev/null; then
+              echo "A+ Solution deploy failed for $APLUS_COMMIT" >&2
+              exit 1
+            fi
+            echo "Waiting for deployed A+ source commit $APLUS_COMMIT ($i/80)..."
             sleep 15
           done
-          echo 'Timed out waiting for exact production deployment.' >&2
-          exit 1
+          test "$VERIFIED" = "1"
+          curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
+          echo "Exact production commit is live and healthy: $APLUS_COMMIT"
 
       - name: Validate App Review login on production
         env:
@@ -129,13 +127,15 @@ jobs:
               'availability, OpenShifts, time tracking, absences, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two-factor authentication. '
               'Its exact credential was verified against the public production login immediately before this submission. '
-              'This build fixes mobile Dienstplan date grouping and sticky day headers, improves profile-photo and no-photo avatar layout, '
-              'removes the global search from Team time tracking, and retains the updated app icon. There are no in-app purchases.'
+              'This build contains the latest production workforce updates: manual post-shift time entry for employees, administrator time entry/editing '
+              'with an admin-only audit log, imported WIW hours in attendance PDF output, German date and 24-hour time selection, '
+              'stable mobile Dienstplan week/avatar rendering after app resume, a fixed Gesamtstunden bar above navigation, and removal of the temporary '
+              'employee location clock-in UI. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Korrigierte Tageszuordnung und Sticky-Datumsleisten im mobilen Dienstplan, verbesserte Profilbilder/Fallbacks und aufgeräumte Team-Zeiterfassung.'
+              loc.release_notes='Verbesserte mobile Dienstplanung und Zeiterfassung: manuelle Arbeitszeiten nach Schichtende, Admin-Zeitbearbeitung mit Zeitlog, WIW-Stunden im PDF, deutsche 24-Stunden-Auswahl sowie stabilerer Dienstplan nach App-Rückkehr.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -191,7 +191,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Korrigierte Tageszuordnung und Sticky-Datumsleisten im mobilen Dienstplan, verbesserte Profilbilder/Fallbacks und aufgeräumte Team-Zeiterfassung.'
+          release.release_notes='Verbesserte mobile Dienstplanung und Zeiterfassung: manuelle Arbeitszeiten nach Schichtende, Admin-Zeitbearbeitung mit Zeitlog, WIW-Stunden im PDF, deutsche 24-Stunden-Auswahl sowie stabilerer Dienstplan nach App-Rückkehr.'
           release.save()
 
           queued=[]

@@ -61,7 +61,7 @@ jobs:
               print('active_or_succeeded=', active, succeeded)
           PY
 
-      - name: Wait for Google Play production build 48
+      - name: Wait for Google submit job
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -73,16 +73,40 @@ jobs:
           for i in $(seq 1 60); do
             STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
-          import json, re
-          from apps.integrations.google_play import GooglePlayClient
+          import re
           from apps.publisher.models import Job, Release
-
           r = Release.objects.get(id=103)
-          app = r.app
           j = Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first()
           status = j.status if j else 'missing'
-          err = re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:300] if j else ''
+          err = re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:500] if j else ''
+          print('|'.join([status,err]))
+          PY
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Google job state: $STATE"
+            IFS='|' read -r JST JERR <<< "$STATE"
+            if [ "$JST" = succeeded ]; then exit 0; fi
+            if [ "$JST" = failed ]; then echo "Google submit failed: $JERR" >&2; exit 1; fi
+            sleep 10
+          done
+          echo "Timed out waiting for Google submit job." >&2
+          exit 1
 
+      - name: Verify Google Play production build 48
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Release
+          r = Release.objects.get(id=103)
+          app = r.app
           gp = GooglePlayClient(app.google_account)
           edit = None
           codes = []
@@ -96,21 +120,6 @@ jobs:
           finally:
               if edit:
                   gp._safe_delete_edit(edit)
-          print('|'.join([status,err,','.join(codes)]))
+          print('production_codes=' + ','.join(codes))
+          assert '48' in codes, f'build 48 not present in production track: {codes}'
           PY
-            )"
-            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
-            echo "Google state: $STATE"
-            IFS='|' read -r JST JERR CODES <<< "$STATE"
-            if [[ ",$CODES," == *",48,"* ]]; then
-              echo "Google Play production now contains build 48."
-              exit 0
-            fi
-            if [ "$JST" = failed ]; then
-              echo "Google submit failed: $JERR" >&2
-              exit 1
-            fi
-            sleep 10
-          done
-          echo "Timed out waiting for Google Play production build 48." >&2
-          exit 1

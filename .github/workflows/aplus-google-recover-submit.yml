@@ -1,0 +1,116 @@
+name: A+ Google Play Recover Submit
+
+on:
+  push:
+    branches: [status-aplus-20260920]
+    paths:
+      - '.github/workflows/aplus-google-recover-submit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  recover-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Recover stale Google submit and requeue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.job_recovery import recover_stale_internal_jobs
+          from apps.publisher.models import Job, Release
+          from apps.publisher.tasks import enqueue_job
+
+          r = Release.objects.get(id=103)
+          app = r.app
+          android = r.builds.get(platform='android')
+          print('recovered=', recover_stale_internal_jobs(
+              app=app,
+              release=r,
+              job_types={'submit_google'},
+              stale_after_minutes=1,
+          ))
+          active = Job.objects.filter(
+              release=r,
+              type='submit_google',
+              status__in=['queued','running'],
+          ).exists()
+          succeeded = Job.objects.filter(
+              release=r,
+              type='submit_google',
+              status='succeeded',
+          ).exists()
+          if not active and not succeeded:
+              job = enqueue_job('submit_google', app=app, release=r, build=android)
+              print('queued_google=', job.id)
+          else:
+              print('active_or_succeeded=', active, succeeded)
+          PY
+
+      - name: Wait for Google Play production build 48
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 60); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json, re
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Job, Release
+
+          r = Release.objects.get(id=103)
+          app = r.app
+          j = Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first()
+          status = j.status if j else 'missing'
+          err = re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:300] if j else ''
+
+          gp = GooglePlayClient(app.google_account)
+          edit = None
+          codes = []
+          try:
+              edit = gp._open_edit(app.package_name)
+              tracks = gp._edit_request(edit,'GET',f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}/tracks').get('tracks',[])
+              for track in tracks:
+                  if track.get('track') == 'production':
+                      for rel in track.get('releases') or []:
+                          codes.extend([str(x) for x in (rel.get('versionCodes') or [])])
+          finally:
+              if edit:
+                  gp._safe_delete_edit(edit)
+          print('|'.join([status,err,','.join(codes)]))
+          PY
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n 1 | tr -d '\r')"
+            echo "Google state: $STATE"
+            IFS='|' read -r JST JERR CODES <<< "$STATE"
+            if [[ ",$CODES," == *",48,"* ]]; then
+              echo "Google Play production now contains build 48."
+              exit 0
+            fi
+            if [ "$JST" = failed ]; then
+              echo "Google submit failed: $JERR" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for Google Play production build 48." >&2
+          exit 1

@@ -62,40 +62,70 @@ jobs:
           app.build_config = cfg
           app.save(update_fields=['build_config','updated_at'])
 
-          previous = Release.objects.filter(app=app).order_by('-build_number').first()
-          version_name = previous.version_name if previous else '1.0.0'
-          build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=0) + 1
-
-          release = Release.objects.create(
+          release = Release.objects.filter(
               app=app,
-              version_name=version_name,
-              build_number=build_number,
-              status='building',
-              source_branch='main',
               source_commit=os.environ['APLUS_COMMIT'],
-              android_track='internal',
-              android_rollout=1,
-              ios_release_type='manual',
-              auto_submit=False,
-              release_notes='Restores the previous A+ Solution launch splash. Build only; no store submission.'
-          )
+          ).order_by('-build_number').first()
+
+          if release is None:
+              previous = Release.objects.filter(app=app).order_by('-build_number').first()
+              version_name = previous.version_name if previous else '1.0.0'
+              build_number = max(Release.objects.filter(app=app).values_list('build_number', flat=True), default=0) + 1
+              release = Release.objects.create(
+                  app=app,
+                  version_name=version_name,
+                  build_number=build_number,
+                  status='building',
+                  source_branch='main',
+                  source_commit=os.environ['APLUS_COMMIT'],
+                  android_track='internal',
+                  android_rollout=1,
+                  ios_release_type='manual',
+                  auto_submit=False,
+                  release_notes='Restores the previous A+ Solution launch splash. Build only; no store submission.'
+              )
+          else:
+              version_name = release.version_name
+              build_number = release.build_number
+              release.status = 'building'
+              release.auto_submit = False
+              release.save(update_fields=['status','auto_submit','updated_at'])
 
           queued = []
           for platform, job_type, runner in [
               ('android','build_android','linux'),
               ('ios','build_ios','macos'),
           ]:
-              build = Build.objects.create(release=release, platform=platform, status='queued')
-              job = enqueue_job(
-                  job_type,
-                  app=app,
-                  release=release,
+              build, _ = Build.objects.get_or_create(release=release, platform=platform)
+              active = Job.objects.filter(
                   build=build,
-                  payload={'source':'splash-rollback-build-only'},
-                  agent=True,
-                  platform=runner,
-              )
-              queued.append(str(job.id))
+                  type=job_type,
+                  status__in=['queued','running'],
+              ).exists()
+              if build.status == 'succeeded' and build.artifact:
+                  continue
+              if not active:
+                  build.status = 'queued'
+                  build.logs = ''
+                  build.finished_at = None
+                  build.external_build_id = ''
+                  build.metadata = {}
+                  if build.artifact:
+                      build.artifact.delete(save=False)
+                  build.artifact = ''
+                  build.artifact_size = 0
+                  build.artifact_checksum = ''
+                  build.save()
+                  job = enqueue_job(
+                      job_type,
+                      app=app,
+                      release=release,
+                      build=build,
+                      payload={'source':'splash-rollback-build-only'},
+                      agent=True,
+                      platform=runner,
+                  )
+                  queued.append(str(job.id))
 
           print('BUILD_META_JSON='+json.dumps({
               'release_id': str(release.id),

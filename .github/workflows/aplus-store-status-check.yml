@@ -1,0 +1,58 @@
+name: A+ Solution Store Status Check
+
+on:
+  push:
+    branches: [status-aplus-20260920]
+    paths:
+      - '.github/workflows/aplus-store-status-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Read Publisher store state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          import json
+          from apps.publisher.models import Job, Release, Submission
+
+          rows=[]
+          releases=Release.objects.filter(
+              app__slug='a-plus-solution',
+              source_commit='6e567d2032a89b910541ec7bcad816172d99839b',
+          ).order_by('build_number')
+          for r in releases:
+              builds={b.platform:{'status':b.status,'external_build_id':b.external_build_id or ''} for b in r.builds.all()}
+              jobs={}
+              for typ in ('submit_google','upload_apple','submit_apple'):
+                  j=Job.objects.filter(release=r,type=typ).order_by('-created_at').first()
+                  jobs[typ]=None if not j else {'status':j.status,'error':(j.error or '')[:500]}
+              subs={s.platform:{'state':s.state,'external_id':s.external_id or ''} for s in Submission.objects.filter(release=r)}
+              rows.append({
+                  'release_id':r.id,
+                  'version':r.version_name,
+                  'build':r.build_number,
+                  'status':r.status,
+                  'builds':builds,
+                  'jobs':jobs,
+                  'submissions':subs,
+              })
+          print('STATUS_JSON='+json.dumps(rows,separators=(',',':')))
+          PY

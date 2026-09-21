@@ -3,6 +3,9 @@ from __future__ import annotations
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
+from apps.integrations.apple_store import AppleStoreClient
+from apps.signing.services import ensure_android_signing, ensure_ios_signing
+
 from apps.compliance.models import ComplianceProfile
 from apps.compliance.services import _console_autofill
 from apps.publisher.models import Build, Job, MobileApp, AppLocalization, Release, StoreAccount
@@ -142,6 +145,27 @@ class Command(BaseCommand):
             defaults={"source_branch": "main", "android_track": "internal", "android_rollout": 1, "ios_release_type": "manual", "auto_submit": False, "release_notes": "Initial SchichtPro mobile release."},
         )
         return release
+
+    def _prepare_signing(self, app):
+        try:
+            credential = ensure_android_signing(app)
+            self.stdout.write(f"android_signing=ready sha256={credential.certificate_sha256}")
+        except Exception as exc:
+            self.stdout.write(self.style.WARNING(f"android_signing=blocked {exc}"))
+        if not app.apple_account or not app.apple_account.configured:
+            self.stdout.write(self.style.WARNING("ios_signing=blocked apple_account_missing"))
+            return
+        try:
+            client = AppleStoreClient(app.apple_account)
+            found = client.request("GET", f"/bundleIds?filter[identifier]={APP_ID}&limit=10").get("data", [])
+            if not found:
+                body = {"data": {"type": "bundleIds", "attributes": {"identifier": APP_ID, "name": "SchichtPro", "platform": "IOS"}}}
+                client.request("POST", "/bundleIds", data=__import__("json").dumps(body))
+                self.stdout.write("apple_bundle_id=registered")
+            profile = ensure_ios_signing(app)
+            self.stdout.write(self.style.SUCCESS(f"ios_signing=ready profile={profile.profile_name}"))
+        except Exception as exc:
+            self.stdout.write(self.style.WARNING(f"ios_signing=blocked {exc}"))
 
     def _queue_builds(self, app, release):
         for platform, required in (("android", "linux"), ("ios", "macos")):

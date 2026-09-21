@@ -33,6 +33,7 @@ class Command(BaseCommand):
             self._upsert_compliance(app)
             release = self._upsert_release(app, options["app_version"], options["build_number"])
         if options["queue"]:
+            self._prepare_signing(app)
             self._queue_builds(app, release)
         self._report(app, release)
 

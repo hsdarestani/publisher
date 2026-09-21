@@ -75,7 +75,7 @@ class Command(BaseCommand):
                     "android_artifact": "apps/mobile/artifacts/schichtpro-release.aab",
                     "ios_command": "bash apps/mobile/scripts/build-ios.sh",
                     "ios_artifact": "apps/mobile/artifacts/schichtpro.ipa",
-                    "env": {"EXPO_PUBLIC_API_URL": PUBLIC_URL},
+                    "env": {"EXPO_PUBLIC_API_URL": PUBLIC_URL, "IOS_TEAM_ID": (self._account("apple").apple_team_id if self._account("apple") else "")},
                 },
                 "tech_stack": ["Expo 53", "React Native", "Next.js", "PostgreSQL", "Android", "iOS"],
             },

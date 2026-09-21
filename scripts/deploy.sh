@@ -104,7 +104,7 @@ print("Configured administrator authentication verified.")
     else
       echo "Administrator secrets are not both configured; login verification skipped."
     fi
-    touch "$BOOTSTRAP_MARKER"
+    echo "Registering SchichtPro release configuration..."\n    docker compose exec -T web python manage.py bootstrap_schichtpro\n    touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
     echo "A+ Publisher is healthy."
     docker image prune -f >/dev/null 2>&1 || true

@@ -64,7 +64,7 @@ class Command(BaseCommand):
                 "content_rating": "4+ / Everyone",
                 "requires_login": True,
                 "review_notes": (
-                    "SchichtPro is a workforce scheduling and time-clock app. Use a Publisher-managed review account. "
+                    "The App Store listing is named Schicht Plus; the product and in-app brand are SchichtPro. SchichtPro is a workforce scheduling and time-clock app. Use a Publisher-managed review account. "
                     "Core flow: Schedule, OpenShifts, Time Clock, Requests, Inbox, Timesheets and Team. "
                     "Location is requested only when clocking in to validate the configured workplace."
                 ),

@@ -114,7 +114,7 @@ class Command(BaseCommand):
         profile.app_access = "restricted"
         profile.app_access_instructions = "Use the Publisher-managed App Review account; no purchase is required."
         profile.account_deletion = "support"
-        profile.account_deletion_url = f"{PUBLIC_URL}/support"
+        profile.account_deletion_url = f"{PUBLIC_URL}/account-deletion"
         profile.payment_handling = "none"
         profile.payment_details = "No purchases or subscriptions are sold inside the mobile app."
         profile.data_practices = {

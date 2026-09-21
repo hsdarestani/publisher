@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction\n\nfrom apps.integrations.apple_store import AppleStoreClient\nfrom apps.signing.services import ensure_android_signing, ensure_ios_signing
+from django.db import transaction
+
+from apps.integrations.apple_store import AppleStoreClient
+from apps.signing.services import ensure_android_signing, ensure_ios_signing
 
 from apps.compliance.models import ComplianceProfile
 from apps.compliance.services import _console_autofill

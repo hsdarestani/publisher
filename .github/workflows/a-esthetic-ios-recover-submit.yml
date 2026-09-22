@@ -1,0 +1,157 @@
+name: Recover and submit A+ Esthetic iOS v27
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-ios-recover-submit.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-ios-v27-recover-submit
+  cancel-in-progress: true
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      SOURCE_COMMIT: 58e325baa2005873617edb48d5ebc1902eeb8434
+    steps:
+      - name: Recover orphaned Esthetic iOS job
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import MobileApp, Release, BuildAgent, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('RELEASE_MISSING')
+
+          build=release.builds.get(platform='ios')
+          build_job=release.jobs.filter(type='build_ios').order_by('-pk').first()
+
+          if build_job and build_job.status=='running':
+              owned=BuildAgent.objects.filter(current_job_id=build_job.pk).exists()
+              if not owned:
+                  print(f'RECOVER_ORPHAN job={build_job.pk}')
+                  build_job.status='queued'
+                  build_job.progress=0
+                  build_job.started_at=None
+                  build_job.finished_at=None
+                  build_job.error=''
+                  build_job.append_log('Recovered orphaned iOS build job and returned it to the macOS FIFO queue.')
+                  build_job.save(update_fields=['status','progress','started_at','finished_at','error','updated_at'])
+                  build.status='queued'
+                  build.agent=None
+                  build.started_at=None
+                  build.finished_at=None
+                  build.save(update_fields=['status','agent','started_at','finished_at','updated_at'])
+
+          if build.status=='succeeded':
+              upload=release.jobs.filter(type='upload_apple').order_by('-pk').first()
+              if not upload or upload.status not in {'queued','running','succeeded'}:
+                  enqueue_job('upload_apple',app=app,release=release,build=build,agent=True,platform='macos')
+
+          if build.status=='succeeded' and build.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists():
+              sub=Submission.objects.filter(release=release,platform='ios').first()
+              submit=release.jobs.filter(type='submit_apple').order_by('-pk').first()
+              if not sub and (not submit or submit.status not in {'queued','running','succeeded'}):
+                  enqueue_job('submit_apple',app=app,release=release,build=build)
+
+          print(f'STATE release={release.version_name}/{release.build_number} build={build.status} external={build.external_build_id or ""} job={build_job.status if build_job else "none"}')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
+
+      - name: Wake macOS builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait until Apple review submission is registered
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 180); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+          build=release.builds.get(platform='ios')
+
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+
+          if build.status=='succeeded':
+              upload=latest('upload_apple')
+              if not upload or upload.status not in {'queued','running','succeeded'}:
+                  enqueue_job('upload_apple',app=app,release=release,build=build,agent=True,platform='macos')
+                  upload=latest('upload_apple')
+
+              if build.external_build_id and upload and upload.status=='succeeded':
+                  sub=Submission.objects.filter(release=release,platform='ios').first()
+                  submit=latest('submit_apple')
+                  if not sub and (not submit or submit.status not in {'queued','running','succeeded'}):
+                      enqueue_job('submit_apple',app=app,release=release,build=build)
+
+          sub=Submission.objects.filter(release=release,platform='ios').first()
+          bjob=latest('build_ios')
+          upload=latest('upload_apple')
+          submit=latest('submit_apple')
+          print(
+              f'STATE ios_build={build.status} external={build.external_build_id or ""} '
+              f'build_job={bjob.status if bjob else "none"} '
+              f'upload={upload.status if upload else "none"} '
+              f'submit={submit.status if submit else "none"} '
+              f'apple={sub.state if sub else "pending"}'
+          )
+          if sub and sub.state in {'in_review','approved','live'}:
+              print('DONE')
+          elif any(j and j.status=='failed' for j in (bjob,upload,submit)):
+              for j in (bjob,upload,submit):
+                  if j and j.status=='failed':
+                      print(f'FAILED {j.type}: {(j.error or "")[:1600]}')
+              print('HARD_FAIL')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
+            echo "$STATE"
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^HARD_FAIL$'; then exit 1; fi
+            sleep 30
+          done
+          exit 1

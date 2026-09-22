@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.utils import timezone
 
 from apps.integrations.apple_store import AppleStoreClient
 from apps.signing.services import ensure_android_signing, ensure_ios_signing
@@ -170,6 +173,8 @@ class Command(BaseCommand):
 
     def _queue_builds(self, app, release):
         for platform, required in (("android", "linux"), ("ios", "macos")):
+            stale = Job.objects.filter(build__release=release, type=f"build_{platform}", status="running", updated_at__lt=timezone.now() - timedelta(minutes=10))
+            stale.update(status="failed", error="Recovered after the cloud runner stopped reporting progress.", finished_at=timezone.now())
             if platform == "ios" and not app.apple_account:
                 self.stdout.write(self.style.WARNING("ios_build=blocked apple_account_missing"))
                 continue

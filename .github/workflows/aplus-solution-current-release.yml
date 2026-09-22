@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 env:
-  APLUS_COMMIT: '91609fc22c010a71b41f917a30f459e41f72e81a'
+  APLUS_COMMIT: 'aeba3af74f426f27756a6b708ed25cf05bd8cfe9'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -180,12 +180,13 @@ jobs:
               'This build contains the latest production workforce updates: manual post-shift time entry for employees, administrator time entry/editing '
               'with an admin-only audit log, imported WIW hours in attendance PDF output, German date and 24-hour time selection, '
               'stable mobile Dienstplan week/avatar rendering after app resume, a fixed Gesamtstunden bar above navigation, and removal of the temporary '
-              'employee location clock-in UI. There are no in-app purchases.'
+              'employee location clock-in UI. This release also prevents unexpected iOS WebView reloads from replaying the launch animation during use '
+              'and improves visibility of the mobile header logo without increasing header height. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Verbesserte mobile Dienstplanung und Zeiterfassung: manuelle Arbeitszeiten nach Schichtende, Admin-Zeitbearbeitung mit Zeitlog, WIW-Stunden im PDF, deutsche 24-Stunden-Auswahl sowie stabilerer Dienstplan nach App-Rückkehr.'
+              loc.release_notes='Stabilitätsupdate für iPhone und mobile Nutzung: unerwartete App-Neustarts bzw. erneute Startanimationen wurden verhindert; außerdem ist das Logo im mobilen Header besser sichtbar. Zusätzlich bleiben die aktuellen Dienstplan- und Zeiterfassungsverbesserungen enthalten.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)

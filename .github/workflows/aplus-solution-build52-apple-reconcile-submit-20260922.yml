@@ -1,0 +1,167 @@
+name: A+ Solution Build 52 Apple Reconcile Submit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build52-apple-reconcile-submit-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  RELEASE_ID: '109'
+  VERSION: '1.0.18'
+  BUILD: '52'
+  STATUS_ISSUE: '74'
+
+jobs:
+  reconcile-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+    steps:
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Wait for Publisher health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 30 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/ >/dev/null
+
+      - name: Reconcile accepted Apple build and queue review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -u
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 30); do
+            sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=15 -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY' && exit 0
+          import os
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Job,Release
+          from apps.publisher.tasks import enqueue_job
+
+          r=Release.objects.get(id=os.environ['RELEASE_ID'])
+          assert r.version_name=='1.0.18' and r.build_number==52
+          app=r.app
+          ios=r.builds.get(platform='ios')
+          client=AppleStoreClient(app.apple_account)
+          apple_app=client.find_app(app.bundle_id)
+
+          build=client.wait_for_build(apple_app['id'], str(r.build_number), timeout=2400, interval=20)
+          external_id=str(build['id'])
+          attrs=build.get('attributes') or {}
+          print('apple_build_id='+external_id)
+          print('apple_processing_state='+str(attrs.get('processingState')))
+          print('apple_uploaded_date='+str(attrs.get('uploadedDate')))
+
+          ios.external_build_id=external_id
+          meta=dict(ios.metadata or {})
+          meta['apple_build_id']=external_id
+          meta['apple_processing_state']=attrs.get('processingState')
+          meta['apple_reconciled_after_callback_401']=True
+          ios.metadata=meta
+          ios.save(update_fields=['external_build_id','metadata','updated_at'])
+
+          upload=Job.objects.filter(build=ios,type='upload_apple').order_by('-created_at').first()
+          if upload:
+              upload.status='succeeded'
+              upload.progress=100
+              upload.error=''
+              upload.finished_at=timezone.now()
+              result=dict(upload.result or {})
+              result.update({
+                  'external_build_id':external_id,
+                  'reconciled':True,
+                  'reason':'Apple upload succeeded; Publisher callback returned 401 after acceptance.',
+              })
+              upload.result=result
+              upload.save(update_fields=['status','progress','error','finished_at','result','updated_at'])
+              print('reconciled_upload_job='+str(upload.id))
+
+          if not Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).exists():
+              job=enqueue_job('submit_apple',app=app,release=r,build=ios)
+              print('queued_submit_apple='+str(job.id))
+          else:
+              print('apple_submit_already_present')
+          PY
+            echo "Publisher unavailable while reconciling Apple build ($i/30)."
+            sleep 10
+          done
+          exit 1
+
+      - name: Wait for Apple review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -u
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 180); do
+            RAW="$(sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=15 -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY' 2>&1
+          import os,re
+          from apps.publisher.models import Job,Release,Submission
+          r=Release.objects.get(id=os.environ['RELEASE_ID'])
+          a=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first()
+          ap=Submission.objects.filter(release=r,platform='ios').first()
+          gs=Submission.objects.filter(release=r,platform='android').first()
+          def err(j): return re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:500] if j else ''
+          print('|'.join([
+              g.status if g else 'missing',
+              gs.state if gs else '',
+              a.status if a else 'missing',
+              err(a),
+              ap.state if ap else '',
+              ap.external_id if ap else '',
+          ]))
+          PY
+            )"
+            RC=$?
+            if [ "$RC" -ne 0 ]; then
+              echo "Publisher temporarily unavailable while checking Apple submission ($i/180)."
+              sleep 15
+              continue
+            fi
+            STATE="$(printf '%s\n' "$RAW" | tail -n 1 | tr -d '\r')"
+            echo "Store state: $STATE"
+            IFS='|' read -r GST GS AST AERR AS AID <<< "$STATE"
+            if [ "$AST" = failed ]; then echo "Apple submit failed: $AERR" >&2; exit 1; fi
+            if [ "$GST" = succeeded ] && [ "$AST" = succeeded ] && [ -n "$GS" ] && [ -n "$AS" ]; then
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for Apple review submission." >&2
+          exit 1
+
+      - name: Publish final status
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(printf '✅ A+ Solution 1.0.18 (Build 52) was delivered to both stores.\n\n- Google Play production: **submitted successfully**\n- App Store Connect binary: **uploaded and processed successfully**\n- App Store review: **submitted successfully**\n- Apple upload reconciliation: **completed after post-upload callback token expiry**\n- Release ID: **109**\n- Workflow: %s/%s/actions/runs/%s\n\nFurther processing/review is controlled by Google and Apple.' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=closed >/dev/null
+
+      - name: Publish blocker
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body=$(printf '❌ A+ Solution 1.0.18 (Build 52) Apple reconciliation hit a blocker.\n\n- Google Play: already submitted successfully\n- Apple binary: uploaded successfully; reconciliation/review submission needs attention\n- Workflow: %s/%s/actions/runs/%s' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/$STATUS_ISSUE" -f body="$body" -f state=open >/dev/null

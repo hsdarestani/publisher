@@ -26,7 +26,7 @@ jobs:
           sudo apt-get install -y -qq sshpass
           PORT="${SSH_PORT:-22}"
           PY_CODE=$(cat <<'PY'
-          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.models import MobileApp, Release, Submission, BuildAgent
           SOURCE='58e325baa2005873617edb48d5ebc1902eeb8434'
           app=MobileApp.objects.get(slug='a-esthetic')
           release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()
@@ -39,9 +39,17 @@ jobs:
               print(f'JOB id={j.pk} type={j.type} status={j.status} progress={j.progress} error={(j.error or "")[:500]}')
           for s in Submission.objects.filter(release=release).order_by('platform'):
               print(f'SUBMISSION platform={s.platform} state={s.state} external={getattr(s,"external_id","") or ""}')
+          for a in BuildAgent.objects.filter(platform='macos').order_by('pk'):
+              j=a.current_job
+              if j:
+                  print(f'MAC_AGENT id={a.pk} job={j.pk} type={j.type} status={j.status} app={j.app.slug} release={j.release.version_name if j.release else ""}/{j.release.build_number if j.release else ""} progress={j.progress} started={j.started_at}')
+              else:
+                  print(f'MAC_AGENT id={a.pk} job=none')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
 
 # probe 2
+
+# probe 3 agent owner

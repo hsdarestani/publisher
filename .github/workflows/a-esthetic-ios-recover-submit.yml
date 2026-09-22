@@ -112,6 +112,20 @@ jobs:
           release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
           build=release.builds.get(platform='ios')
 
+          # A GitHub-hosted Mac runner can disappear between progress callbacks.
+          # If this exact Esthetic build job says running but no registered Mac
+          # agent owns it anymore, return it to the FIFO queue immediately.
+          bjob=release.jobs.filter(type='build_ios').order_by('-pk').first()
+          if bjob and bjob.status=='running':
+              from apps.publisher.models import BuildAgent
+              owned=BuildAgent.objects.filter(current_job_id=bjob.pk).exists()
+              if not owned:
+                  bjob.status='queued'; bjob.progress=0; bjob.started_at=None; bjob.finished_at=None; bjob.error=''
+                  bjob.save(update_fields=['status','progress','started_at','finished_at','error','updated_at'])
+                  build.status='queued'; build.agent=None; build.started_at=None; build.finished_at=None
+                  build.save(update_fields=['status','agent','started_at','finished_at','updated_at'])
+                  print(f'REQUEUED_ORPHAN build_job={bjob.pk}')
+
           def latest(kind):
               return release.jobs.filter(type=kind).order_by('-pk').first()
 

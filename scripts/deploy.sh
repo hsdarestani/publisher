@@ -107,7 +107,7 @@ print("Configured administrator authentication verified.")
     echo "Registering SchichtPro release configuration..."
     docker compose exec -T web python manage.py bootstrap_schichtpro
     docker compose exec -T web python manage.py provision_schichtpro_push
-    docker compose exec -T web python manage.py bootstrap_schichtpro --queue
+    docker compose exec -T web python manage.py bootstrap_schichtpro --queue --force-ios
     touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
     echo "A+ Publisher is healthy."

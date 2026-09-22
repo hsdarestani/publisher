@@ -6,6 +6,7 @@ import os
 
 import jwt
 from django.db import transaction
+from django.utils import timezone
 from jwt import PyJWKClient
 
 from .models import BuildAgent
@@ -45,6 +46,8 @@ def _recover_interrupted_job(agent, request) -> None:
         return
 
     job = agent.current_job
+    if job.status == "running" and job.updated_at >= timezone.now() - timezone.timedelta(minutes=10):
+        return
     if job.status != "running":
         agent.current_job = None
         return

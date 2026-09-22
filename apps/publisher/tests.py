@@ -87,7 +87,22 @@ class PublisherTests(TestCase):
 
     def test_agent_claim(self):
         agent, token = BuildAgent.create_with_token(name="linux-1", platform="linux")
-        job = Job.objects.create(
+        # Bootstrap migrations may leave historical queued jobs in the test DB.
+        # Isolate this assertion and verify agent work is claimed FIFO.
+        Job.objects.filter(
+            status="queued",
+            available_to_agents=True,
+            required_platform="linux",
+        ).update(status="failed")
+        older = Job.objects.create(
+            type="build_android",
+            app=self.app,
+            release=self.release,
+            build=self.release.builds.get(platform="android"),
+            available_to_agents=True,
+            required_platform="linux",
+        )
+        newer = Job.objects.create(
             type="build_android",
             app=self.app,
             release=self.release,
@@ -97,9 +112,11 @@ class PublisherTests(TestCase):
         )
         response = self.client.post(reverse("agent_claim"), HTTP_X_AGENT_TOKEN=token)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["job"]["id"], job.pk)
-        job.refresh_from_db()
-        self.assertEqual(job.status, "running")
+        self.assertEqual(response.json()["job"]["id"], older.pk)
+        older.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual(older.status, "running")
+        self.assertEqual(newer.status, "queued")
 
     @patch("apps.publisher.signals.wake_cloud_agent")
     def test_queued_agent_job_wakes_matching_cloud_runner(self, wake):

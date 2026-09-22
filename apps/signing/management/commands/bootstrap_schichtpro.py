@@ -26,6 +26,7 @@ class Command(BaseCommand):
         parser.add_argument("--app-version", default="1.0.0")
         parser.add_argument("--build-number", type=int, default=1)
         parser.add_argument("--queue", action="store_true")
+        parser.add_argument("--force-ios", action="store_true")
 
     def handle(self, *args, **options):
         if options["build_number"] < 1:
@@ -37,7 +38,7 @@ class Command(BaseCommand):
             release = self._upsert_release(app, options["app_version"], options["build_number"])
         if options["queue"]:
             self._prepare_signing(app)
-            self._queue_builds(app, release)
+            self._queue_builds(app, release, force_ios=options["force_ios"])
         self._report(app, release)
 
     @staticmethod
@@ -146,7 +147,7 @@ class Command(BaseCommand):
     def _upsert_release(app, version, build_number):
         release, _ = Release.objects.update_or_create(
             app=app, version_name=version, build_number=build_number,
-            defaults={"source_branch": "main", "android_track": "internal", "android_rollout": 1, "ios_release_type": "manual", "auto_submit": False, "release_notes": "Initial SchichtPro mobile release."},
+            defaults={"source_branch": "main", "android_track": "internal", "android_rollout": 1, "ios_release_type": "manual", "auto_submit": True, "release_notes": "Initial SchichtPro mobile release."},
         )
         return release
 
@@ -171,7 +172,10 @@ class Command(BaseCommand):
         except Exception as exc:
             self.stdout.write(self.style.WARNING(f"ios_signing=blocked {exc}"))
 
-    def _queue_builds(self, app, release):
+    def _queue_builds(self, app, release, force_ios=False):
+        if force_ios:
+            Job.objects.filter(build__release=release, type="build_ios", status__in=["queued", "running"]).update(status="failed", error="Superseded by forced SchichtPro iOS rebuild.", finished_at=timezone.now())
+            release.builds.filter(platform="ios").update(status="failed", finished_at=timezone.now())
         for platform, required in (("android", "linux"), ("ios", "macos")):
             stale = Job.objects.filter(build__release=release, type=f"build_{platform}", status="running", updated_at__lt=timezone.now() - timedelta(minutes=2))
             stale.update(status="failed", error="Recovered after the cloud runner stopped reporting progress.", finished_at=timezone.now())
@@ -179,7 +183,12 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING("ios_build=blocked apple_account_missing"))
                 continue
             build, _ = Build.objects.get_or_create(release=release, platform=platform)
-            if build.status == "succeeded" or Job.objects.filter(build=build, type=f"build_{platform}", status__in=["queued", "running"]).exists():
+            if build.status == "succeeded":
+                if release.auto_submit and platform == "android" and app.google_account and not Job.objects.filter(build=build, type="submit_google", status__in=["queued", "running", "succeeded"]).exists():
+                    Job.objects.create(type="submit_google", app=app, release=release, build=build, status="queued")
+                    self.stdout.write(self.style.SUCCESS("android_submission=queued"))
+                continue
+            if Job.objects.filter(build=build, type=f"build_{platform}", status__in=["queued", "running"]).exists():
                 continue
             build.status = "queued"; build.save(update_fields=["status", "updated_at"])
             Job.objects.create(type=f"build_{platform}", app=app, release=release, build=build, available_to_agents=True, required_platform=required)

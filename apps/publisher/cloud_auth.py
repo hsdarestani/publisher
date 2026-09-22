@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from datetime import timedelta
 
 import jwt
 from django.db import transaction
@@ -46,7 +47,7 @@ def _recover_interrupted_job(agent, request) -> None:
         return
 
     job = agent.current_job
-    if job.status == "running" and job.updated_at >= timezone.now() - timezone.timedelta(minutes=10):
+    if job.status == "running" and job.updated_at >= timezone.now() - timedelta(minutes=10):
         return
     if job.status != "running":
         agent.current_job = None

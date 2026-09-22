@@ -1,0 +1,208 @@
+name: Build and submit A+ Esthetic final v27 release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-v27-final-release.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-store-submit-v27
+  cancel-in-progress: true
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: production
+    env:
+      SOURCE_COMMIT: 58e325baa2005873617edb48d5ebc1902eeb8434
+    steps:
+      - name: Prepare Publisher release and queue native builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import hashlib, io, os, re, requests
+          from PIL import Image
+          from django.core.files.base import ContentFile
+          from django.db.models import Max
+          from apps.publisher.models import AppAsset, MobileApp, Release, Build
+          from apps.publisher.tasks import enqueue_job
+
+          source_commit=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+
+          # Keep Publisher's Google Play listing icon in sync with the exact
+          # iconesth.png committed in the app repository. Google Play requires
+          # a 512x512 listing icon, so normalize it here without changing the
+          # launcher artwork used by the native builds.
+          icon_url=f'https://raw.githubusercontent.com/hsdarestani/a_esthetic/{source_commit}/iconesth.png'
+          response=requests.get(icon_url,timeout=30)
+          response.raise_for_status()
+          image=Image.open(io.BytesIO(response.content)).convert('RGB')
+          if image.size != (512,512):
+              image=image.resize((512,512),Image.Resampling.LANCZOS)
+          output=io.BytesIO()
+          image.save(output,format='PNG',optimize=True)
+          icon_bytes=output.getvalue()
+          icon_checksum=hashlib.sha256(icon_bytes).hexdigest()
+          icon,_=AppAsset.objects.get_or_create(
+              app=app,kind='icon',platform='shared',locale='de-DE',
+              defaults={'device_type':'','sort_order':0,'width':512,'height':512},
+          )
+          if icon.checksum != icon_checksum or not icon.file:
+              icon.file.save('a-esthetic-icon-512.png',ContentFile(icon_bytes),save=False)
+              icon.device_type=''
+              icon.sort_order=0
+              icon.width=512
+              icon.height=512
+              icon.checksum=icon_checksum
+              icon.save()
+              print(f'ICON_UPDATED checksum={icon_checksum}')
+          else:
+              print(f'ICON_CURRENT checksum={icon_checksum}')
+
+          release=Release.objects.filter(app=app,source_commit=source_commit).order_by('-created_at').first()
+          if not release:
+              patches=[]
+              for value in Release.objects.filter(app=app).values_list('version_name',flat=True):
+                  m=re.fullmatch(r'1\.0\.(\d+)',value or '')
+                  if m: patches.append(int(m.group(1)))
+              version=f'1.0.{max(patches or [0])+1}'
+              build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
+              notes='Optimierte Darstellung der Behandlungen, überarbeitetes App-Design und verbesserte Startanimation.'
+              release=Release.objects.create(
+                  app=app,version_name=version,build_number=build,status='building',
+                  source_branch='main',source_commit=source_commit,android_track='production',
+                  android_rollout=1,ios_release_type='manual',auto_submit=True,release_notes=notes,
+              )
+              app.latest_commit_sha=source_commit
+              app.save(update_fields=['latest_commit_sha','updated_at'])
+              for loc in app.localizations.all():
+                  loc.release_notes=notes
+                  loc.save(update_fields=['release_notes','updated_at'])
+              print(f'RELEASE_CREATED id={release.pk} version={version} build={build}')
+          else:
+              print(f'RELEASE_REUSED id={release.pk} version={release.version_name} build={release.build_number}')
+
+          android,_=Build.objects.get_or_create(release=release,platform='android',defaults={'status':'queued','commit_sha':source_commit})
+          ios,_=Build.objects.get_or_create(release=release,platform='ios',defaults={'status':'queued','commit_sha':source_commit})
+
+          def latest_job(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def has_live(kind):
+              job=latest_job(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
+
+          if android.status not in {'succeeded','running'} and not has_live('build_android'):
+              android.status='queued'; android.commit_sha=source_commit; android.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_android',app=app,release=release,build=android,agent=True,platform='linux')
+          if ios.status not in {'succeeded','running'} and not has_live('build_ios'):
+              ios.status='queued'; ios.commit_sha=source_commit; ios.save(update_fields=['status','commit_sha','updated_at'])
+              enqueue_job('build_ios',app=app,release=release,build=ios,agent=True,platform='macos')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
+
+      - name: Wake Cloud Mac builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for builds, uploads and review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 150); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+          if not release: raise SystemExit('release_missing')
+          android=release.builds.get(platform='android')
+          ios=release.builds.get(platform='ios')
+
+          def latest_job(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def live(kind):
+              job=latest_job(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
+
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+
+          if android.status=='succeeded' and not g and not live('upload_google'):
+              enqueue_job('upload_google',app=app,release=release,build=android)
+          if ios.status=='succeeded' and not a and not live('upload_apple'):
+              enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
+          if ios.status=='succeeded' and ios.external_build_id and release.jobs.filter(type='upload_apple',status='succeeded').exists() and not a and not live('submit_apple'):
+              enqueue_job('submit_apple',app=app,release=release,build=ios)
+
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+          gs=g.state if g else 'pending'; aps=a.state if a else 'pending'
+          current=list(release.jobs.filter(status__in=['queued','running']).values_list('type','status'))
+
+          hard=[]
+          deferred_apple=False
+          deferred_google=False
+          for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
+              job=latest_job(kind)
+              if not job or job.status!='failed':
+                  continue
+              error=(job.error or '')
+              if kind=='submit_apple' and ('cannot create a new version of the App in the current state' in error or 'ENTITY_ERROR.RELATIONSHIP.INVALID' in error):
+                  deferred_apple=True
+                  continue
+              if kind=='upload_google' and ('CHANGES_ALREADY_IN_REVIEW' in error or 'already have changes in review' in error):
+                  deferred_google=True
+                  continue
+              hard.append((kind,error))
+
+          print(f'STATE version={release.version_name} build={release.build_number} android={android.status} ios={ios.status} google={gs} apple={aps} active={current} hard_failed={len(hard)} deferred_apple={deferred_apple} deferred_google={deferred_google}')
+          for kind,error in hard:
+              print(f'HARD_FAILED_JOB {kind}: {error[:1200]}')
+
+          if gs=='in_review' and aps=='in_review':
+              print('DONE')
+          elif android.status=='succeeded' and ios.status=='succeeded' and (deferred_apple or deferred_google):
+              print('STORE_REVIEW_DEFERRED')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
+            echo "$STATE"
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^STORE_REVIEW_DEFERRED$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^HARD_FAILED_JOB '; then exit 1; fi
+            sleep 30
+          done
+          exit 1

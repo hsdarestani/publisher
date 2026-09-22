@@ -43,3 +43,5 @@ jobs:
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+# probe 2

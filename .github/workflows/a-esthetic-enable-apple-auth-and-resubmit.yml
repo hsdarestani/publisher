@@ -1,0 +1,181 @@
+name: Enable A+ Esthetic Apple auth and resubmit iOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-enable-apple-auth-and-resubmit.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fix-and-submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      SOURCE_COMMIT: 58e325baa2005873617edb48d5ebc1902eeb8434
+    steps:
+      - name: Enable Sign in with Apple, regenerate profile, and requeue Build 28
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          import json, os
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp, Release, BuildAgent
+          from apps.signing.models import IOSProvisioningProfile
+          from apps.signing.services import _find_apple_bundle_id, ensure_ios_signing
+
+          source=os.environ['SOURCE_COMMIT']
+          app=MobileApp.objects.select_related('apple_account').get(slug='a-esthetic')
+          release=Release.objects.get(app=app,source_commit=source)
+          build=release.builds.get(platform='ios')
+          client=AppleStoreClient(app.apple_account)
+          bundle=_find_apple_bundle_id(client,app.bundle_id)
+          bundle_id=str(bundle['id'])
+
+          caps=client.request('GET',f'/bundleIds/{bundle_id}/bundleIdCapabilities?limit=200').get('data',[])
+          apple_auth=next((c for c in caps if c.get('attributes',{}).get('capabilityType')=='APPLE_ID_AUTH'),None)
+          if apple_auth:
+              print(f'APPLE_ID_AUTH already enabled id={apple_auth["id"]}')
+          else:
+              body={
+                  'data':{
+                      'type':'bundleIdCapabilities',
+                      'attributes':{'capabilityType':'APPLE_ID_AUTH'},
+                      'relationships':{'bundleId':{'data':{'type':'bundleIds','id':bundle_id}}},
+                  }
+              }
+              apple_auth=client.request('POST','/bundleIdCapabilities',data=json.dumps(body))['data']
+              print(f'APPLE_ID_AUTH enabled id={apple_auth["id"]}')
+
+          # Any profile created before changing App ID capabilities is stale.
+          old=IOSProvisioningProfile.objects.filter(app=app).first()
+          if old:
+              try:
+                  client.request('DELETE',f'/profiles/{old.apple_profile_id}')
+                  print(f'APPLE_PROFILE_DELETED id={old.apple_profile_id}')
+              except Exception as exc:
+                  if '404' not in str(exc):
+                      raise
+                  print(f'APPLE_PROFILE_ALREADY_GONE id={old.apple_profile_id}')
+              old.delete()
+
+          profile=ensure_ios_signing(app)
+          print(f'APPLE_PROFILE_READY id={profile.apple_profile_id} uuid={profile.profile_uuid} name={profile.profile_name}')
+
+          job=release.jobs.filter(type='build_ios').order_by('-pk').first()
+          if not job:
+              raise RuntimeError('A+ Esthetic iOS build job is missing.')
+          # Do not leave a stale agent ownership pointer on a failed/requeued job.
+          BuildAgent.objects.filter(current_job_id=job.pk).update(current_job=None)
+          job.status='queued'
+          job.progress=0
+          job.started_at=None
+          job.finished_at=None
+          job.error=''
+          job.logs=(job.logs+'\nSign in with Apple capability enabled and App Store profile regenerated; retrying iOS build.').strip()[-200000:]
+          job.save(update_fields=['status','progress','started_at','finished_at','error','logs','updated_at'])
+          build.status='queued'
+          build.agent=None
+          build.started_at=None
+          build.finished_at=None
+          build.logs=''
+          build.artifact=''
+          build.artifact_size=0
+          build.artifact_checksum=''
+          build.external_build_id=''
+          build.metadata={}
+          build.save()
+          release.status='building'
+          release.save(update_fields=['status','updated_at'])
+          print(f'IOS_REQUEUED job={job.pk} release={release.version_name}/{release.build_number}')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"
+
+      - name: Wake clean macOS builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for iOS build, upload, and App Store review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 220); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(app=app,source_commit=os.environ['SOURCE_COMMIT'])
+          build=release.builds.get(platform='ios')
+
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+
+          bjob=latest('build_ios')
+          upload=latest('upload_apple')
+          submit=latest('submit_apple')
+          sub=Submission.objects.filter(release=release,platform='ios').first()
+
+          if build.status=='succeeded':
+              if not upload or upload.status not in {'queued','running','succeeded'}:
+                  upload=enqueue_job('upload_apple',app=app,release=release,build=build,agent=True,platform='macos')
+                  print(f'QUEUED upload_apple={upload.pk}')
+              if build.external_build_id and upload and upload.status=='succeeded' and not sub:
+                  if not submit or submit.status not in {'queued','running','succeeded'}:
+                      submit=enqueue_job('submit_apple',app=app,release=release,build=build)
+                      print(f'QUEUED submit_apple={submit.pk}')
+
+          sub=Submission.objects.filter(release=release,platform='ios').first()
+          upload=latest('upload_apple')
+          submit=latest('submit_apple')
+          print(
+              f'STATE build={build.status} build_job={bjob.status if bjob else "none"} '
+              f'upload={upload.status if upload else "none"} external={build.external_build_id or ""} '
+              f'submit={submit.status if submit else "none"} apple={sub.state if sub else "pending"}'
+          )
+
+          if sub and sub.state in {'in_review','approved','live'}:
+              print(f'DONE submission={sub.external_id} state={sub.state}')
+          elif bjob and bjob.status=='failed':
+              print(f'HARD_FAIL build_ios: {(bjob.error or "")[:2000]}')
+          elif upload and upload.status=='failed':
+              print(f'HARD_FAIL upload_apple: {(upload.error or "")[:2000]}')
+          elif submit and submit.status=='failed':
+              print(f'HARD_FAIL submit_apple: {(submit.error or "")[:2000]}')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell")
+            echo "$STATE"
+            if printf '%s' "$STATE" | grep -q '^DONE '; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^HARD_FAIL '; then exit 1; fi
+            sleep 30
+          done
+          exit 1

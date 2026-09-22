@@ -173,7 +173,7 @@ class Command(BaseCommand):
 
     def _queue_builds(self, app, release):
         for platform, required in (("android", "linux"), ("ios", "macos")):
-            stale = Job.objects.filter(build__release=release, type=f"build_{platform}", status="running", updated_at__lt=timezone.now() - timedelta(minutes=10))
+            stale = Job.objects.filter(build__release=release, type=f"build_{platform}", status="running", updated_at__lt=timezone.now() - timedelta(minutes=2))
             stale.update(status="failed", error="Recovered after the cloud runner stopped reporting progress.", finished_at=timezone.now())
             if platform == "ios" and not app.apple_account:
                 self.stdout.write(self.style.WARNING("ios_build=blocked apple_account_missing"))

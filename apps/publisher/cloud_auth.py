@@ -47,7 +47,7 @@ def _recover_interrupted_job(agent, request) -> None:
         return
 
     job = agent.current_job
-    if job.status == "running" and job.updated_at >= timezone.now() - timedelta(minutes=10):
+    if job.status == "running" and job.updated_at >= timezone.now() - timedelta(minutes=2):
         return
     if job.status != "running":
         agent.current_job = None

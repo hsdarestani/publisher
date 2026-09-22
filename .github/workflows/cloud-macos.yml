@@ -19,10 +19,9 @@ permissions:
   issues: write
 
 concurrency:
-  # A failed agent-owned job must not pin the only macOS lane indefinitely.
-  # A fresh dispatch cancels a stale runner and lets Publisher re-claim queued iOS work.
+  # Keep macOS agent ownership serialized once a healthy runner has claimed work.
   group: aplus-cloud-macos
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   cloud-macos-agent:

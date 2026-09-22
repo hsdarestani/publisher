@@ -21,7 +21,7 @@ permissions:
 concurrency:
   # Serialize macOS runners without cancelling an active native build/upload.
   # New triggers queue behind the current runner so an in-flight App Store job cannot be orphaned.
-  group: aplus-cloud-macos
+  group: aplus-cloud-macos-v2
   cancel-in-progress: false
 
 jobs:

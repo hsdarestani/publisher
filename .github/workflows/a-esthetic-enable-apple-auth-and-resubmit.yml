@@ -45,7 +45,7 @@ jobs:
           bundle=_find_apple_bundle_id(client,app.bundle_id)
           bundle_id=str(bundle['id'])
 
-          caps=client.request('GET',f'/bundleIds/{bundle_id}/bundleIdCapabilities?limit=200').get('data',[])
+          caps=client.request('GET',f'/bundleIds/{bundle_id}/bundleIdCapabilities').get('data',[])
           apple_auth=next((c for c in caps if c.get('attributes',{}).get('capabilityType')=='APPLE_ID_AUTH'),None)
           if apple_auth:
               print(f'APPLE_ID_AUTH already enabled id={apple_auth["id"]}')

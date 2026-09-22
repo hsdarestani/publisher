@@ -19,9 +19,10 @@ permissions:
   issues: write
 
 concurrency:
-  # Keep macOS agent ownership serialized once a healthy runner has claimed work.
+  # One-shot stale-run recovery: the live FIFO server will give the fresh runner
+  # the oldest queued macOS job, which is A+ Esthetic Build 28.
   group: aplus-cloud-macos
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   cloud-macos-agent:

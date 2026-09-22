@@ -19,7 +19,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: aplus-cloud-macos-hotfix-20260922
+  group: aplus-cloud-macos
   cancel-in-progress: false
 
 jobs:

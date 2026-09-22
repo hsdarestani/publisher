@@ -19,10 +19,10 @@ permissions:
   issues: write
 
 concurrency:
-  # One-shot stale-run recovery: the live FIFO server will give the fresh runner
-  # the oldest queued macOS job, which is A+ Esthetic Build 28.
+  # Serialize macOS runners without cancelling an active native build/upload.
+  # New triggers queue behind the current runner so an in-flight App Store job cannot be orphaned.
   group: aplus-cloud-macos
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   cloud-macos-agent:

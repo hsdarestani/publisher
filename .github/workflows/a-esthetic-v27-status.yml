@@ -37,6 +37,10 @@ jobs:
               print(f'BUILD platform={b.platform} status={b.status} external={b.external_build_id or ""} artifact={bool(b.artifact)} commit={b.commit_sha}')
           for j in release.jobs.order_by('-pk')[:20]:
               print(f'JOB id={j.pk} type={j.type} status={j.status} progress={j.progress} error={(j.error or "")[:500]}')
+              if j.type == 'build_ios':
+                  print('LOG_TAIL_START')
+                  print((j.logs or '')[-12000:])
+                  print('LOG_TAIL_END')
           for s in Submission.objects.filter(release=release).order_by('platform'):
               print(f'SUBMISSION platform={s.platform} state={s.state} external={getattr(s,"external_id","") or ""}')
           for a in BuildAgent.objects.filter(platform='macos').order_by('pk'):

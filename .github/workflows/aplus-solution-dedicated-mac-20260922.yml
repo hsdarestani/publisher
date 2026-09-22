@@ -1,0 +1,44 @@
+name: A+ Solution Dedicated Mac 2026-09-22
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-dedicated-mac-20260922.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  dedicated-mac:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Publisher agent
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+      - name: Wait for Publisher health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 24 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 20 \
+            https://publisher.smarbiz.sbs/healthz/
+      - name: Claim one macOS job
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '1'
+        run: |
+          python agents/custom_cloud_macos_altool.py

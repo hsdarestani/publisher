@@ -1,4 +1,4 @@
-name: A+ Solution Native Fix Build
+name: A+ Solution Splash Rollback Build
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   actions: write
 
 env:
-  APLUS_COMMIT: '7be8d4f9442837106e9c509a7b6474603de8421c'
+  APLUS_COMMIT: '6e567d2032a89b910541ec7bcad816172d99839b'
 
 jobs:
   build:
@@ -82,7 +82,7 @@ jobs:
                   android_rollout=1,
                   ios_release_type='manual',
                   auto_submit=False,
-                  release_notes='iOS WebView lifecycle stability and larger mobile header logo. Build only; no store submission.'
+                  release_notes='Restores the previous A+ Solution launch splash. Build only; no store submission.'
               )
           else:
               version_name = release.version_name
@@ -121,7 +121,7 @@ jobs:
                       app=app,
                       release=release,
                       build=build,
-                      payload={'source':'ios-webview-restart-fix-build-only'},
+                      payload={'source':'splash-rollback-build-only'},
                       agent=True,
                       platform=runner,
                   )

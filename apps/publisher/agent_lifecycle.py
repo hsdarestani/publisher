@@ -69,6 +69,9 @@ def agent_claim(request):
                 available_to_agents=True,
                 required_platform__in=allowed,
             )
+            # Job's model default is newest-first for UI history. Agent queues
+            # must be FIFO, otherwise fresh retries can starve an older release.
+            .order_by("created_at", "pk")
             .first()
         )
         if not job:

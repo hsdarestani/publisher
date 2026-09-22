@@ -19,7 +19,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: aplus-cloud-macos
+  group: aplus-cloud-macos-release52-upload
   cancel-in-progress: false
 
 jobs:

@@ -1,0 +1,233 @@
+name: Build and submit A+ Esthetic Build 29
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-build29-final-release.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-store-submit-build29
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      SOURCE_COMMIT: b76e87dd6dc37a9303548a1e9f7b7f9ae73f4694
+      VERSION_NAME: 1.0.24
+      BUILD_NUMBER: '29'
+    steps:
+      - name: Create Build 29 and queue Android/iOS
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Build
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          version=os.environ['VERSION_NAME']
+          build_number=int(os.environ['BUILD_NUMBER'])
+          app=MobileApp.objects.get(slug='a-esthetic')
+          notes='Google-Anmeldung auf Android korrigiert, Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert.'
+
+          release,created=Release.objects.get_or_create(
+              app=app,version_name=version,build_number=build_number,
+              defaults={
+                  'status':'building','source_branch':'main','source_commit':source,
+                  'android_track':'production','android_rollout':1,
+                  'ios_release_type':'manual','auto_submit':True,'release_notes':notes,
+              },
+          )
+          changed=[]
+          if release.source_commit != source:
+              release.source_commit=source; changed.append('source_commit')
+          if release.source_branch != 'main':
+              release.source_branch='main'; changed.append('source_branch')
+          if release.release_notes != notes:
+              release.release_notes=notes; changed.append('release_notes')
+          if release.status in {'draft','failed','rejected'}:
+              release.status='building'; changed.append('status')
+          if changed:
+              release.save(update_fields=changed+['updated_at'])
+          app.latest_commit_sha=source
+          app.save(update_fields=['latest_commit_sha','updated_at'])
+          for loc in app.localizations.all():
+              loc.release_notes=notes
+              loc.save(update_fields=['release_notes','updated_at'])
+
+          android,_=Build.objects.get_or_create(
+              release=release,platform='android',
+              defaults={'status':'queued','commit_sha':source},
+          )
+          ios,_=Build.objects.get_or_create(
+              release=release,platform='ios',
+              defaults={'status':'queued','commit_sha':source},
+          )
+
+          def ensure_build(platform, build, kind):
+              live=release.jobs.filter(type=kind,status__in=['queued','running','succeeded']).order_by('-pk').first()
+              if build.status not in {'succeeded','running'} and not live:
+                  build.status='queued'; build.commit_sha=source
+                  build.save(update_fields=['status','commit_sha','updated_at'])
+                  job=enqueue_job(kind,app=app,release=release,build=build,agent=True,platform=platform)
+                  print('QUEUED',kind,job.pk)
+              else:
+                  print('BUILD_STATE',kind,build.status,'job',getattr(live,'pk',None),getattr(live,'status',None))
+
+          ensure_build('linux',android,'build_android')
+          ensure_build('macos',ios,'build_ios')
+          print('RELEASE',release.pk,release.version_name,release.build_number,release.source_commit,'created',created)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell"
+
+      - name: Wake Android and iOS cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }
+
+      - name: Advance uploads and submissions
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 240); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(
+              app=app,
+              version_name=os.environ['VERSION_NAME'],
+              build_number=int(os.environ['BUILD_NUMBER']),
+          )
+          android=release.builds.get(platform='android')
+          ios=release.builds.get(platform='ios')
+
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def active_or_done(kind):
+              j=latest(kind)
+              return bool(j and j.status in {'queued','running','succeeded'})
+
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+
+          if android.status=='succeeded' and not g and not active_or_done('upload_google'):
+              j=enqueue_job('upload_google',app=app,release=release,build=android)
+              print('QUEUED upload_google',j.pk)
+
+          upload_apple=latest('upload_apple')
+          if ios.status=='succeeded' and not ios.external_build_id and not active_or_done('upload_apple'):
+              j=enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
+              print('QUEUED upload_apple',j.pk)
+
+          upload_apple=latest('upload_apple')
+          a=Submission.objects.filter(release=release,platform='ios').first()
+          if (
+              ios.status=='succeeded' and ios.external_build_id
+              and upload_apple and upload_apple.status=='succeeded'
+              and not a and not active_or_done('submit_apple')
+          ):
+              j=enqueue_job('submit_apple',app=app,release=release,build=ios)
+              print('QUEUED submit_apple',j.pk)
+
+          g=Submission.objects.filter(release=release,platform='android').first()
+          a=Submission.objects.filter(release=release,platform='ios').first()
+          jobs={k:(latest(k).status if latest(k) else 'missing') for k in ['build_android','build_ios','upload_google','upload_apple','submit_apple']}
+          errors={k:(latest(k).error or '')[:900] for k in jobs if latest(k) and latest(k).status=='failed'}
+          print('STATE',
+                'release',release.pk,release.version_name,release.build_number,
+                'android',android.status,'ios',ios.status,'ios_external',bool(ios.external_build_id),
+                'google',g.state if g else 'pending',
+                'apple',a.state if a else 'pending',
+                'jobs',jobs)
+          for k,e in errors.items():
+              print('FAILED',k,e)
+
+          if errors:
+              raise SystemExit(2)
+          if g and g.state in {'in_review','approved','live'} and a and a.state in {'in_review','approved','live'}:
+              print('DONE')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            set +e
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" 2>&1)
+            RC=$?
+            set -e
+            echo "$STATE"
+            if [ "$RC" -eq 2 ]; then exit 1; fi
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+
+            # Keep the Mac queue moving after iOS build completion so upload_apple
+            # is claimed promptly even if the previous runner already exited.
+            if [ $((attempt % 10)) -eq 0 ]; then
+              gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            fi
+            sleep 20
+          done
+          exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify Google production versionCode 29
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp
+          app=MobileApp.objects.get(slug='a-esthetic')
+          client=GooglePlayClient(app.google_account)
+          edit=client._open_edit(app.package_name)
+          try:
+              track=client._edit_request(edit,'GET',f'/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks/production')
+              print('GOOGLE_PRODUCTION',track)
+              matches=[
+                  r for r in track.get('releases',[])
+                  if '29' in [str(v) for v in r.get('versionCodes',[])]
+              ]
+              if not matches:
+                  raise SystemExit('versionCode_29_missing_from_production')
+              if matches[0].get('status') not in {'completed','inProgress'}:
+                  raise SystemExit('versionCode_29_not_active')
+          finally:
+              client._safe_delete_edit(edit)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

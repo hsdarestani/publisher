@@ -98,8 +98,22 @@ class CloudMacAgent(Agent):
             bufsize=1,
         )
         assert process.stdout is not None
+        # Xcode emits tens of thousands of lines. Sending one authenticated HTTP
+        # request per line can make a normal archive exceed the hosted-runner
+        # timeout, so mirror every line to Actions while batching Publisher logs.
+        log_batch = []
+        last_flush = time.monotonic()
         for line in process.stdout:
-            self.log(job_id, line.rstrip(), min(progress + 45, 88))
+            clean = line.rstrip()
+            print(clean, flush=True)
+            log_batch.append(clean)
+            now = time.monotonic()
+            if len(log_batch) >= 100 or now - last_flush >= 5:
+                self.log(job_id, "\n".join(log_batch), min(progress + 45, 88))
+                log_batch.clear()
+                last_flush = now
+        if log_batch:
+            self.log(job_id, "\n".join(log_batch), min(progress + 45, 88))
         code = process.wait()
         if code:
             raise RuntimeError(f"Command failed with exit code {code}")

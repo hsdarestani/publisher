@@ -22,14 +22,14 @@ concurrency:
   # Every hosted runner authenticates as the same logical Publisher Mac agent.
   # Serialize runs and never cancel an active native build/upload, otherwise a
   # replacement runner can orphan the job that still owns Xcode/altool work.
-  group: aplus-cloud-macos-v5
+  group: aplus-cloud-macos-v6
   cancel-in-progress: false
 
 jobs:
   cloud-macos-agent:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Checkout A+ Publisher agent
         uses: actions/checkout@v4

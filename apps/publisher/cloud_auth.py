@@ -3,11 +3,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import timedelta
 
 import jwt
 from django.db import transaction
-from django.utils import timezone
 from jwt import PyJWKClient
 
 from .models import BuildAgent
@@ -47,50 +45,13 @@ def _recover_interrupted_job(agent, request) -> None:
         return
 
     job = agent.current_job
-    if job.status == "running" and job.updated_at >= timezone.now() - timedelta(minutes=2):
+    # A native archive can legitimately run for well over an hour without
+    # changing the Job row. Never let a second ephemeral runner steal an active
+    # job: doing so invalidates the first runner's log and completion requests.
+    # Explicit recovery/force-rebuild commands remain responsible for genuinely
+    # abandoned running jobs.
+    if job.status == "running":
         return
-    if job.status != "running":
-        agent.current_job = None
-        return
-
-    job.logs = (
-        job.logs
-        + "\nPrevious ephemeral cloud runner stopped before completion; job was recovered automatically."
-    ).strip()[-200000:]
-    job.status = "queued"
-    job.progress = 0
-    job.started_at = None
-    job.finished_at = None
-    job.error = ""
-    job.save(
-        update_fields=[
-            "logs",
-            "status",
-            "progress",
-            "started_at",
-            "finished_at",
-            "error",
-            "updated_at",
-        ]
-    )
-
-    if job.build_id:
-        build = job.build
-        build.status = "queued"
-        build.agent = None
-        build.started_at = None
-        build.finished_at = None
-        build.logs = job.logs
-        build.save(
-            update_fields=[
-                "status",
-                "agent",
-                "started_at",
-                "finished_at",
-                "logs",
-                "updated_at",
-            ]
-        )
 
     agent.current_job = None
 

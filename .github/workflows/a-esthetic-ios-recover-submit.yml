@@ -1,4 +1,4 @@
-name: Recover and submit A+ Esthetic iOS v27
+name: Recover and submit A+ Esthetic iOS Build 29
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: a-esthetic-ios-v27-recover-submit
+  group: a-esthetic-ios-build29-recover-submit
   cancel-in-progress: true
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 120
     environment: production
     env:
-      SOURCE_COMMIT: 58e325baa2005873617edb48d5ebc1902eeb8434
+      SOURCE_COMMIT: b76e87dd6dc37a9303548a1e9f7b7f9ae73f4694
     steps:
       - name: Recover orphaned Esthetic iOS job
         env:

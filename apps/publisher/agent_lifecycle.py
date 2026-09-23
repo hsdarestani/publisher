@@ -10,7 +10,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .agent_completion import _agent_from_request
-from .models import Job
+from .models import BuildAgent, Job
 
 
 BUILD_JOB_TYPES = {"build_android", "build_ios"}
@@ -62,6 +62,22 @@ def agent_claim(request):
         allowed = ["linux", "macos"]
 
     with transaction.atomic():
+        # GitHub-hosted macOS runners authenticate as one logical cloud agent.
+        # Multiple ephemeral runners can overlap briefly (schedule + dispatch).
+        # Lock the agent row and never let a second runner overwrite current_job
+        # while the first native build/upload is still active.
+        agent = (
+            BuildAgent.objects.select_for_update()
+            .select_related("current_job")
+            .get(pk=agent.pk)
+        )
+        current = agent.current_job
+        if current and current.status in {"queued", "running"}:
+            return JsonResponse({"job": None, "busy_job": current.pk})
+        if current:
+            agent.current_job = None
+            agent.save(update_fields=["current_job", "updated_at"])
+
         job = (
             Job.objects.select_for_update(skip_locked=True)
             .filter(

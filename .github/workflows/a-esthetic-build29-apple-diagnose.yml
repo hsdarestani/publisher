@@ -1,0 +1,62 @@
+name: Diagnose A+ Esthetic Apple Build 29 review slot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-build29-apple-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Inspect App Store Connect state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.select_related('apple_account').get(slug='a-esthetic')
+          release=Release.objects.get(app=app,version_name='1.0.24',build_number=29)
+          build=release.builds.get(platform='ios')
+          c=AppleStoreClient(app.apple_account)
+          a=c.find_app(app.bundle_id)
+          app_id=a['id']
+          print('APP',app_id,a.get('attributes',{}))
+          versions=c.list_versions(app_id,limit=50)
+          for v in versions:
+              attrs=v.get('attributes',{})
+              if attrs.get('versionString')=='1.0.24':
+                  vid=v['id']
+                  print('VERSION',vid,attrs)
+                  rel=c.request('GET',f'/appStoreVersions/{vid}/build').get('data')
+                  print('VERSION_BUILD',rel)
+                  locs=c.request('GET',f'/appStoreVersions/{vid}/appStoreVersionLocalizations?limit=50').get('data',[])
+                  print('LOCALIZATIONS',[(x.get('id'),x.get('attributes',{}).get('locale')) for x in locs])
+          print('BUILD29',build.external_build_id,build.metadata)
+          for state in ['READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES','COMPLETE']:
+              subs=c.list_review_submissions(app_id,state)
+              print('SUBMISSIONS',state,[(s['id'],s.get('attributes',{})) for s in subs])
+              for s in subs:
+                  try:
+                      items=c.list_review_submission_items(s['id'])
+                      print('ITEMS',s['id'],[(i['id'],i.get('attributes',{}),i.get('relationships',{}).get('appStoreVersion',{}).get('data')) for i in items])
+                  except Exception as exc:
+                      print('ITEMS_ERROR',s['id'],str(exc))
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

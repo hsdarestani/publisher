@@ -22,7 +22,7 @@ concurrency:
   # Recovery mode: replace a stale cloud runner after its DB-owned job is already terminal.
   # This unblocks the queued A+ Esthetic iOS release; restore serialized non-cancelling
   # behavior after the recovery run has claimed the queue.
-  group: aplus-cloud-macos-v2
+  group: aplus-cloud-macos-esthetic-recovery-v3
   cancel-in-progress: true
 
 jobs:

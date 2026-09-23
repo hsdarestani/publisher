@@ -37,13 +37,16 @@ jobs:
           from apps.publisher.models import MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
-          # Latest A+ patient app dashboard polish release.
-          SOURCE='c10967863b8987fa5489253c215f222fc7e2fafe'
+          # Always recover the newest Publisher release for A+ Esthetic.
+          # Do not pin this workflow to an old app commit: that can attach a
+          # pre-release build from a previous marketing version and Apple will
+          # reject the relationship with HTTP 409.
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')
-          release=Release.objects.filter(app=app,source_commit=SOURCE).order_by('-created_at').first()
+          release=Release.objects.filter(app=app).order_by('-created_at').first()
           if not release: raise SystemExit('release_missing')
+          print('PUBLISHER_TARGET',release.source_commit,release.version_name,release.build_number)
           ios=release.builds.get(platform='ios')
           if ios.status!='succeeded' or not ios.external_build_id: raise SystemExit('ios_build_not_ready')
           client=AppleStoreClient(app.apple_account)

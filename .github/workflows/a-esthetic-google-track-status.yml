@@ -1,0 +1,67 @@
+name: A+ Esthetic Google Play track status
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-google-track-status.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read Google Play tracks
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check google-auth requests
+          python - <<'PY'
+          import json, os
+          from urllib.parse import quote
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import AuthorizedSession, Request
+
+          package='de.aplusesthetic.app'
+          info=json.loads(os.environ['GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'])
+          creds=service_account.Credentials.from_service_account_info(
+              info, scopes=['https://www.googleapis.com/auth/androidpublisher']
+          )
+          creds.refresh(Request())
+          s=AuthorizedSession(creds)
+          base='https://androidpublisher.googleapis.com/androidpublisher/v3'
+          appq=quote(package,safe='._-')
+          r=s.post(f'{base}/applications/{appq}/edits',json={},timeout=60)
+          print('EDIT_INSERT',r.status_code)
+          r.raise_for_status()
+          edit_id=r.json()['id']
+          try:
+              br=s.get(f'{base}/applications/{appq}/edits/{edit_id}/bundles',timeout=60)
+              print('BUNDLES_HTTP',br.status_code)
+              if br.ok:
+                  bundles=br.json().get('bundles',[])
+                  print('BUNDLES',json.dumps([{
+                    'versionCode':b.get('versionCode'),
+                    'sha256':b.get('sha256','')[:12]
+                  } for b in bundles],ensure_ascii=False))
+              for track in ['production','beta','alpha','internal']:
+                  tr=s.get(f'{base}/applications/{appq}/edits/{edit_id}/tracks/{track}',timeout=60)
+                  print('TRACK_HTTP',track,tr.status_code)
+                  if tr.ok:
+                      data=tr.json()
+                      print('TRACK',track,json.dumps(data,ensure_ascii=False,sort_keys=True))
+                  else:
+                      print('TRACK_ERR',track,tr.text[:800].replace('\n',' '))
+          finally:
+              d=s.delete(f'{base}/applications/{appq}/edits/{edit_id}',timeout=30)
+              print('EDIT_DELETE',d.status_code)
+          PY

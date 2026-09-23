@@ -1,4 +1,5 @@
 name: Run A+ iOS recovery agent
+# Build 29 queue nudge: clear any terminal Mac pointer and claim the Esthetic iOS build.
 
 on:
   workflow_dispatch:

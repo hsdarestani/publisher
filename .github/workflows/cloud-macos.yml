@@ -19,10 +19,11 @@ permissions:
   issues: write
 
 concurrency:
-  # Serialize macOS runners without cancelling an active native build/upload.
-  # New triggers queue behind the current runner so an in-flight App Store job cannot be orphaned.
+  # Recovery mode: replace a stale cloud runner after its DB-owned job is already terminal.
+  # This unblocks the queued A+ Esthetic iOS release; restore serialized non-cancelling
+  # behavior after the recovery run has claimed the queue.
   group: aplus-cloud-macos-v2
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   cloud-macos-agent:

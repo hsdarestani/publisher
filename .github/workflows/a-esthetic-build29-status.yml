@@ -1,0 +1,51 @@
+name: A+ Esthetic Build 29 status
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-build29-status.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read Build 29 production state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import BuildAgent, MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,version_name='1.0.24',build_number=29).first()
+          if not release:
+              print('BUILD29_RELEASE missing')
+              raise SystemExit(0)
+          print(f'BUILD29_RELEASE id={release.pk} version={release.version_name} build={release.build_number} status={release.status} commit={release.source_commit}')
+          for b in release.builds.order_by('platform'):
+              print(f'BUILD29_BUILD platform={b.platform} status={b.status} artifact={bool(b.artifact)} external={b.external_build_id or ""} commit={b.commit_sha}')
+          for j in release.jobs.order_by('pk'):
+              print(f'BUILD29_JOB id={j.pk} type={j.type} status={j.status} progress={j.progress} error={(j.error or "")[:900]}')
+          for s in Submission.objects.filter(release=release).order_by('platform'):
+              print(f'BUILD29_SUBMISSION platform={s.platform} state={s.state} external={s.external_id or ""} error={(s.last_error or "")[:500]}')
+          for a in BuildAgent.objects.filter(platform__in=['macos','linux','universal']).order_by('pk'):
+              j=a.current_job
+              if j:
+                  print(f'AGENT id={a.pk} platform={a.platform} job={j.pk} type={j.type} status={j.status} app={getattr(j.app,"slug","")} release={getattr(j.release,"version_name","")}/{getattr(j.release,"build_number","")} progress={j.progress}')
+              else:
+                  print(f'AGENT id={a.pk} platform={a.platform} job=none')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

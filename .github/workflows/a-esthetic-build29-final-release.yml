@@ -115,6 +115,7 @@ jobs:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
@@ -197,8 +198,6 @@ jobs:
             sleep 20
           done
           exit 1
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Verify Google production versionCode 29
         env:

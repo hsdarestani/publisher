@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
-
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
@@ -177,8 +175,9 @@ class Command(BaseCommand):
             Job.objects.filter(build__release=release, type="build_ios", status__in=["queued", "running"]).update(status="failed", error="Superseded by forced SchichtPro iOS rebuild.", finished_at=timezone.now())
             release.builds.filter(platform="ios").update(status="failed", finished_at=timezone.now())
         for platform, required in (("android", "linux"), ("ios", "macos")):
-            stale = Job.objects.filter(build__release=release, type=f"build_{platform}", status="running", updated_at__lt=timezone.now() - timedelta(minutes=2))
-            stale.update(status="failed", error="Recovered after the cloud runner stopped reporting progress.", finished_at=timezone.now())
+            # Native iOS archives often run for more than an hour while the
+            # database row is unchanged. Recovery must not invalidate a live
+            # runner; --force-ios is the explicit abandoned-job recovery path.
             if platform == "ios" and not app.apple_account:
                 self.stdout.write(self.style.WARNING("ios_build=blocked apple_account_missing"))
                 continue

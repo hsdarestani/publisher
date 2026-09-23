@@ -66,11 +66,9 @@ def agent_claim(request):
         # Multiple ephemeral runners can overlap briefly (schedule + dispatch).
         # Lock the agent row and never let a second runner overwrite current_job
         # while the first native build/upload is still active.
-        agent = (
-            BuildAgent.objects.select_for_update()
-            .select_related("current_job")
-            .get(pk=agent.pk)
-        )
+        agent = BuildAgent.objects.select_for_update().get(pk=agent.pk)
+        # Read the nullable current_job after locking the agent row. Joining it
+        # inside SELECT FOR UPDATE makes PostgreSQL reject the outer join.
         current = agent.current_job
         if current and current.status in {"queued", "running"}:
             return JsonResponse({"job": None, "busy_job": current.pk})

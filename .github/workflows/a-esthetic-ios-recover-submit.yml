@@ -45,6 +45,14 @@ jobs:
           if not release:
               raise SystemExit('RELEASE_MISSING')
 
+          # A finished/failed job must never keep the single macOS agent pinned.
+          # Clear only terminal ownership pointers; never interrupt a live job.
+          for agent in BuildAgent.objects.filter(platform='macos').select_related('current_job'):
+              current=agent.current_job
+              if current and current.status in {'failed','succeeded','cancelled'}:
+                  print(f'CLEAR_STALE_MAC_OWNER agent={agent.pk} job={current.pk} status={current.status}')
+                  BuildAgent.objects.filter(pk=agent.pk).update(current_job=None)
+
           build=release.builds.get(platform='ios')
           build_job=release.jobs.filter(type='build_ios').order_by('-pk').first()
 

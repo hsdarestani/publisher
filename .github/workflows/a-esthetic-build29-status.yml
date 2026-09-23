@@ -42,9 +42,10 @@ jobs:
           for a in BuildAgent.objects.filter(platform__in=['macos','linux','universal']).order_by('pk'):
               j=a.current_job
               if j:
-                  print(f'AGENT id={a.pk} platform={a.platform} job={j.pk} type={j.type} status={j.status} app={getattr(j.app,"slug","")} release={getattr(j.release,"version_name","")}/{getattr(j.release,"build_number","")} progress={j.progress}')
+                  print(f'AGENT id={a.pk} platform={a.platform} job={j.pk} type={j.type} status={j.status} app={getattr(j.app,"slug","")} release={getattr(j.release,"version_name","")}/{getattr(j.release,"build_number","")} progress={j.progress} started={j.started_at} updated={j.updated_at} last_seen={a.last_seen_at}')
+                  print('AGENT_JOB_LOG_TAIL', (j.logs or '')[-2500:].replace('\\n',' | '))
               else:
-                  print(f'AGENT id={a.pk} platform={a.platform} job=none')
+                  print(f'AGENT id={a.pk} platform={a.platform} job=none last_seen={a.last_seen_at}')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)

@@ -34,7 +34,7 @@ jobs:
           PY_CODE=$(cat <<'PY'
           import json, time
           from apps.integrations.apple_store import AppleStoreClient
-          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.models import BuildAgent, MobileApp, Release, Submission
           from apps.publisher.tasks import enqueue_job
 
           # Always recover the newest Publisher release for A+ Esthetic.
@@ -44,6 +44,15 @@ jobs:
           EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
           TRANSITIONAL={'PROCESSING_FOR_DISTRIBUTION','PROCESSING_TO_AVAILABLE','PENDING_APPLE_RELEASE','WAITING_FOR_EXPORT_COMPLIANCE'}
           app=MobileApp.objects.get(slug='a-esthetic')
+          # Recovery for the cancelled cloud-Mac run that left job 2918 pinned
+          # as the logical agent's current job after the runner had already exited.
+          # Clearing only this known stale pointer lets the queued Esthetic upload
+          # be claimed without mutating the orphaned SchichtPro job itself.
+          stale_agent=BuildAgent.objects.filter(platform='macos',current_job_id=2918).first()
+          if stale_agent:
+              print('CLEAR_STALE_MAC_POINTER',stale_agent.id,stale_agent.current_job_id)
+              stale_agent.current_job=None
+              stale_agent.save(update_fields=['current_job','updated_at'])
           release=Release.objects.filter(app=app).order_by('-created_at').first()
           if not release: raise SystemExit('release_missing')
           print('PUBLISHER_TARGET',release.source_commit,release.version_name,release.build_number)

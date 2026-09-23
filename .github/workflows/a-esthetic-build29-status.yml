@@ -36,7 +36,7 @@ jobs:
           for b in release.builds.order_by('platform'):
               print(f'BUILD29_BUILD platform={b.platform} status={b.status} artifact={bool(b.artifact)} external={b.external_build_id or ""} commit={b.commit_sha}')
           for j in release.jobs.order_by('pk'):
-              print(f'BUILD29_JOB id={j.pk} type={j.type} status={j.status} progress={j.progress} error={(j.error or "")[:900]}')
+              print(f'BUILD29_JOB id={j.pk} type={j.type} status={j.status} progress={j.progress} error={(j.error or "")[:5000]}')
           for s in Submission.objects.filter(release=release).order_by('platform'):
               print(f'BUILD29_SUBMISSION platform={s.platform} state={s.state} external={s.external_id or ""} error={(s.last_error or "")[:500]}')
           for a in BuildAgent.objects.filter(platform__in=['macos','linux','universal']).order_by('pk'):

@@ -1,0 +1,89 @@
+name: Recover stale Mac and unblock Esthetic Build 29
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-stale-mac-esthetic29.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Repair stale Mac ownership and requeue displaced build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from datetime import timedelta
+          from django.db import transaction
+          from django.utils import timezone
+          from apps.publisher.models import BuildAgent, Job
+          from apps.publisher.tasks import enqueue_job
+
+          with transaction.atomic():
+              agent=BuildAgent.objects.select_for_update().filter(platform='macos').order_by('pk').first()
+              if not agent:
+                  raise SystemExit('mac_agent_missing')
+              current=agent.current_job
+              print('MAC_BEFORE',agent.pk,getattr(current,'pk',None),getattr(current,'status',None),agent.last_seen_at)
+              if not current:
+                  print('NO_STALE_OWNER')
+              else:
+                  stale = (
+                      current.status in {'queued','running'}
+                      and agent.last_seen_at
+                      and agent.last_seen_at < timezone.now()-timedelta(minutes=5)
+                  )
+                  if stale:
+                      old=current
+                      old.status='failed'
+                      old.finished_at=timezone.now()
+                      old.error=((old.error or '')+'\nRecovered from stale GitHub macOS runner to unblock A+ Esthetic Build 29.').strip()
+                      old.save(update_fields=['status','finished_at','error','updated_at'])
+                      if old.build and old.type=='build_ios':
+                          b=old.build
+                          b.status='queued'
+                          b.agent=None
+                          b.started_at=None
+                          b.finished_at=None
+                          b.save(update_fields=['status','agent','started_at','finished_at','updated_at'])
+                      agent.current_job=None
+                      agent.save(update_fields=['current_job','updated_at'])
+                      if old.type=='build_ios' and old.app and old.release and old.build:
+                          retry=enqueue_job('build_ios',app=old.app,release=old.release,build=old.build,agent=True,platform='macos')
+                          retry.append_log('Requeued after stale Mac runner recovery; Esthetic upload already has FIFO priority.')
+                          print('REQUEUED_DISPLACED',old.pk,retry.pk,old.app.slug,old.release.version_name,old.release.build_number)
+                      print('STALE_OWNER_CLEARED',old.pk)
+                  else:
+                      print('OWNER_NOT_STALE',current.pk,current.status,current.updated_at,agent.last_seen_at)
+
+          esthetic=Job.objects.filter(app__slug='a-esthetic',release__version_name='1.0.24',release__build_number=29,type='upload_apple').order_by('-pk').first()
+          print('ESTHETIC_UPLOAD',getattr(esthetic,'pk',None),getattr(esthetic,'status',None))
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake Mac runner
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

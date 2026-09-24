@@ -43,7 +43,7 @@ jobs:
           version=os.environ['VERSION_NAME']
           build_number=int(os.environ['BUILD_NUMBER'])
           app=MobileApp.objects.get(slug='a-esthetic')
-          notes='Google-Anmeldung auf Android korrigiert, Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert.'
+          notes='Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert.'
 
           release,created=Release.objects.get_or_create(
               app=app,version_name=version,build_number=build_number,

@@ -37,6 +37,8 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
                 return {"data": []}
             if path.endswith("filter[state]=IN_REVIEW&limit=200"):
                 return {"data": []}
+            if path.endswith("filter[state]=UNRESOLVED_ISSUES&limit=200"):
+                return {"data": []}
             if path.endswith("filter[state]=READY_FOR_REVIEW&limit=200"):
                 return {"data": submissions}
             if path.startswith("/reviewSubmissions/sub-1/items?"):
@@ -143,6 +145,8 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
             if path.endswith("filter[state]=WAITING_FOR_REVIEW&limit=200"):
                 return {"data": []}
             if path.endswith("filter[state]=IN_REVIEW&limit=200"):
+                return {"data": []}
+            if path.endswith("filter[state]=UNRESOLVED_ISSUES&limit=200"):
                 return {"data": []}
             if path.endswith("filter[state]=READY_FOR_REVIEW&limit=200"):
                 return {"data": [{"id": "empty-sub", "attributes": {"state": "READY_FOR_REVIEW"}}]}

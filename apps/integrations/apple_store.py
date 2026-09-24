@@ -270,6 +270,21 @@ class AppleStoreClient:
             data=json.dumps(body),
         )["data"]
 
+    def resolve_review_submission_item(self, item_id):
+        """Mark a rejected review item resolved after its metadata was corrected."""
+        body = {
+            "data": {
+                "type": "reviewSubmissionItems",
+                "id": str(item_id),
+                "attributes": {"resolved": True},
+            }
+        }
+        return self.request(
+            "PATCH",
+            f"/reviewSubmissionItems/{item_id}",
+            data=json.dumps(body),
+        )["data"]
+
     def _review_submission_matches(self, submission, version_id):
         items = self.list_review_submission_items(submission["id"])
         item = next(
@@ -296,6 +311,37 @@ class AppleStoreClient:
                         "reused": True,
                         "already_submitted": True,
                     }
+
+        # Apple keeps rejected app versions inside the original review submission
+        # with state UNRESOLVED_ISSUES. The item cannot be added to a fresh draft.
+        # After correcting metadata, mark that rejected item resolved ("Add for
+        # Review" in App Store Connect), then resubmit the same submission.
+        for unresolved in self.list_review_submissions(app_id, "UNRESOLVED_ISSUES"):
+            rejected_item, _ = self._review_submission_matches(unresolved, version_id)
+            if not rejected_item:
+                continue
+            item_state = rejected_item.get("attributes", {}).get("state")
+            item = rejected_item
+            if item_state == "REJECTED":
+                item = self.resolve_review_submission_item(rejected_item["id"])
+            submit_body = {
+                "data": {
+                    "type": "reviewSubmissions",
+                    "id": unresolved["id"],
+                    "attributes": {"submitted": True},
+                }
+            }
+            final = self.request(
+                "PATCH",
+                f"/reviewSubmissions/{unresolved['id']}",
+                data=json.dumps(submit_body),
+            )["data"]
+            return {
+                "submission": final,
+                "item": item,
+                "reused": True,
+                "resubmitted_unresolved": True,
+            }
 
         submission = None
         item = None

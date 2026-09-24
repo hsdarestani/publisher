@@ -85,6 +85,55 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
         self.assertTrue(result["already_submitted"])
         self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in calls))
 
+    def test_resolves_and_resubmits_matching_unresolved_submission(self):
+        client = self._client()
+        unresolved = {
+            "id": "sub-rejected",
+            "attributes": {"state": "UNRESOLVED_ISSUES"},
+        }
+        item = version_item("item-rejected", "version-1")
+        item["attributes"] = {"state": "REJECTED"}
+        calls = []
+
+        def request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if path.endswith("filter[state]=WAITING_FOR_REVIEW&limit=200"):
+                return {"data": []}
+            if path.endswith("filter[state]=IN_REVIEW&limit=200"):
+                return {"data": []}
+            if path.endswith("filter[state]=UNRESOLVED_ISSUES&limit=200"):
+                return {"data": [unresolved]}
+            if path.startswith("/reviewSubmissions/sub-rejected/items?"):
+                return {"data": [item]}
+            if method == "PATCH" and path == "/reviewSubmissionItems/item-rejected":
+                body = json.loads(kwargs["data"])
+                self.assertIs(body["data"]["attributes"]["resolved"], True)
+                return {
+                    "data": {
+                        **item,
+                        "attributes": {"state": "READY_FOR_REVIEW"},
+                    }
+                }
+            if method == "PATCH" and path == "/reviewSubmissions/sub-rejected":
+                body = json.loads(kwargs["data"])
+                self.assertIs(body["data"]["attributes"]["submitted"], True)
+                return {
+                    "data": {
+                        "id": "sub-rejected",
+                        "attributes": {"state": "WAITING_FOR_REVIEW"},
+                    }
+                }
+            self.fail(f"Unexpected Apple request: {method} {path}")
+
+        client.request = Mock(side_effect=request)
+
+        result = client.submit_version("app-1", "version-1")
+
+        self.assertEqual(result["submission"]["id"], "sub-rejected")
+        self.assertTrue(result["reused"])
+        self.assertTrue(result["resubmitted_unresolved"])
+        self.assertFalse(any(method == "POST" for method, _, _ in calls))
+
     def test_creates_new_submission_only_when_no_ready_draft_targets_version(self):
         client = self._client()
         calls = []

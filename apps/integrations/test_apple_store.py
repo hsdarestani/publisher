@@ -4,8 +4,27 @@ from unittest.mock import Mock
 
 from django.test import SimpleTestCase
 
-from .apple_store import AppleStoreClient
+from .apple_store import AppleStoreClient, _apple_safe_whats_new
 from .base import IntegrationError
+
+
+class AppleStoreWhatsNewTests(SimpleTestCase):
+    def test_android_clause_is_removed_from_ios_whats_new(self):
+        text = "Google-Anmeldung auf Android korrigiert, Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert."
+        self.assertEqual(
+            _apple_safe_whats_new(text, "de-DE"),
+            "Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert.",
+        )
+
+    def test_android_only_note_gets_safe_fallback(self):
+        self.assertEqual(
+            _apple_safe_whats_new("Android-Login korrigiert.", "de-DE"),
+            "Fehlerbehebungen und Verbesserungen.",
+        )
+
+    def test_safe_ios_note_is_unchanged(self):
+        text = "Behandlungsfilter stabilisiert und Kalender optimiert."
+        self.assertEqual(_apple_safe_whats_new(text, "de-DE"), text)
 
 
 class AppleStoreVersionAlignmentTests(SimpleTestCase):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import io
 import json
+import re
 import time
 import uuid
 import zipfile
@@ -11,6 +12,30 @@ import requests
 from .base import IntegrationError, IntegrationNotConfigured, IntegrationResult
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
+
+_APPLE_IRRELEVANT_PLATFORM_RE = re.compile(r"\\b(?:android|google\\s*play|play\\s*store)\\b", re.IGNORECASE)
+
+
+def _apple_safe_whats_new(text: str | None, locale: str = "") -> str | None:
+    """Remove other-platform references from App Store What's New metadata."""
+    if not text:
+        return None
+    value = str(text).strip()
+    if not _APPLE_IRRELEVANT_PLATFORM_RE.search(value):
+        return value
+
+    parts = [part.strip(" \\t,;") for part in re.split(r"[,;\\n]+", value)]
+    safe_parts = [part for part in parts if part and not _APPLE_IRRELEVANT_PLATFORM_RE.search(part)]
+    if safe_parts:
+        cleaned = ", ".join(safe_parts).strip()
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        return cleaned
+
+    if (locale or "").lower().startswith("de"):
+        return "Fehlerbehebungen und Verbesserungen."
+    return "Bug fixes and improvements."
+
 
 class AppleStoreClient:
     def __init__(self, store_account):
@@ -144,7 +169,7 @@ class AppleStoreClient:
             "marketingUrl": loc.app.marketing_url or None,
             "promotionalText": loc.promotional_text or None,
             "supportUrl": loc.app.support_url or None,
-            "whatsNew": loc.release_notes or None,
+            "whatsNew": _apple_safe_whats_new(loc.release_notes, loc.locale),
         }
         attrs = {k: v for k, v in attrs.items() if v is not None}
         if existing:

@@ -55,6 +55,21 @@ jobs:
               stale_agent.save(update_fields=['current_job','updated_at'])
           release=Release.objects.filter(app=app).order_by('-created_at').first()
           if not release: raise SystemExit('release_missing')
+
+          # Keep iOS What's New free of Android-specific metadata. Build 29 was
+          # rejected under Guideline 2.3.10 because its shared release note said
+          # "Android". Repair the stored localization before any resubmission.
+          if release.version_name == '1.0.24' and release.build_number == 29:
+              safe_notes='Behandlungsfilter stabilisiert und Admin-Kalender/CRM optimiert.'
+              if release.release_notes != safe_notes:
+                  release.release_notes=safe_notes
+                  release.save(update_fields=['release_notes','updated_at'])
+              for loc in app.localizations.all():
+                  if loc.release_notes != safe_notes:
+                      loc.release_notes=safe_notes
+                      loc.save(update_fields=['release_notes','updated_at'])
+              print('APPLE_METADATA_REPAIRED',safe_notes)
+
           print('PUBLISHER_TARGET',release.source_commit,release.version_name,release.build_number)
           ios=release.builds.get(platform='ios')
           if ios.status!='succeeded' or not ios.external_build_id: raise SystemExit('ios_build_not_ready')

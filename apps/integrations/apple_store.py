@@ -24,7 +24,7 @@ def _apple_safe_whats_new(text: str | None, locale: str = "") -> str | None:
     if not _APPLE_IRRELEVANT_PLATFORM_RE.search(value):
         return value
 
-    parts = [part.strip(" \\t,;") for part in re.split(r"[,;\\n]+", value)]
+    parts = [part.strip(" \t,;") for part in re.split(r"[,;\n]+", value)]
     safe_parts = [part for part in parts if part and not _APPLE_IRRELEVANT_PLATFORM_RE.search(part)]
     if safe_parts:
         cleaned = ", ".join(safe_parts).strip()

@@ -178,25 +178,11 @@ jobs:
           client.attach_build(target_id,ios.external_build_id)
           print('APPLE_BUILD_ATTACHED',ios.external_build_id)
 
-          ready=None
-          for r in rs():
-              if rst(r)!='READY_FOR_REVIEW': continue
-              if live_item(r,target_id): ready=r; break
-              live=[i for i in its(r) if ist(i)!='REMOVED' and vid(i)]
-              if not live and ready is None: ready=r
-          if ready is None:
-              body={'data':{'type':'reviewSubmissions','attributes':{},'relationships':{'app':{'data':{'type':'apps','id':app_id}}}}}
-              ready=client.request('POST','/reviewSubmissions',data=json.dumps(body))['data']
-          if not live_item(ready,target_id):
-              body={'data':{'type':'reviewSubmissionItems','relationships':{'reviewSubmission':{'data':{'type':'reviewSubmissions','id':ready['id']}},'appStoreVersion':{'data':{'type':'appStoreVersions','id':target_id}}}}}
-              for attempt in range(1,37):
-                  try:
-                      item=client.request('POST','/reviewSubmissionItems',data=json.dumps(body))['data']; print('APPLE_TARGET_ATTACHED',ready['id'],item['id']); break
-                  except Exception as exc:
-                      if 'ITEM_PART_OF_ANOTHER_SUBMISSION' not in str(exc): raise
-                      if attempt==36: raise
-                      time.sleep(5)
-
+          # Let the central submit handler own review-submission lifecycle.
+          # It now knows how to resolve and resubmit an UNRESOLVED_ISSUES item,
+          # reuse an existing READY_FOR_REVIEW draft, or create a fresh draft.
+          # Do not pre-attach the version here: rejected items remain owned by
+          # their original unresolved submission until Apple marks them resolved.
           job=release.jobs.filter(type='submit_apple',status__in=['queued','running']).first()
           if not job: job=enqueue_job('submit_apple',app=app,release=release,build=ios)
           print('APPLE_SUBMIT_JOB',job.id,job.status)

@@ -13,7 +13,7 @@ from .base import IntegrationError, IntegrationNotConfigured, IntegrationResult
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
 
-_APPLE_IRRELEVANT_PLATFORM_RE = re.compile(r"\\b(?:android|google\\s*play|play\\s*store)\\b", re.IGNORECASE)
+_APPLE_IRRELEVANT_PLATFORM_RE = re.compile(r"\b(?:android|google\s*play|play\s*store)\b", re.IGNORECASE)
 
 
 def _apple_safe_whats_new(text: str | None, locale: str = "") -> str | None:

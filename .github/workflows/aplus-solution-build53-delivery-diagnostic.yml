@@ -1,0 +1,44 @@
+name: Diagnose A+ Solution Build 53 delivery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build53-delivery-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Inspect Publisher release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import BuildAgent, Job, MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.19',build_number=53,source_commit='e5cad700bdb90410e6cf8eff990e39c16ae9aaad')
+          print('RELEASE', r.id, r.status, r.version_name, r.build_number)
+          for b in r.builds.order_by('platform'):
+              print('BUILD', b.platform, b.status, bool(b.artifact), b.external_build_id, b.started_at, b.finished_at, getattr(b,'agent_id',None))
+          for j in Job.objects.filter(release=r).order_by('created_at'):
+              print('JOB', j.id, j.type, j.status, 'created', j.created_at, 'started', j.started_at, 'finished', j.finished_at, 'error', str(j.error or '')[:500])
+          for a in BuildAgent.objects.all().order_by('name'):
+              if a.current_job_id:
+                  print('AGENT', a.id, a.name, a.platform, 'current_job', a.current_job_id, 'last_seen', a.last_seen_at if hasattr(a,'last_seen_at') else '')
+          for s in Submission.objects.filter(release=r).order_by('platform'):
+              print('SUBMISSION', s.platform, s.state, s.external_id)
+          PY

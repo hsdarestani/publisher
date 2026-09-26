@@ -38,7 +38,10 @@ jobs:
               print('JOB', j.id, j.type, j.status, 'created', j.created_at, 'started', j.started_at, 'finished', j.finished_at, 'error', str(j.error or '')[:500])
           for a in BuildAgent.objects.all().order_by('name'):
               if a.current_job_id:
-                  print('AGENT', a.id, a.name, a.platform, 'current_job', a.current_job_id, 'last_seen', a.last_seen_at if hasattr(a,'last_seen_at') else '')
+                  cj=Job.objects.filter(pk=a.current_job_id).select_related('app','release','build').first()
+                  print('AGENT', a.id, a.name, a.platform, 'current_job', a.current_job_id, 'last_seen', a.last_seen_at if hasattr(a,'last_seen_at') else '', 'job', cj.type if cj else '', cj.status if cj else '', cj.app.slug if cj and cj.app_id else '', f'{cj.release.version_name}/{cj.release.build_number}' if cj and cj.release_id else '')
+          for j in Job.objects.filter(status__in=['queued','running'],available_to_agents=True,required_platform='macos').select_related('app','release').order_by('created_at','pk'):
+              print('MAC_QUEUE',j.id,j.type,j.status,j.app.slug if j.app_id else '',f'{j.release.version_name}/{j.release.build_number}' if j.release_id else '',j.created_at,j.started_at)
           for s in Submission.objects.filter(release=r).order_by('platform'):
               print('SUBMISSION', s.platform, s.state, s.external_id)
           PY

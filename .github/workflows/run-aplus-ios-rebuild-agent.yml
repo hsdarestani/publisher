@@ -1,5 +1,5 @@
 name: Run A+ iOS recovery agent
-# Build 29 queue nudge: clear any terminal Mac pointer and claim the Esthetic iOS build.
+# Build 53 Apple upload recovery: claim exactly one queued macOS job.
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: '1'
           PUBLISHER_URL: https://publisher.smarbiz.sbs
-          PUBLISHER_MAX_JOBS: '3'
+          PUBLISHER_MAX_JOBS: '1'
         run: |
           set -o pipefail
           python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/aplus-ios-agent.log

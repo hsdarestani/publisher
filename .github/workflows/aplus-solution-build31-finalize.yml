@@ -1,4 +1,4 @@
-name: Finalize A+ Solution Build 31
+name: Finalize A+ Solution Build 53
 
 on:
   push:
@@ -17,9 +17,9 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      RELEASE_VERSION: '1.0.12'
-      RELEASE_BUILD: '31'
-      RELEASE_COMMIT: 'ec0c7865c70f088dc60a78c4870d3336e56d0544'
+      RELEASE_VERSION: '1.0.19'
+      RELEASE_BUILD: '53'
+      RELEASE_COMMIT: 'e5cad700bdb90410e6cf8eff990e39c16ae9aaad'
       STATUS_ISSUE: '74'
     steps:
       - name: Install SSH tooling

@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 env:
-  APLUS_COMMIT: 'aeba3af74f426f27756a6b708ed25cf05bd8cfe9'
+  APLUS_COMMIT: 'e5cad700bdb90410e6cf8eff990e39c16ae9aaad'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -37,12 +37,12 @@ jobs:
           VERIFIED=0
           for i in $(seq 1 80); do
             RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
-            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null; then
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select((.name == "STRATO DR stage backup server" or .name == "Validate and deploy A+ Solution") and .status == "completed" and .conclusion == "success")' >/dev/null; then
               VERIFIED=1
               break
             fi
-            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled"))' >/dev/null; then
-              echo "A+ Solution deploy failed for $APLUS_COMMIT" >&2
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "STRATO DR stage backup server" and .status == "completed" and (.conclusion == "failure" or .conclusion == "cancelled"))' >/dev/null; then
+              echo "A+ Solution DR deploy failed for $APLUS_COMMIT" >&2
               exit 1
             fi
             echo "Waiting for deployed A+ source commit $APLUS_COMMIT ($i/80)..."
@@ -181,12 +181,12 @@ jobs:
               'with an admin-only audit log, imported WIW hours in attendance PDF output, German date and 24-hour time selection, '
               'stable mobile Dienstplan week/avatar rendering after app resume, a fixed Gesamtstunden bar above navigation, and removal of the temporary '
               'employee location clock-in UI. This release also prevents unexpected iOS WebView reloads from replaying the launch animation during use '
-              'and improves visibility of the mobile header logo without increasing header height. There are no in-app purchases.'
+              'and improves visibility of the mobile header logo without increasing header height. The admin dashboard now clearly lists employees with missing post-shift time reports, including the exact shift date, planned start/end time, location and role. There are no in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Stabilitätsupdate für iPhone und mobile Nutzung: unerwartete App-Neustarts bzw. erneute Startanimationen wurden verhindert; außerdem ist das Logo im mobilen Header besser sichtbar. Zusätzlich bleiben die aktuellen Dienstplan- und Zeiterfassungsverbesserungen enthalten.'
+              loc.release_notes='Verbesserte Zeiterfassung für Administratoren: Fehlende Arbeitszeiten werden jetzt mit Mitarbeitername, Datum, geplanter Uhrzeit, Einsatzort und Tätigkeit direkt und übersichtlich angezeigt. Zusätzlich bleiben die aktuellen Stabilitätsverbesserungen für mobile Nutzung enthalten.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -242,7 +242,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Verbesserte mobile Dienstplanung und Zeiterfassung: manuelle Arbeitszeiten nach Schichtende, Admin-Zeitbearbeitung mit Zeitlog, WIW-Stunden im PDF, deutsche 24-Stunden-Auswahl sowie stabilerer Dienstplan nach App-Rückkehr.'
+          release.release_notes='Verbesserte Zeiterfassung für Administratoren: Fehlende Arbeitszeiten werden jetzt mit Mitarbeitername, Datum, geplanter Uhrzeit, Einsatzort und Tätigkeit direkt und übersichtlich angezeigt. Zusätzlich bleiben die aktuellen mobilen Dienstplan- und Stabilitätsverbesserungen enthalten.'
           release.save()
 
           queued=[]

@@ -1,0 +1,175 @@
+name: Recover A+ Solution Build 53 Apple delivery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build53-apple-recovery.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Clear stale terminal Mac pointer and verify queued upload
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import BuildAgent, Job, MobileApp, Release
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.19',build_number=53,source_commit='e5cad700bdb90410e6cf8eff990e39c16ae9aaad')
+          ios=r.builds.get(platform='ios')
+          assert ios.status=='succeeded' and ios.artifact
+
+          agent=BuildAgent.objects.get(name='A+ Cloud Mac · GitHub Actions')
+          current=agent.current_job
+          if current and current.status not in {'queued','running'}:
+              print(f'clearing_terminal_agent_pointer={current.id}:{current.type}:{current.status}')
+              agent.current_job=None
+              agent.save(update_fields=['current_job','updated_at'])
+
+          upload=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first()
+          assert upload is not None
+          if upload.status=='failed':
+              upload.status='queued'
+              upload.error=''
+              upload.started_at=None
+              upload.finished_at=None
+              upload.progress=0
+              upload.save(update_fields=['status','error','started_at','finished_at','progress','updated_at'])
+          assert upload.status in {'queued','running','succeeded'}
+          print(f'upload_job={upload.id}:{upload.status}')
+          PY
+
+  upload:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Publisher agent dependencies
+        run: pip install 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+      - name: Verify Publisher health
+        run: |
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 10 --max-time 20 https://publisher.smarbiz.sbs/healthz/
+      - name: Claim exactly one macOS job
+        env:
+          PYTHONUNBUFFERED: '1'
+          PUBLISHER_URL: https://publisher.smarbiz.sbs
+          PUBLISHER_MAX_JOBS: '1'
+        run: |
+          set -o pipefail
+          python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/build53-apple-upload.log
+          grep -qE 'Apple accepted the binary upload|No macOS job is queued' /tmp/build53-apple-upload.log || true
+
+  finalize:
+    needs: upload
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - name: Queue Apple review submission and verify both stores
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+
+          for i in $(seq 1 60); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job,MobileApp,Release
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.19',build_number=53)
+          ios=r.builds.get(platform='ios')
+          u=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first()
+          print('|'.join([u.status if u else 'missing',str(u.error or '').replace('|','/')[:300] if u else '',ios.external_build_id or '']))
+          PY
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
+            echo "Apple upload: $STATE"
+            IFS='|' read -r UST UERR APPLE_ID <<< "$STATE"
+            [ "$UST" != failed ] || { echo "$UERR" >&2; exit 1; }
+            if [ "$UST" = succeeded ] && [ -n "$APPLE_ID" ]; then break; fi
+            sleep 15
+          done
+          [ "$UST" = succeeded ] && [ -n "$APPLE_ID" ]
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job,MobileApp,Release
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.19',build_number=53)
+          ios=r.builds.get(platform='ios')
+          assert ios.status=='succeeded' and ios.external_build_id
+          existing=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          if existing and existing.status=='failed':
+              existing=None
+          if not existing:
+              j=enqueue_job('submit_apple',app=app,release=r,build=ios)
+              print('queued_submit_apple='+str(j.id))
+          else:
+              print('submit_apple='+str(existing.id)+':'+existing.status)
+          PY
+
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job,MobileApp,Release,Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.19',build_number=53)
+          g=Job.objects.filter(release=r,type='submit_google').order_by('-created_at').first()
+          a=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          gs=Submission.objects.filter(release=r,platform='android').first()
+          aps=Submission.objects.filter(release=r,platform='ios').first()
+          print('|'.join([
+              g.status if g else 'missing',
+              a.status if a else 'missing',
+              str(a.error or '').replace('|','/')[:300] if a else '',
+              gs.state if gs else '',
+              aps.state if aps else '',
+              aps.external_id if aps else '',
+          ]))
+          PY
+            )"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
+            echo "Store state: $STATE"
+            IFS='|' read -r GST AST AERR GS AS AID <<< "$STATE"
+            [ "$AST" != failed ] || { echo "$AERR" >&2; exit 1; }
+            if [ "$GST" = succeeded ] && [ "$AST" = succeeded ] && [ -n "$GS" ] && [ -n "$AS" ]; then
+              BODY=$(printf '✅ A+ Solution 1.0.19 build 53 delivery recovered and submitted.\n\n- Source commit: %s\n- Google Play: **%s**\n- App Store Connect: **%s**\n- Apple build id: **%s**\n- Recovery workflow: %s/%s/actions/runs/%s' 'e5cad700bdb90410e6cf8eff990e39c16ae9aaad' "$GS" "$AS" "$APPLE_ID" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+              gh issue edit 74 --repo "$GITHUB_REPOSITORY" --body "$BODY"
+              gh issue close 74 --repo "$GITHUB_REPOSITORY" >/dev/null || true
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for final store submissions.' >&2
+          exit 1

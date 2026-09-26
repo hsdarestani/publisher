@@ -1,0 +1,166 @@
+name: A+ Solution missing time native build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-missing-time-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APLUS_COMMIT: 'e5cad700bdb90410e6cf8eff990e39c16ae9aaad'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: production
+    steps:
+      - name: Verify A+ source is live
+        run: |
+          set -euo pipefail
+          HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | python3 -c "import json,sys; print(json.load(sys.stdin)['commit']['sha'])")"
+          test "$HEAD" = "$APLUS_COMMIT"
+          curl -fsS --retry 10 --retry-delay 3 https://app.aplus-solution.de/health/ >/dev/null
+
+      - name: Queue signed Android and iOS builds in Publisher
+        id: queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os, re
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          cfg = dict(app.build_config or {})
+          cfg['android_command'] = 'bash frontend/scripts/build-publisher-android.sh'
+          cfg['android_artifact'] = 'frontend/android/app/build/outputs/bundle/release/*.aab'
+          cfg['ios_command'] = 'bash frontend/scripts/build-publisher-ios-opaque.sh'
+          cfg['ios_artifact'] = 'frontend/ios/build/export/*.ipa'
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          cfg['env'] = env
+          app.build_config = cfg
+          app.save(update_fields=['build_config','updated_at'])
+
+          def semver(value):
+              nums=[int(x) for x in re.findall(r'\d+', str(value or ''))[:3]]
+              while len(nums)<3: nums.append(0)
+              return tuple(nums)
+
+          def bump(value):
+              a,b,c=semver(value)
+              return f'{a}.{b}.{c+1}'
+
+          apple=AppleStoreClient(app.apple_account)
+          apple_app=apple.find_app(app.bundle_id)
+          versions=apple.list_versions(apple_app['id'], limit=50)
+          current=max(versions,key=lambda x: semver((x.get('attributes') or {}).get('versionString')),default=None)
+          attrs=(current or {}).get('attributes') or {}
+          current_version=attrs.get('versionString') or '1.0.0'
+          current_state=attrs.get('appStoreState') or attrs.get('appVersionState') or 'UNKNOWN'
+          replaceable={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED','WAITING_FOR_REVIEW','IN_REVIEW','INVALID_BINARY'}
+          target_version=current_version if current_state in replaceable else bump(current_version)
+
+          db_max=max(Release.objects.filter(app=app).values_list('build_number',flat=True),default=0)
+          apple_max=0
+          for item in apple.list_builds(apple_app['id'], limit=50):
+              try: apple_max=max(apple_max,int((item.get('attributes') or {}).get('version')))
+              except (TypeError,ValueError): pass
+
+          google_max=0
+          gp=GooglePlayClient(app.google_account)
+          edit=None
+          try:
+              edit=gp._open_edit(app.package_name)
+              tracks=gp._edit_request(edit,'GET',f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}/tracks').get('tracks',[])
+              for track in tracks:
+                  for rel in track.get('releases') or []:
+                      for code in rel.get('versionCodes') or []:
+                          try: google_max=max(google_max,int(code))
+                          except (TypeError,ValueError): pass
+          finally:
+              if edit: gp._safe_delete_edit(edit)
+
+          build_number=max(db_max,apple_max,google_max)+1
+          release,_=Release.objects.get_or_create(app=app,version_name=target_version,build_number=build_number)
+          release.status='building'
+          release.source_branch='main'
+          release.source_commit=os.environ['APLUS_COMMIT']
+          release.android_track='production'
+          release.android_rollout=1
+          release.ios_release_type='automatic'
+          release.auto_submit=False
+          release.release_notes='Fehlende Arbeitszeiten sind im Admin Dashboard klar sichtbar, mit Mitarbeiter, Datum, Uhrzeit, Einsatzort und Position der betroffenen Schichten.'
+          release.save()
+
+          queued=[]
+          for platform,job_type,runner in [('android','build_android','linux'),('ios','build_ios','macos')]:
+              build,_=Build.objects.get_or_create(release=release,platform=platform)
+              if not Job.objects.filter(build=build,type=job_type,status__in=['queued','running']).exists():
+                  build.status='queued'
+                  build.logs=''
+                  build.finished_at=None
+                  build.external_build_id=''
+                  build.metadata={}
+                  if build.artifact: build.artifact.delete(save=False)
+                  build.artifact=''
+                  build.artifact_size=0
+                  build.artifact_checksum=''
+                  build.save()
+                  queued.append(str(enqueue_job(job_type,app=app,release=release,build=build,payload={'source':'missing-time-dashboard'},agent=True,platform=runner).id))
+          print('META='+json.dumps({'release_id':str(release.id),'version':target_version,'build':build_number,'apple_state':current_state,'queued':queued},separators=(',',':')))
+          PY
+          )"
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^META=//p' | tail -n1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['release_id'])")" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])")" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | python3 -c "import json,sys; print(json.load(sys.stdin)['build'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Wake Publisher builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id, ref: 'main'});
+            }
+
+      - name: Wait for signed artifacts
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.queue.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Build,Release; r=Release.objects.get(id=os.environ['RELEASE_ID']); print('|'.join([f'{p}:{(b:=Build.objects.get(release=r,platform=p)).status}:{bool(b.artifact)}' for p in ['android','ios']]))\"")"
+            STATE="$(printf '%s\n' "$STATE" | tail -n1 | tr -d '\r')"
+            echo "$STATE"
+            [[ "$STATE" == *":failed:"* ]] && exit 1
+            if [[ "$STATE" == "android:succeeded:True|ios:succeeded:True" ]]; then
+              echo "Signed Android and iOS builds are ready."
+              exit 0
+            fi
+            sleep 20
+          done
+          exit 1

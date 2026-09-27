@@ -1,0 +1,231 @@
+name: Build and submit A+ Esthetic Android Build 31
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-build31-android-google-login-fix.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-android-build31
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      SOURCE_COMMIT: a1d79066013dbbf939701875d4bae5359b05790f
+      VERSION_NAME: 1.0.26
+      BUILD_NUMBER: '31'
+    steps:
+      - name: Create Android Build 31 in Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Build
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          version=os.environ['VERSION_NAME']
+          build_number=int(os.environ['BUILD_NUMBER'])
+          app=MobileApp.objects.get(slug='a-esthetic')
+          notes='Google Anmeldung unter Android stabilisiert.'
+
+          release,created=Release.objects.get_or_create(
+              app=app,
+              version_name=version,
+              build_number=build_number,
+              defaults={
+                  'status':'building',
+                  'source_branch':'main',
+                  'source_commit':source,
+                  'android_track':'production',
+                  'android_rollout':1,
+                  'ios_release_type':'manual',
+                  'auto_submit':True,
+                  'release_notes':notes,
+              },
+          )
+
+          changed=[]
+          if release.source_commit != source:
+              release.source_commit=source; changed.append('source_commit')
+          if release.source_branch != 'main':
+              release.source_branch='main'; changed.append('source_branch')
+          if release.release_notes != notes:
+              release.release_notes=notes; changed.append('release_notes')
+          if release.status in {'draft','failed','rejected'}:
+              release.status='building'; changed.append('status')
+          if changed:
+              release.save(update_fields=changed+['updated_at'])
+
+          app.latest_commit_sha=source
+          app.save(update_fields=['latest_commit_sha','updated_at'])
+          for loc in app.localizations.all():
+              loc.release_notes=notes
+              loc.save(update_fields=['release_notes','updated_at'])
+
+          android,_=Build.objects.get_or_create(
+              release=release,
+              platform='android',
+              defaults={'status':'queued','commit_sha':source},
+          )
+
+          live=release.jobs.filter(
+              type='build_android',
+              status__in=['queued','running','succeeded'],
+          ).order_by('-pk').first()
+
+          if android.status not in {'succeeded','running'} and not live:
+              android.status='queued'
+              android.commit_sha=source
+              android.save(update_fields=['status','commit_sha','updated_at'])
+              job=enqueue_job(
+                  'build_android',
+                  app=app,
+                  release=release,
+                  build=android,
+                  agent=True,
+                  platform='linux',
+              )
+              print('QUEUED build_android',job.pk)
+          else:
+              print('BUILD_STATE',android.status,'job',getattr(live,'pk',None),getattr(live,'status',None))
+
+          print('RELEASE',release.pk,release.version_name,release.build_number,release.source_commit,'created',created)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell"
+
+      - name: Wake Android cloud builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-linux.yml',
+              ref: 'main'
+            });
+
+      - name: Upload Android build to Google Play
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 240); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(
+              app=app,
+              version_name=os.environ['VERSION_NAME'],
+              build_number=int(os.environ['BUILD_NUMBER']),
+          )
+          android=release.builds.get(platform='android')
+
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+
+          def active_or_done(kind):
+              job=latest(kind)
+              return bool(job and job.status in {'queued','running','succeeded'})
+
+          submission=Submission.objects.filter(
+              release=release,
+              platform='android',
+          ).first()
+
+          if android.status=='succeeded' and not submission and not active_or_done('upload_google'):
+              job=enqueue_job(
+                  'upload_google',
+                  app=app,
+                  release=release,
+                  build=android,
+              )
+              print('QUEUED upload_google',job.pk)
+
+          submission=Submission.objects.filter(
+              release=release,
+              platform='android',
+          ).first()
+          build_job=latest('build_android')
+          upload_job=latest('upload_google')
+
+          print(
+              'STATE',
+              'release',release.pk,release.version_name,release.build_number,
+              'android',android.status,
+              'google',submission.state if submission else 'pending',
+              'build_job',build_job.status if build_job else 'missing',
+              'upload_job',upload_job.status if upload_job else 'missing',
+          )
+
+          failures=[]
+          deferred=False
+          for kind in ('build_android','upload_google'):
+              job=latest(kind)
+              if not job or job.status!='failed':
+                  continue
+              error=job.error or ''
+              if kind=='upload_google' and (
+                  'CHANGES_ALREADY_IN_REVIEW' in error
+                  or 'already have changes in review' in error
+              ):
+                  deferred=True
+                  print('GOOGLE_REVIEW_DEFERRED',error[:1200])
+                  continue
+              failures.append((kind,error))
+
+          for kind,error in failures:
+              print('FAILED',kind,error[:1200])
+
+          if failures:
+              raise SystemExit(2)
+
+          if submission and submission.state in {'in_review','approved','live'}:
+              print('DONE')
+          elif android.status=='succeeded' and deferred:
+              print('STORE_REVIEW_DEFERRED')
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            set +e
+            STATE=$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" 2>&1)
+            RC=$?
+            set -e
+            echo "$STATE"
+            if [ "$RC" -eq 2 ]; then exit 1; fi
+            if printf '%s' "$STATE" | grep -q '^DONE$'; then exit 0; fi
+            if printf '%s' "$STATE" | grep -q '^STORE_REVIEW_DEFERRED$'; then exit 0; fi
+
+            if [ $((attempt % 10)) -eq 0 ]; then
+              gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            fi
+            sleep 20
+          done
+          exit 1

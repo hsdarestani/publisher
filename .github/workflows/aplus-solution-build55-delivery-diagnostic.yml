@@ -50,3 +50,5 @@ jobs:
                   print('JOB_DETAIL',jid,'status',j.status,'progress',j.progress,'updated',j.updated_at,'error',str(j.error or '')[:1000])
                   print('JOB_LOG_TAIL',jid,repr(str(j.logs or '')[-6000:]))
           PY
+
+# status-probe

@@ -44,4 +44,9 @@ jobs:
               print('MAC_QUEUE',j.id,j.type,j.status,j.app.slug if j.app_id else '',f'{j.release.version_name}/{j.release.build_number}' if j.release_id else '',j.created_at,j.started_at)
           for s in Submission.objects.filter(release=r).order_by('platform'):
               print('SUBMISSION', s.platform, s.state, s.external_id)
+          for jid in (3161,3163):
+              j=Job.objects.filter(pk=jid).first()
+              if j:
+                  print('JOB_DETAIL',jid,'status',j.status,'progress',j.progress,'updated',j.updated_at,'error',str(j.error or '')[:1000])
+                  print('JOB_LOG_TAIL',jid,repr(str(j.logs or '')[-6000:]))
           PY

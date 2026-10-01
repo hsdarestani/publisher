@@ -1,0 +1,77 @@
+name: Free A+ Solution build 56 Mac queue
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/free-aplus-solution-build56-mac-queue.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Cancel stuck Cloud Mac runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method POST repos/${GITHUB_REPOSITORY}/actions/runs/36854074233/cancel || true
+
+      - name: Release stale Publisher Mac job
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import BuildAgent, Job, MobileApp, Release
+
+          stuck = Job.objects.select_related('build','app','release').get(pk=3295)
+          if stuck.status in {'queued','running'}:
+              stuck.status = 'cancelled'
+              stuck.finished_at = timezone.now()
+              stuck.error = 'Cancelled to release the shared macOS agent for the waiting A+ Solution App Store upload.'
+              stuck.append_log(stuck.error)
+              stuck.save(update_fields=['status','finished_at','error','updated_at'])
+              if stuck.build and stuck.type == 'build_ios' and stuck.build.status in {'queued','claimed','running'}:
+                  stuck.build.status = 'cancelled'
+                  stuck.build.finished_at = timezone.now()
+                  stuck.build.save(update_fields=['status','finished_at','updated_at'])
+
+          for agent in BuildAgent.objects.filter(platform='macos', current_job_id=stuck.pk):
+              agent.current_job = None
+              agent.save(update_fields=['current_job','updated_at'])
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          release = Release.objects.get(app=app, version_name='1.0.21', build_number=56)
+          upload = Job.objects.get(pk=3297, release=release, type='upload_apple')
+          if upload.status == 'running':
+              upload.status = 'queued'
+              upload.started_at = None
+              upload.progress = 0
+              upload.error = ''
+              upload.save(update_fields=['status','started_at','progress','error','updated_at'])
+          assert upload.status == 'queued', f'Unexpected A+ upload state: {upload.status}'
+          print('stuck_job', stuck.pk, stuck.status)
+          print('aplus_upload', upload.pk, upload.status)
+          PY
+
+      - name: Nudge Cloud Mac queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method POST repos/${GITHUB_REPOSITORY}/actions/workflows/cloud-macos.yml/dispatches -f ref=main

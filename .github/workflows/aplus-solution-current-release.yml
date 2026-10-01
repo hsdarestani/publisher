@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 env:
-  APLUS_COMMIT: '106fcd9e400f82fc800e698c1fea7c2034934c4f'
+  APLUS_COMMIT: 'e6305209f982d01513db738fd7e1c33034d53367'
   STATUS_ISSUE: '74'
 
 jobs:
@@ -177,14 +177,14 @@ jobs:
               'availability, assigned shifts, time tracking, documents, notifications and internal communication. '
               'The supplied App Review account is a dedicated active employee test account with no invitation step and no two factor authentication. '
               'Its exact credential is verified against the public production login immediately before submission. '
-              'This release adds employee calendar subscription for assigned shifts so Apple Calendar, Google Calendar and Outlook can refresh later changes automatically. '
-              'It also keeps the detailed individual time entry PDF and submitted time markers restricted to administrators, '
-              'and makes shift notes visible in authorized client schedule views. There are no in app purchases.'
+              'This release adds Einsatzplan PDF attachments for shifts. Administrators and authorized clients can upload one or many event plan PDFs, '
+              'the app matches them to the correct shifts using event number, date, customer, location and note context, '
+              'and assigned employees can securely download the plan from their shift. Matching for multi day events and the upload result UI were also improved. There are no in app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Mitarbeiter können zugewiesene Schichten jetzt einmalig mit Apple Kalender, Google Kalender oder Outlook abonnieren. Spätere Änderungen werden über das Kalenderabo automatisch aktualisiert. Zusätzlich wurden Zugriffsrechte bei Zeiterfassung und Schichtnotizen im Kundenportal verbessert.'
+              loc.release_notes='Neue Einsatzplan PDF Funktion: Administration und berechtigte Kunden können einzelne oder mehrere Einsatzplan PDFs hochladen. Das System ordnet die Pläne anhand von Eventnummer, Datum, Kunde, Ort und Notiz automatisch den passenden Schichten zu. Zugewiesene Mitarbeiter können den Einsatzplan direkt in ihrer Schicht herunterladen. Die Erkennung mehrtägiger Events und die Darstellung der Upload Ergebnisse wurden verbessert.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -240,7 +240,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Mitarbeiter können zugewiesene Schichten jetzt einmalig mit Apple Kalender, Google Kalender oder Outlook abonnieren. Spätere Änderungen werden über das Kalenderabo automatisch aktualisiert. Zusätzlich wurden Zugriffsrechte bei Zeiterfassung und Schichtnotizen im Kundenportal verbessert.'
+          release.release_notes='Neue Einsatzplan PDF Funktion: Administration und berechtigte Kunden können einzelne oder mehrere Einsatzplan PDFs hochladen. Das System ordnet die Pläne anhand von Eventnummer, Datum, Kunde, Ort und Notiz automatisch den passenden Schichten zu. Zugewiesene Mitarbeiter können den Einsatzplan direkt in ihrer Schicht herunterladen. Die Erkennung mehrtägiger Events und die Darstellung der Upload Ergebnisse wurden verbessert.'
           release.save()
 
           queued=[]

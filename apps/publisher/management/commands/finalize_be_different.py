@@ -9,6 +9,9 @@ from apps.publisher.models import Build, Job, MobileApp, Release, Submission
 from apps.publisher.tasks import enqueue_job
 
 
+TARGET_SOURCE_COMMIT = "e62e86767dc331a8aeea7de3dc9690d3505f4fbb"
+
+
 class Command(BaseCommand):
     help = "Drive the BE DIFFERENT 1.0.0 (2) release through native builds and store delivery."
 
@@ -21,8 +24,8 @@ class Command(BaseCommand):
         release = Release.objects.get(app=app, version_name="1.0.0", build_number=2)
 
         changed = []
-        source_commit = (options.get("source_commit") or "").strip()
-        if source_commit and release.source_commit != source_commit:
+        source_commit = TARGET_SOURCE_COMMIT
+        if release.source_commit != source_commit:
             release.source_commit = source_commit
             changed.append("source_commit")
         if not release.auto_submit:

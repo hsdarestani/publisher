@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          SOURCE_COMMIT="423b50f247b51b2ddc60845e264a476b8277e499"
+          SOURCE_COMMIT="e62e86767dc331a8aeea7de3dc9690d3505f4fbb"
 
           for attempt in $(seq 1 30); do
             echo "=== Finalizer attempt $attempt ==="

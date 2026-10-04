@@ -155,7 +155,10 @@ def agent_complete(request, job_pk):
         and job.type == "build_android"
         and build
         and job.release
-        and job.release.auto_submit
+        and (
+            job.release.auto_submit
+            or (job.app.slug == "be-different" and job.release.android_track == "internal")
+        )
         and job.app.google_account
         and job.app.google_account.configured
     ):
@@ -172,7 +175,9 @@ def agent_complete(request, job_pk):
                 build=build,
             )
             next_job.append_log(
-                "Automatically queued after the cloud Android build because auto_submit is enabled."
+                "Automatically queued after the cloud Android build for internal delivery."
+                if job.app.slug == "be-different" and not job.release.auto_submit
+                else "Automatically queued after the cloud Android build because auto_submit is enabled."
             )
 
     if (
@@ -180,7 +185,7 @@ def agent_complete(request, job_pk):
         and job.type == "build_ios"
         and build
         and job.release
-        and job.release.auto_submit
+        and (job.release.auto_submit or job.app.slug == "be-different")
         and job.app.apple_account
         and job.app.apple_account.configured
     ):
@@ -199,7 +204,9 @@ def agent_complete(request, job_pk):
                 platform="macos",
             )
             next_job.append_log(
-                "Automatically queued after the cloud iOS build because auto_submit is enabled."
+                "Automatically queued after the cloud iOS build for App Store Connect delivery without review submission."
+                if job.app.slug == "be-different" and not job.release.auto_submit
+                else "Automatically queued after the cloud iOS build because auto_submit is enabled."
             )
 
     if succeeded and job.type == "upload_apple" and job.release and job.release.auto_submit:

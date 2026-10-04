@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import timedelta
 
 from django.db import transaction
 from django.http import JsonResponse
@@ -71,8 +73,25 @@ def agent_claim(request):
         # inside SELECT FOR UPDATE makes PostgreSQL reject the outer join.
         current = agent.current_job
         if current and current.status in {"queued", "running"}:
-            return JsonResponse({"job": None, "busy_job": current.pk})
-        if current:
+            stale_minutes = max(5, int(os.getenv("PUBLISHER_AGENT_STALE_MINUTES", "15")))
+            stale_before = timezone.now() - timedelta(minutes=stale_minutes)
+            if current.status == "running" and current.updated_at < stale_before:
+                current.logs = (current.logs or "") + "\nRecovered stale cloud-agent lease and requeued the job."
+                current.status = "queued"
+                current.started_at = None
+                current.progress = 0
+                current.error = ""
+                current.save(update_fields=["logs", "status", "started_at", "progress", "error", "updated_at"])
+                if current.build and current.type in BUILD_JOB_TYPES and current.build.status in {"claimed", "running"}:
+                    current.build.status = "queued"
+                    current.build.agent = None
+                    current.build.started_at = None
+                    current.build.save(update_fields=["status", "agent", "started_at", "updated_at"])
+                agent.current_job = None
+                agent.save(update_fields=["current_job", "updated_at"])
+            else:
+                return JsonResponse({"job": None, "busy_job": current.pk})
+        elif current:
             agent.current_job = None
             agent.save(update_fields=["current_job", "updated_at"])
 

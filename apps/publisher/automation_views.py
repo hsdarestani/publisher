@@ -11,6 +11,7 @@ from django.views.decorators.http import require_POST
 
 from .models import MobileApp, Release, Build, Job, StoreAccount
 from .tasks import enqueue_job
+from apps.signing.services import ensure_ios_signing
 
 
 def _authorized(request) -> bool:
@@ -116,13 +117,14 @@ def automation_release(request):
             status=422,
         )
 
-    app = (
-        MobileApp.objects.filter(bundle_id=identifier).first()
-        or MobileApp.objects.filter(package_name=identifier).first()
-        or MobileApp.objects.filter(slug=identifier).first()
-    )
-    if not app:
+    if identifier == "com.smarbiz.bedifferent":
         app = _bootstrap_known_app(identifier, body)
+    else:
+        app = (
+            MobileApp.objects.filter(bundle_id=identifier).first()
+            or MobileApp.objects.filter(package_name=identifier).first()
+            or MobileApp.objects.filter(slug=identifier).first()
+        )
     if not app:
         return JsonResponse({"ok": False, "error": "app_not_found"}, status=404)
 
@@ -134,6 +136,16 @@ def automation_release(request):
     ]
     if not platforms:
         return JsonResponse({"ok": False, "error": "no_supported_platforms"}, status=422)
+
+    if "ios" in platforms and app.apple_account_id:
+        try:
+            ensure_ios_signing(app)
+        except Exception as exc:
+            return JsonResponse({
+                "ok": False,
+                "error": "ios_signing_provisioning_failed",
+                "detail": str(exc),
+            }, status=409)
 
     source_commit = str(body.get("source_commit") or "").strip()
     source_branch = str(body.get("source_branch") or app.default_branch or "main").strip()

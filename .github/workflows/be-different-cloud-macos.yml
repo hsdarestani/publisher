@@ -2,6 +2,10 @@ name: BE DIFFERENT Cloud Mac
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/be-different-cloud-macos.yml'
 
 permissions:
   contents: read
@@ -53,3 +57,5 @@ jobs:
           PUBLISHER_AGENT_APP_SLUG: be-different
           FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64: ${{ secrets.BEDIFFERENT_FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64 }}
         run: python agents/custom_cloud_macos_altool.py
+
+# queue nudge 1791150048944

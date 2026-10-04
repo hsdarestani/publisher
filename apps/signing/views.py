@@ -20,7 +20,10 @@ from .services import ensure_android_signing
 @require_GET
 def job_credentials(request, job_pk):
     agent = github_cloud_agent(request)
-    if not agent or agent.platform != "linux" or agent.current_job_id != job_pk:
+    # Dedicated app-scoped Linux agents authenticate as variants such as
+    # "linux_bedifferent". They are still Linux build agents and must be able
+    # to fetch signing material for the job they currently own.
+    if not agent or not agent.platform.startswith("linux") or agent.current_job_id != job_pk:
         return JsonResponse({"error": "unauthorized"}, status=401)
 
     job = get_object_or_404(Job.objects.select_related("app"), pk=job_pk)

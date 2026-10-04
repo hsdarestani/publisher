@@ -236,10 +236,7 @@ class CustomBuildMacAgent(CloudMacAgent):
                     "APPLE_ISSUER_ID": apple["issuer_id"],
                     "IOS_TEAM_ID": apple["team_id"],
                     "IOS_BUNDLE_ID": str(payload.get("bundle_id") or ""),
-                    "IOS_SIGNING_STYLE": "Manual",
-                    "IOS_CODE_SIGN_IDENTITY": "Apple Distribution",
-                    "IOS_PROVISIONING_PROFILE_SPECIFIER": installed["profile_name"],
-                    "IOS_PROVISIONING_PROFILE_UUID": installed["profile_uuid"],
+                    "IOS_SIGNING_STYLE": "Automatic",
                     "IOS_SIGNING_KEYCHAIN": str(installed["keychain_path"]),
                 }
             )

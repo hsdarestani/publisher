@@ -26,6 +26,14 @@ _AGENT_CONFIG = {
         "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},
     },
+    "macos_bedifferent": {
+        "name": "A+ Cloud Mac · BE DIFFERENT",
+        "workflows": [
+            ".github/workflows/be-different-cloud-macos.yml@",
+        ],
+        "labels": ["github-hosted", "ephemeral", "xcode", "cloud", "be-different"],
+        "capabilities": {"oidc": True, "ephemeral": True, "xcode": True, "app": "be-different"},
+    },
     "linux": {
         "name": "A+ Cloud Linux · GitHub Actions",
         "workflows": [

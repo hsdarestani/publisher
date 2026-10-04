@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           PORT="${SSH_PORT:-22}"
           OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
-            "cd /opt/aplus-publisher && echo '=== PS ===' && docker compose ps && echo '=== WEB ===' && docker compose logs --tail=160 web && echo '=== WORKER ===' && docker compose logs --tail=120 worker" 2>&1 || true)"
+            "cd /opt/aplus-publisher && echo '=== PS ===' && docker compose ps && echo '=== BE DIFFERENT ===' && docker compose exec -T web python manage.py shell -c 'import json; from apps.publisher.models import MobileApp,Release,Job,Submission; a=MobileApp.objects.get(slug=\"be-different\"); r=Release.objects.get(app=a,version_name=\"1.0.0\",build_number=2); print(json.dumps({\"release\":{\"id\":r.id,\"status\":r.status,\"source_commit\":r.source_commit,\"auto_submit\":r.auto_submit},\"builds\":[{\"id\":b.id,\"platform\":b.platform,\"status\":b.status,\"external_build_id\":b.external_build_id} for b in r.builds.all()],\"jobs\":[{\"id\":j.id,\"type\":j.type,\"status\":j.status,\"error\":j.error[-300:]} for j in Job.objects.filter(release=r).order_by(\"-created_at\")[:20]],\"submissions\":[{\"platform\":s.platform,\"state\":s.state,\"external_id\":s.external_id,\"last_error\":s.last_error} for s in Submission.objects.filter(release=r)]}, default=str))' && echo '=== WEB ===' && docker compose logs --tail=100 web && echo '=== WORKER ===' && docker compose logs --tail=100 worker" 2>&1 || true)"
           printf '%s\n' "$OUTPUT"
           {
             echo 'output<<EOF'

@@ -139,3 +139,34 @@ def github_cloud_agent(request):
             ]
         )
         return agent
+
+
+def github_release_automation(request) -> bool:
+    """Authenticate BE DIFFERENT release requests from its GitHub workflow via OIDC."""
+
+    token = request.headers.get("X-GitHub-OIDC", "").strip()
+    if not token:
+        return False
+    audience = os.getenv("GITHUB_OIDC_AUDIENCE", "https://publisher.smarbiz.sbs").rstrip("/")
+    try:
+        signing_key = _GITHUB_JWKS.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=audience,
+            issuer=_GITHUB_OIDC_ISSUER,
+            options={"require": ["exp", "iat", "iss", "aud", "repository", "ref"]},
+        )
+    except Exception as exc:
+        logger.warning("Rejected BE DIFFERENT release OIDC token: %s", exc)
+        return False
+
+    if claims.get("repository") != "hsdarestani/aymantraining":
+        return False
+    if claims.get("ref") != "refs/heads/main":
+        return False
+    if claims.get("event_name") not in {"push", "workflow_dispatch"}:
+        return False
+    workflow_ref = claims.get("workflow_ref", "")
+    return ".github/workflows/publisher-release.yml@" in workflow_ref

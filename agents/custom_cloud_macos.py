@@ -9,6 +9,7 @@ ephemeral macOS keychain; the profile is installed only for this build.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import secrets
 import shlex
@@ -76,14 +77,31 @@ class CustomBuildMacAgent(CloudMacAgent):
         key_pem.write_text(signing["private_key_pem"])
         key_pem.chmod(0o600)
         cert_der.write_bytes(base64.b64decode(signing["certificate_content_base64"]))
-        profile_bytes = base64.b64decode(signing["profile_content_base64"])
 
-        profile_uuid = signing["profile_uuid"]
         profiles_dir = Path.home() / "Library" / "MobileDevice" / "Provisioning Profiles"
         profiles_dir.mkdir(parents=True, exist_ok=True)
-        profile_path = profiles_dir / f"{profile_uuid}.mobileprovision"
-        profile_path.write_bytes(profile_bytes)
-        profile_path.chmod(0o600)
+        installed_profiles = []
+        target_profiles = {}
+        bundle_profiles = {}
+
+        profiles = signing.get("profiles") or [
+            {
+                "target_name": "",
+                "bundle_id": signing["bundle_id"],
+                "profile_name": signing["profile_name"],
+                "profile_uuid": signing["profile_uuid"],
+                "profile_content_base64": signing["profile_content_base64"],
+            }
+        ]
+        for profile in profiles:
+            profile_uuid = profile["profile_uuid"]
+            profile_path = profiles_dir / f"{profile_uuid}.mobileprovision"
+            profile_path.write_bytes(base64.b64decode(profile["profile_content_base64"]))
+            profile_path.chmod(0o600)
+            installed_profiles.append(profile_path)
+            if profile.get("target_name"):
+                target_profiles[profile["target_name"]] = profile["profile_name"]
+            bundle_profiles[profile["bundle_id"]] = profile["profile_name"]
 
         keychain_password = secrets.token_urlsafe(32)
         p12_password = secrets.token_urlsafe(32)
@@ -185,11 +203,10 @@ class CustomBuildMacAgent(CloudMacAgent):
         )
 
         return {
-            "profile_path": profile_path,
+            "profile_paths": installed_profiles,
             "keychain_path": keychain_path,
-            "profile_name": signing["profile_name"],
-            "profile_uuid": profile_uuid,
-            "bundle_id": signing["bundle_id"],
+            "target_profiles": target_profiles,
+            "bundle_profiles": bundle_profiles,
             "temporary_files": [key_pem, cert_der, cert_pem, p12_path],
         }
 
@@ -204,7 +221,8 @@ class CustomBuildMacAgent(CloudMacAgent):
                 text=True,
             )
         finally:
-            installed["profile_path"].unlink(missing_ok=True)
+            for path in installed.get("profile_paths", []):
+                path.unlink(missing_ok=True)
             for path in installed["temporary_files"]:
                 path.unlink(missing_ok=True)
 
@@ -236,7 +254,10 @@ class CustomBuildMacAgent(CloudMacAgent):
                     "APPLE_ISSUER_ID": apple["issuer_id"],
                     "IOS_TEAM_ID": apple["team_id"],
                     "IOS_BUNDLE_ID": str(payload.get("bundle_id") or ""),
-                    "IOS_SIGNING_STYLE": "Automatic",
+                    "IOS_SIGNING_STYLE": "Manual",
+                    "IOS_TARGET_PROFILES_JSON": json.dumps(installed.get("target_profiles", {})),
+                    "IOS_BUNDLE_PROFILES_JSON": json.dumps(installed.get("bundle_profiles", {})),
+                    "IOS_CODE_SIGN_IDENTITY": "Apple Distribution",
                     "IOS_SIGNING_KEYCHAIN": str(installed["keychain_path"]),
                 }
             )

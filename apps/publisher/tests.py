@@ -78,6 +78,36 @@ class PublisherTests(TestCase):
             {"build_android", "build_ios"},
         )
 
+
+    @patch("apps.publisher.signals.wake_cloud_agent")
+    def test_automation_bootstraps_be_different(self, wake):
+        url = reverse("automation_release")
+        MobileApp.objects.filter(slug="be-different").delete()
+        payload = {
+            "app_identifier": "com.smarbiz.bedifferent",
+            "version_name": "1.0.0",
+            "build_number": 1,
+            "platforms": ["android", "ios"],
+            "source_branch": "main",
+            "source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }
+        with patch.dict(os.environ, {"PUBLISHER_AUTOMATION_TOKEN": "automation-test-token"}):
+            response = self.client.post(
+                url,
+                data=json.dumps(payload),
+                content_type="application/json",
+                HTTP_AUTHORIZATION="Bearer automation-test-token",
+            )
+        self.assertEqual(response.status_code, 200)
+        app = MobileApp.objects.get(slug="be-different")
+        self.assertEqual(app.package_name, "com.smarbiz.bedifferent")
+        self.assertEqual(app.bundle_id, "com.smarbiz.bedifferent")
+        self.assertEqual(app.framework, "react_native")
+        self.assertEqual(app.build_config["android_command"], "bash mobile/scripts/build-android.sh")
+        self.assertEqual(app.build_config["ios_command"], "bash mobile/scripts/build-ios.sh")
+        release = Release.objects.get(app=app, version_name="1.0.0", build_number=1)
+        self.assertEqual(set(release.jobs.values_list("type", flat=True)), {"build_android", "build_ios"})
+
     def test_dashboard_and_app_pages(self):
         self.assertEqual(self.client.get(reverse("dashboard")).status_code, 200)
         self.assertEqual(self.client.get(self.app.get_absolute_url()).status_code, 200)

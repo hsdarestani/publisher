@@ -27,7 +27,13 @@ class CustomBuildMacAgent(CloudMacAgent):
             timeout=45,
         )
         if response.status_code == 409:
-            raise RuntimeError("Publisher iOS Distribution signing/profile is not provisioned yet.")
+            detail = ""
+            try:
+                detail = response.json().get("detail") or response.json().get("error") or ""
+            except Exception:
+                detail = response.text[:1200]
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError("Publisher iOS Distribution signing/profile is not provisioned yet" + suffix)
         response.raise_for_status()
         return response.json()
 

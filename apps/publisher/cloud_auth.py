@@ -169,4 +169,10 @@ def github_release_automation(request) -> bool:
     if claims.get("event_name") not in {"push", "workflow_dispatch"}:
         return False
     workflow_ref = claims.get("workflow_ref", "")
-    return ".github/workflows/publisher-release.yml@" in workflow_ref
+    return any(
+        workflow in workflow_ref
+        for workflow in (
+            ".github/workflows/publisher-release.yml@",
+            ".github/workflows/deploy.yml@",
+        )
+    )

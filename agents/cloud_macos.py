@@ -66,7 +66,11 @@ class CloudMacAgent(Agent):
     def __init__(self, server: str, max_jobs: int = 3):
         super().__init__(server, token="oidc-placeholder", interval=5)
         self.session.headers.pop("X-Agent-Token", None)
-        self.session.headers["X-Agent-Platform"] = "macos"
+        platform = os.getenv("PUBLISHER_AGENT_PLATFORM", "macos").strip() or "macos"
+        self.session.headers["X-Agent-Platform"] = platform
+        app_slug = os.getenv("PUBLISHER_AGENT_APP_SLUG", "").strip()
+        if app_slug:
+            self.session.headers["X-Agent-App-Slug"] = app_slug
         self.session.auth = GitHubOIDCAuth(GitHubOIDCProvider(server))
         self.max_jobs = max_jobs
 

@@ -42,7 +42,11 @@ class CloudLinuxAgent(CloudMacAgent):
             self.max_jobs = max_jobs
         else:
             super().__init__(server, max_jobs=max_jobs)
-        self.session.headers["X-Agent-Platform"] = "linux"
+        platform = os.getenv("PUBLISHER_AGENT_PLATFORM", "linux").strip() or "linux"
+        self.session.headers["X-Agent-Platform"] = platform
+        app_slug = os.getenv("PUBLISHER_AGENT_APP_SLUG", "").strip()
+        if app_slug:
+            self.session.headers["X-Agent-App-Slug"] = app_slug
 
     @staticmethod
     def _transient_poll_error(exc: Exception) -> bool:

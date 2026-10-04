@@ -62,6 +62,12 @@ def agent_claim(request):
     allowed = [agent.platform]
     if agent.platform == "universal":
         allowed = ["linux", "macos"]
+    elif agent.platform.startswith("macos"):
+        allowed = ["macos"]
+    elif agent.platform.startswith("linux"):
+        allowed = ["linux"]
+
+    app_slug = request.headers.get("X-Agent-App-Slug", "").strip()
 
     with transaction.atomic():
         # GitHub-hosted macOS runners authenticate as one logical cloud agent.
@@ -95,13 +101,15 @@ def agent_claim(request):
             agent.current_job = None
             agent.save(update_fields=["current_job", "updated_at"])
 
+        jobs = Job.objects.select_for_update(skip_locked=True).filter(
+            status="queued",
+            available_to_agents=True,
+            required_platform__in=allowed,
+        )
+        if app_slug:
+            jobs = jobs.filter(app__slug=app_slug)
         job = (
-            Job.objects.select_for_update(skip_locked=True)
-            .filter(
-                status="queued",
-                available_to_agents=True,
-                required_platform__in=allowed,
-            )
+            jobs
             # Job's model default is newest-first for UI history. Agent queues
             # must be FIFO, otherwise fresh retries can starve an older release.
             .order_by("created_at", "pk")

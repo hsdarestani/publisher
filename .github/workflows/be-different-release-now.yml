@@ -1,0 +1,45 @@
+name: BE DIFFERENT release now
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/be-different-release-now.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release-now:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Finalize BE DIFFERENT immediately
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          SOURCE_COMMIT="423b50f247b51b2ddc60845e264a476b8277e499"
+
+          for attempt in $(seq 1 60); do
+            echo "=== attempt $attempt ==="
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py finalize_be_different --source-commit $SOURCE_COMMIT --json" 2>&1 || true)"
+            printf '%s\n' "$OUTPUT"
+
+            if printf '%s\n' "$OUTPUT" | grep -q 'BE_DIFFERENT_FINALIZED=true'; then
+              exit 0
+            fi
+
+            gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            gh workflow run be-different-cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            sleep 30
+          done
+          exit 1

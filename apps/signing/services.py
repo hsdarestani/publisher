@@ -249,3 +249,151 @@ def ensure_ios_signing(app):
     """Idempotently provision both the team certificate and app profile."""
 
     return ensure_ios_app_store_profile(app)
+
+
+def _ensure_apple_bundle_id(client: AppleStoreClient, identifier: str, name: str):
+    try:
+        return _find_apple_bundle_id(client, identifier)
+    except RuntimeError:
+        body = {
+            "data": {
+                "type": "bundleIds",
+                "attributes": {
+                    "identifier": identifier,
+                    "name": name,
+                    "platform": "IOS",
+                },
+            }
+        }
+        return client.request("POST", "/bundleIds", data=json.dumps(body))["data"]
+
+
+def _ensure_bundle_capability(client: AppleStoreClient, bundle: dict, capability: str):
+    enabled = client.request(
+        "GET",
+        f"/bundleIds/{bundle['id']}/bundleIdCapabilities?limit=200",
+    ).get("data", [])
+    for item in enabled:
+        if item.get("attributes", {}).get("capabilityType") == capability:
+            return item
+    body = {
+        "data": {
+            "type": "bundleIdCapabilities",
+            "attributes": {"capabilityType": capability},
+            "relationships": {
+                "bundleId": {
+                    "data": {"type": "bundleIds", "id": bundle["id"]}
+                }
+            },
+        }
+    }
+    return client.request(
+        "POST",
+        "/bundleIdCapabilities",
+        data=json.dumps(body),
+    )["data"]
+
+
+def _ensure_named_app_store_profile(
+    client: AppleStoreClient,
+    distribution: IOSDistributionCredential,
+    bundle: dict,
+    profile_name: str,
+):
+    profiles = client.request(
+        "GET",
+        f"/bundleIds/{bundle['id']}/profiles?limit=200",
+    ).get("data", [])
+    existing = next(
+        (
+            item
+            for item in profiles
+            if item.get("attributes", {}).get("name") == profile_name
+            and item.get("attributes", {}).get("profileState") == "ACTIVE"
+        ),
+        None,
+    )
+    if existing:
+        full = client.request("GET", f"/profiles/{existing['id']}")["data"]
+        attrs = full.get("attributes", {})
+        if attrs.get("profileContent"):
+            return full
+
+    body = {
+        "data": {
+            "type": "profiles",
+            "attributes": {
+                "name": profile_name,
+                "profileType": "IOS_APP_STORE",
+            },
+            "relationships": {
+                "bundleId": {
+                    "data": {"type": "bundleIds", "id": bundle["id"]}
+                },
+                "certificates": {
+                    "data": [
+                        {
+                            "type": "certificates",
+                            "id": distribution.apple_certificate_id,
+                        }
+                    ]
+                },
+            },
+        }
+    }
+    return client.request("POST", "/profiles", data=json.dumps(body))["data"]
+
+
+def ensure_be_different_ios_signing_bundle(app):
+    """Provision all BE DIFFERENT iOS/watch targets without Xcode account auth.
+
+    App Groups are deliberately not required by these distribution profiles.
+    The main app keeps HealthKit and Push Notifications; the companion targets
+    receive their own explicit App Store profiles.
+    """
+
+    if app.slug != "be-different":
+        raise RuntimeError("BE DIFFERENT signing bundle requested for another app.")
+    if not app.apple_account_id:
+        raise RuntimeError("The app is not linked to an Apple Store account.")
+
+    distribution = ensure_ios_distribution_signing(app.apple_account)
+    client = AppleStoreClient(app.apple_account)
+    targets = [
+        ("BEDIFFERENT", app.bundle_id, "BE DIFFERENT"),
+        ("widget", f"{app.bundle_id}.widget", "BE DIFFERENT Widget"),
+        ("watch", f"{app.bundle_id}.watch", "BE DIFFERENT Watch"),
+        ("watchwidget", f"{app.bundle_id}.watch-widget", "BE DIFFERENT Watch Widget"),
+    ]
+
+    material = []
+    for target_name, identifier, display_name in targets:
+        bundle = _ensure_apple_bundle_id(client, identifier, display_name)
+        if identifier == app.bundle_id:
+            _ensure_bundle_capability(client, bundle, "HEALTHKIT")
+            _ensure_bundle_capability(client, bundle, "PUSH_NOTIFICATIONS")
+
+        profile_name = f"A+ Publisher {identifier} Native Store 20261004"
+        profile = _ensure_named_app_store_profile(
+            client,
+            distribution,
+            bundle,
+            profile_name,
+        )
+        attrs = profile.get("attributes", {})
+        content = attrs.get("profileContent", "")
+        if not content:
+            raise RuntimeError(
+                f"Apple profile {profile_name} has no profileContent."
+            )
+        material.append(
+            {
+                "target_name": target_name,
+                "bundle_id": identifier,
+                "profile_name": attrs.get("name") or profile_name,
+                "profile_uuid": attrs.get("uuid", ""),
+                "profile_content_base64": content,
+            }
+        )
+
+    return distribution, material

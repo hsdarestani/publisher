@@ -72,10 +72,6 @@ jobs:
           PUBLISHER_URL: https://publisher.smarbiz.sbs
           PUBLISHER_MAX_JOBS: '3'
           FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64: ${{ secrets.BEDIFFERENT_FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64 }}
-          APPLE_TEAM_ID: ${{ secrets.BEDIFFERENT_APPLE_TEAM_ID }}
-          ASC_KEY_ID: ${{ secrets.BEDIFFERENT_ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.BEDIFFERENT_ASC_ISSUER_ID }}
-          ASC_PRIVATE_KEY_B64: ${{ secrets.BEDIFFERENT_ASC_PRIVATE_KEY_B64 }}
         run: |
           set +e
           python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/cloud-mac.log

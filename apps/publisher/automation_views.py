@@ -9,7 +9,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from .models import MobileApp, Release, Build, Job
+from .models import MobileApp, Release, Build, Job, StoreAccount
 from .tasks import enqueue_job
 
 
@@ -21,6 +21,74 @@ def _authorized(request) -> bool:
     token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
     return bool(token) and secrets.compare_digest(token, expected)
 
+
+
+def _bootstrap_known_app(identifier: str, body: dict) -> MobileApp | None:
+    if identifier != "com.smarbiz.bedifferent":
+        return None
+    build_config = {
+        "android_command": "bash mobile/scripts/build-android.sh",
+        "android_artifact": "mobile/android/app/build/outputs/bundle/release/*.aab",
+        "ios_command": "bash mobile/scripts/build-ios.sh",
+        "ios_artifact": "mobile/ios/build/export/*.ipa",
+        "env": {},
+    }
+    app, _ = MobileApp.objects.get_or_create(
+        slug="be-different",
+        defaults={
+            "name": "BE DIFFERENT",
+            "client_name": "BE DIFFERENT",
+            "platform": "both",
+            "framework": "react_native",
+            "status": "active",
+            "package_name": identifier,
+            "bundle_id": identifier,
+            "repository_url": "https://github.com/hsdarestani/aymantraining",
+            "default_branch": "main",
+            "privacy_policy_url": "https://bedifferent.smarbiz.sbs/legal/privacy",
+            "support_url": "https://bedifferent.smarbiz.sbs/",
+            "marketing_url": "https://bedifferent.smarbiz.sbs/",
+            "category": "Health & Fitness",
+            "requires_login": True,
+            "build_config": build_config,
+            "tech_stack": ["React Native", "Expo prebuild", "StoreKit 2", "Google Play Billing", "Firebase Cloud Messaging"],
+        },
+    )
+    changed = False
+    expected = {
+        "name": "BE DIFFERENT",
+        "platform": "both",
+        "framework": "react_native",
+        "status": "active",
+        "package_name": identifier,
+        "bundle_id": identifier,
+        "repository_url": "https://github.com/hsdarestani/aymantraining",
+        "default_branch": "main",
+        "privacy_policy_url": "https://bedifferent.smarbiz.sbs/legal/privacy",
+        "support_url": "https://bedifferent.smarbiz.sbs/",
+        "marketing_url": "https://bedifferent.smarbiz.sbs/",
+        "category": "Health & Fitness",
+        "requires_login": True,
+        "build_config": build_config,
+    }
+    for field, value in expected.items():
+        if getattr(app, field) != value:
+            setattr(app, field, value)
+            changed = True
+
+    if app.google_account_id is None:
+        google = StoreAccount.objects.filter(provider="google", enabled=True).first()
+        if google and google.configured:
+            app.google_account = google
+            changed = True
+    if app.apple_account_id is None:
+        apple = StoreAccount.objects.filter(provider="apple", enabled=True).first()
+        if apple and apple.configured:
+            app.apple_account = apple
+            changed = True
+    if changed:
+        app.save()
+    return app
 
 @csrf_exempt
 @require_POST
@@ -53,6 +121,8 @@ def automation_release(request):
         or MobileApp.objects.filter(package_name=identifier).first()
         or MobileApp.objects.filter(slug=identifier).first()
     )
+    if not app:
+        app = _bootstrap_known_app(identifier, body)
     if not app:
         return JsonResponse({"ok": False, "error": "app_not_found"}, status=404)
 

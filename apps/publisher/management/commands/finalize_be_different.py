@@ -9,7 +9,7 @@ from apps.publisher.models import Build, Job, MobileApp, Release, Submission
 from apps.publisher.tasks import enqueue_job
 
 
-TARGET_SOURCE_COMMIT = "e62e86767dc331a8aeea7de3dc9690d3505f4fbb"
+TARGET_SOURCE_COMMIT = "9d8fce132af4bf6fab63e97381cec0771eca846d"
 
 
 class Command(BaseCommand):

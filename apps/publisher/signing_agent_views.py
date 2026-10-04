@@ -9,6 +9,7 @@ from django.views.decorators.http import require_POST
 
 from .cloud_auth import github_cloud_agent
 from .models import BuildAgent, Job
+from apps.signing.services import ensure_be_different_ios_signing_bundle
 
 
 def _agent_from_request(request):
@@ -41,6 +42,25 @@ def ios_signing_material(request, job_pk):
         return JsonResponse({"error": "unauthorized"}, status=401)
 
     app = job.app
+    if app.slug == "be-different":
+        try:
+            distribution, profiles = ensure_be_different_ios_signing_bundle(app)
+        except Exception as exc:
+            return JsonResponse(
+                {"error": "ios_signing_not_configured", "detail": str(exc)},
+                status=409,
+            )
+        dist_data = distribution.get_credentials()
+        required = {
+            "private_key_pem": dist_data.get("private_key_pem", ""),
+            "certificate_content_base64": dist_data.get("certificate_content_base64", ""),
+            "profiles": profiles,
+            "bundle_id": app.bundle_id,
+        }
+        if not required["private_key_pem"] or not required["certificate_content_base64"] or not profiles:
+            return JsonResponse({"error": "ios_signing_incomplete"}, status=409)
+        return JsonResponse(required)
+
     try:
         distribution = app.apple_account.ios_distribution_signing
         profile = app.ios_provisioning_profile

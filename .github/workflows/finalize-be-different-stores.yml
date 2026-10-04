@@ -1,0 +1,68 @@
+name: Finalize BE DIFFERENT stores
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/finalize-be-different-stores.yml'
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: be-different-store-finalizer
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 70
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH client helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Drive native builds and store delivery to completion
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          SOURCE_COMMIT="423b50f247b51b2ddc60845e264a476b8277e499"
+
+          for attempt in $(seq 1 30); do
+            echo "=== Finalizer attempt $attempt ==="
+
+            gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            gh workflow run be-different-cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+
+            OUTPUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py finalize_be_different --source-commit $SOURCE_COMMIT --json" 2>&1 || true)"
+            printf '%s\n' "$OUTPUT"
+
+            if printf '%s\n' "$OUTPUT" | grep -q 'BE_DIFFERENT_FINALIZED=true'; then
+              echo "Both stores have accepted the BE DIFFERENT release workflow."
+              exit 0
+            fi
+
+            sleep 120
+          done
+
+          echo "Timed out before both store submissions were confirmed."
+          exit 1
+
+      - name: Publish finalizer status
+        if: always()
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue edit 2 --repo "$GITHUB_REPOSITORY"             --title "BE DIFFERENT store finalizer"             --body "BE DIFFERENT Android and iOS store finalizer run: $RUN_URL"

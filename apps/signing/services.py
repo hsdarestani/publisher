@@ -271,7 +271,7 @@ def _ensure_apple_bundle_id(client: AppleStoreClient, identifier: str, name: str
 def _ensure_bundle_capability(client: AppleStoreClient, bundle: dict, capability: str):
     enabled = client.request(
         "GET",
-        f"/bundleIds/{bundle['id']}/bundleIdCapabilities?limit=200",
+        f"/bundleIds/{bundle['id']}/bundleIdCapabilities",
     ).get("data", [])
     for item in enabled:
         if item.get("attributes", {}).get("capabilityType") == capability:
@@ -302,7 +302,7 @@ def _ensure_named_app_store_profile(
 ):
     profiles = client.request(
         "GET",
-        f"/bundleIds/{bundle['id']}/profiles?limit=200",
+        f"/bundleIds/{bundle['id']}/profiles",
     ).get("data", [])
     existing = next(
         (

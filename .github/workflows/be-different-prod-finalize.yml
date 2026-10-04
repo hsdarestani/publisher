@@ -1,0 +1,88 @@
+name: BE DIFFERENT Production Finalizer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/be-different-prod-finalize.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install SSH client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+      - name: Repair and inspect BE DIFFERENT release 120
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          from apps.publisher.models import Release, Job
+          from apps.publisher.tasks import enqueue_job
+          import json
+
+          r = Release.objects.select_related("app").get(pk=120)
+          app = r.app
+          print("BE_DIFFERENT_RELEASE", r.pk, r.version_name, r.build_number, r.status, "auto_submit=", r.auto_submit)
+
+          def active(job_type, build=None):
+              qs = Job.objects.filter(release=r, type=job_type, status__in=["queued","running","succeeded"])
+              if build is not None:
+                  qs = qs.filter(build=build)
+              return qs.order_by("-created_at").first()
+
+          for platform in ("android", "ios"):
+              b = r.builds.filter(platform=platform).first()
+              if not b:
+                  continue
+              print("BUILD_BEFORE", platform, b.status, b.pk, bool(b.artifact), b.external_build_id)
+              jt = "build_android" if platform == "android" else "build_ios"
+              if b.status == "failed" and not active(jt, b):
+                  b.status = "queued"
+                  b.logs = ""
+                  b.save(update_fields=["status","logs","updated_at"])
+                  j = enqueue_job(jt, app=app, release=r, build=b, agent=True, platform="linux" if platform=="android" else "macos")
+                  print("REQUEUED_BUILD", platform, j.pk)
+
+          android = r.builds.filter(platform="android").first()
+          if android and android.status == "succeeded" and not active("submit_google", android):
+              j = enqueue_job("submit_google", app=app, release=r, build=android)
+              print("QUEUED_GOOGLE_SUBMIT", j.pk)
+
+          ios = r.builds.filter(platform="ios").first()
+          if ios and ios.status == "succeeded":
+              upload = active("upload_apple", ios)
+              if not upload:
+                  upload = enqueue_job("upload_apple", app=app, release=r, build=ios, agent=True, platform="macos")
+                  print("QUEUED_APPLE_UPLOAD", upload.pk)
+              elif upload.status == "succeeded" and r.auto_submit and not active("submit_apple", ios):
+                  j = enqueue_job("submit_apple", app=app, release=r, build=ios)
+                  print("QUEUED_APPLE_SUBMIT", j.pk)
+
+          print("BUILDS_AFTER", json.dumps(list(r.builds.values("platform","status","id","external_build_id")), default=str))
+          print("JOBS_AFTER", json.dumps(list(r.jobs.order_by("-created_at").values("id","type","status","error")[:20]), default=str))
+          print("SUBMISSIONS", json.dumps(list(r.submissions.values("platform","state","external_id","last_error")), default=str))
+          PY
+
+      - name: Wake Android and iOS agents
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','be-different-cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }

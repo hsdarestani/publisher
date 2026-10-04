@@ -11,10 +11,13 @@ from django.views.decorators.http import require_POST
 
 from .models import MobileApp, Release, Build, Job, StoreAccount
 from .tasks import enqueue_job
+from .cloud_auth import github_release_automation
 from apps.signing.services import ensure_ios_signing
 
 
 def _authorized(request) -> bool:
+    if github_release_automation(request):
+        return True
     expected = os.getenv("PUBLISHER_AUTOMATION_TOKEN", "").strip()
     if not expected:
         return False
@@ -94,8 +97,6 @@ def _bootstrap_known_app(identifier: str, body: dict) -> MobileApp | None:
 @csrf_exempt
 @require_POST
 def automation_release(request):
-    if not os.getenv("PUBLISHER_AUTOMATION_TOKEN", "").strip():
-        return JsonResponse({"ok": False, "error": "automation_not_configured"}, status=503)
     if not _authorized(request):
         return JsonResponse({"ok": False, "error": "unauthorized"}, status=401)
 

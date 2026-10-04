@@ -88,6 +88,11 @@ jobs:
           PUBLISHER_MAX_JOBS: '10'
           PUBLISHER_POLL_INTERVAL: '10'
           PUBLISHER_WATCH_SECONDS: '240'
+          FIREBASE_ANDROID_GOOGLE_SERVICES_B64: ${{ secrets.BEDIFFERENT_FIREBASE_ANDROID_GOOGLE_SERVICES_B64 }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.BEDIFFERENT_ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.BEDIFFERENT_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.BEDIFFERENT_ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.BEDIFFERENT_ANDROID_KEY_PASSWORD }}
         run: |
           set +e
           python agents/custom_cloud_linux.py 2>&1 | tee /tmp/cloud-linux.log

@@ -1,3 +1,4 @@
+import os
 import hashlib
 import json
 from types import SimpleNamespace
@@ -38,6 +39,44 @@ class PublisherTests(TestCase):
         )
         Build.objects.create(release=self.release, platform="android", status="succeeded")
         Build.objects.create(release=self.release, platform="ios", status="succeeded")
+
+
+    def test_automation_release_requires_token_and_queues_platform_jobs(self):
+        url = reverse("automation_release")
+        payload = {
+            "app_identifier": self.app.bundle_id,
+            "version_name": "1.2.3",
+            "build_number": 23,
+            "platforms": ["android", "ios"],
+            "android_track": "internal",
+            "auto_submit": False,
+            "release_notes": "Automated build",
+            "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
+        with patch.dict(os.environ, {"PUBLISHER_AUTOMATION_TOKEN": "automation-test-token"}):
+            unauthorized = self.client.post(
+                url,
+                data=json.dumps(payload),
+                content_type="application/json",
+            )
+            self.assertEqual(unauthorized.status_code, 401)
+
+            response = self.client.post(
+                url,
+                data=json.dumps(payload),
+                content_type="application/json",
+                HTTP_AUTHORIZATION="Bearer automation-test-token",
+            )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["ok"])
+        self.assertEqual({x["platform"] for x in data["queued"]}, {"android", "ios"})
+        release = Release.objects.get(app=self.app, version_name="1.2.3", build_number=23)
+        self.assertEqual(release.source_commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(
+            set(release.jobs.filter(status="queued").values_list("type", flat=True)),
+            {"build_android", "build_ios"},
+        )
 
     def test_dashboard_and_app_pages(self):
         self.assertEqual(self.client.get(reverse("dashboard")).status_code, 200)

@@ -72,6 +72,9 @@ jobs:
           print("BUILDS_AFTER", json.dumps(list(r.builds.values("platform","status","id","external_build_id")), default=str))
           print("JOBS_AFTER", json.dumps(list(r.jobs.order_by("-created_at").values("id","type","status","error")[:20]), default=str))
           print("SUBMISSIONS", json.dumps(list(r.submissions.values("platform","state","external_id","last_error")), default=str))
+          for j in r.jobs.filter(status="failed").order_by("-created_at")[:6]:
+              print("FAILED_JOB", j.pk, j.type, j.error)
+              print("FAILED_LOG_TAIL", (j.logs or "")[-12000:].replace("\n","\\n"))
           PY
 
       - name: Wake Android and iOS agents

@@ -128,6 +128,10 @@ class MobileApp(TimeStampedModel):
     def get_review_password(self):
         return decrypt_json(self.review_password_blob).get("password", "")
 
+    @property
+    def primary_icon(self):
+        return self.assets.filter(kind="icon").order_by("sort_order", "id").first()
+
 class AppLocalization(TimeStampedModel):
     app = models.ForeignKey(MobileApp, related_name="localizations", on_delete=models.CASCADE)
     locale = models.CharField(max_length=20, default="en-US")

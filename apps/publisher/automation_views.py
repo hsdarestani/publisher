@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from pathlib import Path
 
+from django.conf import settings
+from django.core.files import File
 from django.db import transaction
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from .models import MobileApp, Release, Build, Job, StoreAccount
+from .models import MobileApp, Release, Build, Job, StoreAccount, AppAsset
 from .tasks import enqueue_job
 from .cloud_auth import github_release_automation
 from apps.signing.services import ensure_ios_signing
@@ -25,6 +28,28 @@ def _authorized(request) -> bool:
     token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
     return bool(token) and secrets.compare_digest(token, expected)
 
+
+
+def _ensure_be_different_icon(app: MobileApp) -> None:
+    source = Path(settings.BASE_DIR) / "apps" / "publisher" / "bootstrap_assets" / "be-different-icon.png"
+    if not source.exists():
+        return
+    asset, _ = AppAsset.objects.get_or_create(
+        app=app,
+        kind="icon",
+        platform="shared",
+        locale="de-DE",
+        defaults={"device_type": "", "sort_order": 0, "width": 1254, "height": 1254},
+    )
+    if asset.file:
+        return
+    with source.open("rb") as handle:
+        asset.file.save("be-different-icon.png", File(handle), save=False)
+    asset.device_type = ""
+    asset.sort_order = 0
+    asset.width = 1254
+    asset.height = 1254
+    asset.save()
 
 
 def _bootstrap_known_app(identifier: str, body: dict) -> MobileApp | None:
@@ -92,6 +117,7 @@ def _bootstrap_known_app(identifier: str, body: dict) -> MobileApp | None:
             changed = True
     if changed:
         app.save()
+    _ensure_be_different_icon(app)
     return app
 
 @csrf_exempt

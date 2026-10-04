@@ -22,14 +22,14 @@ concurrency:
   # Every hosted runner authenticates as the same logical Publisher Mac agent.
   # Serialize runs and never cancel an active native build/upload, otherwise a
   # replacement runner can orphan the job that still owns Xcode/altool work.
-  group: aplus-cloud-macos-v6
+  group: aplus-cloud-macos-v7
   cancel-in-progress: false
 
 jobs:
   cloud-macos-agent:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: macos-latest
-    timeout-minutes: 360
+    timeout-minutes: 90
     steps:
       - name: Checkout A+ Publisher agent
         uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
         env:
           PYTHONUNBUFFERED: '1'
           PUBLISHER_URL: https://publisher.smarbiz.sbs
-          PUBLISHER_MAX_JOBS: '3'
+          PUBLISHER_MAX_JOBS: '1'
           FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64: ${{ secrets.BEDIFFERENT_FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64 }}
         run: |
           set +e

@@ -81,7 +81,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            for (const workflow_id of ['cloud-linux.yml','be-different-cloud-macos.yml']) {
+            for (const workflow_id of ['be-different-cloud-linux.yml','be-different-cloud-macos.yml']) {
               await github.rest.actions.createWorkflowDispatch({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -91,3 +91,5 @@ jobs:
             }
 
 # status refresh 2026-10-05 final store completion
+
+# use dedicated BE DIFFERENT Android and iOS agents

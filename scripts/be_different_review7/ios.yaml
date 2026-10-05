@@ -1,0 +1,34 @@
+appId: com.smarbiz.bedifferent
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "E Mail"
+    timeout: 60000
+- tapOn: "E Mail"
+- inputText: ${REVIEW_USER}
+- tapOn: "Passwort"
+- inputText: ${REVIEW_PASS}
+- hideKeyboard
+- tapOn: "SYSTEM ÖFFNEN.*"
+- extendedWaitUntil:
+    visible: "BE DIFFERENT LEISTUNGSWERT"
+    timeout: 60000
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--de-DE--APP_IPHONE_65--0-home
+- tapOn: "TRAINING"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--de-DE--APP_IPHONE_65--1-training
+- tapOn: "ATHLET"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--de-DE--APP_IPHONE_65--2-profile
+- tapOn:
+    text: "Change language"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--en-US--APP_IPHONE_65--2-profile
+- tapOn: "TRAINING"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--en-US--APP_IPHONE_65--1-training
+- tapOn: "START"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/ios--en-US--APP_IPHONE_65--0-home

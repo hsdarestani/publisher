@@ -1,0 +1,34 @@
+appId: com.smarbiz.bedifferent
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: "E Mail"
+    timeout: 60000
+- tapOn: "E Mail"
+- inputText: ${REVIEW_USER}
+- tapOn: "Passwort"
+- inputText: ${REVIEW_PASS}
+- hideKeyboard
+- tapOn: "SYSTEM ÖFFNEN.*"
+- extendedWaitUntil:
+    visible: "BE DIFFERENT LEISTUNGSWERT"
+    timeout: 60000
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--de-DE--phone--0-home
+- tapOn: "TRAINING"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--de-DE--phone--1-training
+- tapOn: "ATHLET"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--de-DE--phone--2-profile
+- tapOn:
+    text: "Change language"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--en-US--phone--2-profile
+- tapOn: "TRAINING"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--en-US--phone--1-training
+- tapOn: "START"
+- waitForAnimationToEnd
+- takeScreenshot: ${SHOTDIR}/android--en-US--phone--0-home

@@ -34,7 +34,7 @@ jobs:
               return selected[-12:]
           rows = []
           for r in Release.objects.filter(app=a).order_by("-build_number")[:4]:
-              rows.append({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"source":r.source_commit,"builds":[{"id":b.pk,"platform":b.platform,"status":b.status,"artifact":bool(b.artifact),"external_id":b.external_build_id} for b in r.builds.all()],"jobs":[{"id":j.pk,"type":j.type,"status":j.status,"progress":j.progress,"diagnostics":diagnostics(j),"error":(j.error or "")[-600:]} for j in Job.objects.filter(release=r).order_by("-created_at")[:10]],"submissions":[{"platform":s.platform,"state":s.state,"external_id":s.external_id,"error":s.last_error} for s in Submission.objects.filter(release=r)]})
+              rows.append({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"source":r.source_commit,"builds":[{"id":b.pk,"platform":b.platform,"status":b.status,"artifact":bool(b.artifact),"external_id":b.external_build_id} for b in r.builds.all()],"jobs":[{"id":j.pk,"type":j.type,"status":j.status,"progress":j.progress,"diagnostics":diagnostics(j),"last_activity":j.updated_at,"phase":next((x[-350:] for x in reversed((j.logs or "").splitlines()) if not re.search(r"(?:private|secret|password|token|issuer|certificate|-----|key_id)",x,re.I)), ""),"error":(j.error or "")[-600:]} for j in Job.objects.filter(release=r).order_by("-created_at")[:10]],"submissions":[{"platform":s.platform,"state":s.state,"external_id":s.external_id,"error":s.last_error} for s in Submission.objects.filter(release=r)]})
           print("BE_DIFFERENT_STATUS="+json.dumps(rows,default=str))
           PY
 

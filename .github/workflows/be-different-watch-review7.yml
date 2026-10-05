@@ -1,0 +1,94 @@
+name: Capture BE DIFFERENT native Apple Watch review screenshots
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-watch-review7.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+jobs:
+  watch:
+    runs-on: macos-15
+    environment: production
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/aymantraining
+          ref: 2a9d0e7f01e00528735ad6c4a0a196b36b554ed5
+          path: native-source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install SSH helper
+        run: brew install sshpass
+      - name: Establish real companion session for review athlete
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/watch_session.py > /tmp/bd-watch-private.json
+          python3 - <<'PY'
+          import os,json
+          value=json.load(open("/tmp/bd-watch-private.json"))["token"]
+          print("::add-mask::"+value)
+          with open(os.environ["GITHUB_ENV"],"a") as f:f.write("WATCH_SESSION="+value+"\n")
+          os.remove("/tmp/bd-watch-private.json")
+          PY
+      - name: Build unchanged Watch views with simulator authentication harness
+        working-directory: native-source/mobile
+        run: |
+          set -euo pipefail
+          npm ci
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path("targets/watch/BeDifferentWatchApp.swift")
+          text=path.read_text()
+          marker="final class WatchModel: ObservableObject {"
+          assert text.count(marker)==1
+          # Simulator harness initializes the real paired session. Views and API
+          # responses are unchanged; no score or workout data is fabricated.
+          init='\n  init(){if let token=ProcessInfo.processInfo.environment["BD_CAPTURE_SESSION"]{KeychainStore.save(token);paired=true}}\n'
+          path.write_text(text.replace(marker,marker+init))
+          PY
+          CI=1 npx expo prebuild --platform ios --clean
+          cd ios
+          xcodebuild -workspace BEDIFFERENT.xcworkspace -scheme watch -configuration Release -destination 'generic/platform=watchOS Simulator' -derivedDataPath /tmp/bd-watch-derived CODE_SIGNING_ALLOWED=NO build >/tmp/bd-watch-build.log 2>&1 || { tail -n 100 /tmp/bd-watch-build.log; exit 1; }
+          tail -n 10 /tmp/bd-watch-build.log
+      - name: Capture real paired Watch UI in both languages
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; print(next(x["identifier"] for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.watchOS")))')"
+          dtype="$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(x["identifier"] for x in json.load(sys.stdin)["devicetypes"] if "Apple Watch Series 9" in x["name"] and "45mm" in x["name"]))')"
+          udid="$(xcrun simctl create 'BE DIFFERENT Watch Store Capture' "$dtype" "$runtime")"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" /tmp/bd-watch-derived/Build/Products/Release-watchsimulator/watch.app
+          mkdir -p screenshots
+          for locale in de-DE en-US; do
+            if [ "$locale" = de-DE ]; then language=de; else language=en; fi
+            curl -fsS -X PATCH -H "Authorization: Bearer $WATCH_SESSION" -H 'x-bd-client: mobile' -H 'Content-Type: application/json' -d "{\"locale\":\"$language\"}" https://bedifferent.smarbiz.sbs/api/profile >/dev/null
+            xcrun simctl terminate "$udid" com.smarbiz.bedifferent.watch || true
+            SIMCTL_CHILD_BD_CAPTURE_SESSION="$WATCH_SESSION" xcrun simctl launch "$udid" com.smarbiz.bedifferent.watch
+            sleep 12
+            xcrun simctl io "$udid" screenshot "screenshots/ios--$locale--APP_WATCH_SERIES_7--0-watch.png"
+          done
+      - name: Save captured native screenshots in Publisher
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review7'
+          for image in screenshots/*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review7/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review7 "$CID":/tmp/'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/save_screenshots.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}-native-store-screenshots
+          path: screenshots/*.png
+          retention-days: 14

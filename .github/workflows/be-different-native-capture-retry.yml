@@ -1,0 +1,92 @@
+name: Diagnose and retry BE DIFFERENT native Android capture
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-native-capture-retry.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-native-store-screenshots
+          run-id: 37355666610
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: previous
+      - name: Inspect actual launch failure image
+        run: |
+          python3 - <<'PY'
+          import pathlib,base64,json
+          for path in pathlib.Path("previous").rglob("*.png"):
+              print("NATIVE_FAILURE_PNG="+json.dumps({"file":str(path),"data":base64.b64encode(path.read_bytes()).decode()}))
+          PY
+  android:
+    needs: inspect
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-native-store-screenshots
+          run-id: 37355666610
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: previous
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare capture tools and private login
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          curl -fsSL https://get.maestro.mobile.dev | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/read_credentials.py > /tmp/bd-private.json
+          python3 - <<'PY'
+          import os,json
+          d=json.load(open("/tmp/bd-private.json"))
+          for key,value in (("REVIEW_USER",d["username"]),("REVIEW_PASS",d["password"])):
+              print("::add-mask::"+value)
+              with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
+          os.remove("/tmp/bd-private.json")
+          PY
+      - name: Diagnose actual release UI and capture both languages
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: bash scripts/be_different_review7/android_retry.sh
+      - name: Save successful native screenshots
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review7'
+          for image in screenshots/android--*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review7/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review7 "$CID":/tmp/'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/save_screenshots.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-retry-native-screenshots
+          path: screenshots/*.png
+          retention-days: 14

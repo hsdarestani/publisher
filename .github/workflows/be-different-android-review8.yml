@@ -1,0 +1,23 @@
+name: Build corrected BE DIFFERENT Android review 8
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-android-review8.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Queue corrected signed Android app
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/queue_android8.py

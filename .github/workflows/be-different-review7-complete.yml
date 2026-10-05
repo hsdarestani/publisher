@@ -62,7 +62,7 @@ jobs:
           python3 - <<'PY'
           import os,json
           data=json.load(open("/tmp/bd-review-private.json"))
-          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"]),("FIREBASE_ANDROID_GOOGLE_SERVICES_B64",data["FIREBASE_ANDROID_GOOGLE_SERVICES_B64"]),("FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64",data["FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64"])):
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
               print("::add-mask::"+value)
               with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
           os.remove("/tmp/bd-review-private.json")
@@ -78,7 +78,7 @@ jobs:
           CI=1 npx expo prebuild --platform ios --clean
           python3 scripts/patch-fmt-apple-clang.py ios/Pods
           cd ios
-          xcodebuild -workspace BEDIFFERENT.xcworkspace -scheme BEDIFFERENT -configuration Release -destination 'generic/platform=iOS Simulator' -derivedDataPath /tmp/bd-review-derived CODE_SIGNING_ALLOWED=NO build > /tmp/bd-review-build.log 2>&1 || { tail -n 100 /tmp/bd-review-build.log; exit 1; }
+          xcodebuild -workspace BEDIFFERENT.xcworkspace -scheme BEDIFFERENT -configuration Release -destination 'generic/platform=iOS Simulator' -derivedDataPath /tmp/bd-review-derived CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build > /tmp/bd-review-build.log 2>&1 || { tail -n 100 /tmp/bd-review-build.log; exit 1; }
           tail -n 12 /tmp/bd-review-build.log
       - name: Capture authenticated native iPhone UI in both languages
         run: |
@@ -107,7 +107,7 @@ jobs:
           name: ${{ github.job }}-native-store-screenshots
           path: |
             screenshots/*.png
-            ~/.maestro/tests/**/*
+            ~/.maestro/tests/**/*.png
             native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
             /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14
@@ -146,7 +146,7 @@ jobs:
           python3 - <<'PY'
           import os,json
           data=json.load(open("/tmp/bd-review-private.json"))
-          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"]),("FIREBASE_ANDROID_GOOGLE_SERVICES_B64",data["FIREBASE_ANDROID_GOOGLE_SERVICES_B64"]),("FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64",data["FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64"])):
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
               print("::add-mask::"+value)
               with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
           os.remove("/tmp/bd-review-private.json")
@@ -160,7 +160,7 @@ jobs:
           node scripts/prepare-native-config.mjs --require-android
           CI=1 npx expo prebuild --platform android --clean
           chmod +x android/gradlew
-          ./android/gradlew -p android --no-daemon :app:assembleRelease
+          ./android/gradlew -p android --no-daemon :app:assembleRelease -PreactNativeArchitectures=x86_64
       - name: Capture authenticated native Android UI in both languages
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -190,7 +190,7 @@ jobs:
           name: ${{ github.job }}-native-store-screenshots
           path: |
             screenshots/*.png
-            ~/.maestro/tests/**/*
+            ~/.maestro/tests/**/*.png
             native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
             /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14

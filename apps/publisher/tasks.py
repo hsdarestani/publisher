@@ -1,7 +1,11 @@
 from __future__ import annotations
 from datetime import timedelta
+import logging
+import os
 import time
 import traceback
+
+import requests
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
@@ -15,6 +19,51 @@ from .store_compliance import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def _wake_cloud_agent(app_slug: str, platform: str) -> None:
+    """Best-effort wake-up for GitHub-hosted build runners after a job commits."""
+    token = os.getenv("PUBLISHER_GITHUB_TOKEN", "").strip()
+    if not token:
+        logger.warning("Cloud build job queued but PUBLISHER_GITHUB_TOKEN is not configured.")
+        return
+
+    if app_slug == "be-different":
+        workflow_id = (
+            "be-different-cloud-linux.yml"
+            if platform == "linux"
+            else "be-different-cloud-macos.yml"
+        )
+    else:
+        workflow_id = "cloud-linux.yml" if platform == "linux" else "cloud-macos.yml"
+
+    repository = os.getenv("PUBLISHER_GITHUB_REPOSITORY", "hsdarestani/publisher").strip()
+    url = f"https://api.github.com/repos/{repository}/actions/workflows/{workflow_id}/dispatches"
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"ref": "main"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        logger.info("Woke cloud runner %s for app=%s platform=%s", workflow_id, app_slug, platform)
+    except Exception:
+        # Keep the build queued even if GitHub is temporarily unavailable; a later
+        # panel retry or scheduled/deploy wake-up can still claim it.
+        logger.exception(
+            "Failed to wake cloud runner %s for app=%s platform=%s",
+            workflow_id,
+            app_slug,
+            platform,
+        )
+
+
 def enqueue_job(job_type, *, app=None, release=None, build=None, payload=None, agent=False, platform=""):
     job = Job.objects.create(
         type=job_type, app=app or (release.app if release else None), release=release,
@@ -22,6 +71,12 @@ def enqueue_job(job_type, *, app=None, release=None, build=None, payload=None, a
     )
     if not agent:
         run_job.delay(job.pk)
+    else:
+        app_for_job = app or (release.app if release else None) or (build.release.app if build else None)
+        app_slug = getattr(app_for_job, "slug", "")
+        transaction.on_commit(
+            lambda app_slug=app_slug, platform=platform: _wake_cloud_agent(app_slug, platform)
+        )
     return job
 
 @shared_task(bind=True, autoretry_for=(), retry_backoff=True)

@@ -22,31 +22,22 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
-          import json
-          from apps.publisher.models import MobileApp,Release,Job
+          import json,base64
+          from apps.publisher.models import MobileApp,Release,Submission
           from apps.integrations.apple_store import AppleStoreClient
           from apps.integrations.google_play import GooglePlayClient
           a=MobileApp.objects.get(slug="be-different")
-          r=Release.objects.get(pk=126,app=a,build_number=7)
-          j=Job.objects.get(pk=3641,release=r)
-          print("APPLE_REVIEW_ERROR="+j.error)
-          print("APPLE_REVIEW_LOG="+(j.logs or "")[-18000:])
-          print("APP_INFO="+json.dumps({"client":a.client_name,"login":a.requires_login,"has_review_user":bool(a.review_username),"has_review_password":bool(a.get_review_password()),"privacy":a.privacy_policy_url,"support":a.support_url,"locales":list(a.localizations.values("locale","title")),"assets":list(a.assets.values("id","kind","platform","locale","device_type","width","height")),"track":r.android_track}))
+          print("NATIVE_ASSETS="+json.dumps(list(a.assets.values("id","kind","platform","locale","device_type","width","height"))))
+          for asset in a.assets.filter(kind="screenshot",device_type="APP_WATCH_SERIES_7"):
+              print("WATCH_PNG="+json.dumps({"locale":asset.locale,"data":base64.b64encode(open(asset.file.path,"rb").read()).decode()}))
           c=AppleStoreClient(a.apple_account)
-          record=c.find_app(a.bundle_id)
-          v=c.find_editable_version(record["id"],r.version_name)
-          print("APPLE_VERSION="+json.dumps(v))
-          if v:
-              ls=c.request("GET",f"/appStoreVersions/{v['id']}/appStoreVersionLocalizations?limit=200").get("data",[])
-              for loc in ls:
-                  sets=c.request("GET",f"/appStoreVersionLocalizations/{loc['id']}/appScreenshotSets?limit=200").get("data",[])
-                  for ss in sets:
-                      imgs=c.request("GET",f"/appScreenshotSets/{ss['id']}/appScreenshots?limit=200").get("data",[])
-                      print("APPLE_SCREENSHOTS="+json.dumps({"locale":loc["attributes"]["locale"],"set":ss["attributes"],"images":[{"id":x["id"],"file":x["attributes"].get("fileName"),"state":x["attributes"].get("assetDeliveryState")} for x in imgs]}))
+          v=c.request("GET","/appStoreVersions/bec48543-3f4a-47b5-9fb6-53701512abb2")["data"]
+          print("APPLE_VERSION_STATE="+json.dumps(v["attributes"]))
           g=GooglePlayClient(a.google_account)
           e=g._open_edit(a.package_name)
           try:
               print("GOOGLE_TRACKS="+json.dumps(g._edit_request(e,"GET",f"/applications/{g._q(a.package_name)}/edits/{e.edit_id}/tracks")))
+              print("GOOGLE_LISTING_DETAILS="+json.dumps(g._edit_request(e,"GET",f"/applications/{g._q(a.package_name)}/edits/{e.edit_id}/details")))
           finally:
               g._safe_delete_edit(e)
           

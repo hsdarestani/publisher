@@ -29,6 +29,6 @@ appId: com.smarbiz.bedifferent
 - tapOn: "TRAINING"
 - waitForAnimationToEnd
 - takeScreenshot: ${SHOTDIR}/android--en-US--phone--1-training
-- tapOn: "HOME"
+- tapOn: "START"
 - waitForAnimationToEnd
 - takeScreenshot: ${SHOTDIR}/android--en-US--phone--0-home

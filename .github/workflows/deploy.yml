@@ -159,7 +159,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            for (const workflow_id of ['cloud-macos.yml', 'cloud-linux.yml', 'be-different-cloud-macos.yml']) {
+            for (const workflow_id of ['cloud-macos.yml', 'cloud-linux.yml', 'be-different-cloud-macos.yml', 'be-different-cloud-linux.yml']) {
               await github.rest.actions.createWorkflowDispatch({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

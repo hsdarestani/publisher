@@ -1,0 +1,103 @@
+name: Recover BE DIFFERENT iOS build 7 with batched logs
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-ios-build7-batched-retry.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: be-different-ios-build7-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Verify the exact running BE DIFFERENT build
+        id: candidate
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          state="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          from apps.publisher.models import Job
+          j=Job.objects.select_related("release","build","build__agent").get(pk=3623,release_id=126,app__slug="be-different",type="build_ios")
+          assert j.release.build_number == 7
+          assert j.release.source_commit == "f440cfd19a1c5489da065d6cbd4905e597dd1d7e"
+          if j.build.artifact or j.status == "succeeded":
+              print("RECOVERY_CANDIDATE=false")
+          else:
+              assert j.status == "running", j.status
+              assert j.build.agent.name == "A+ Cloud Mac · GitHub Actions", j.build.agent.name
+              print("RECOVERY_CANDIDATE=true")
+          PY
+          )"
+          printf '%s\n' "$state"
+          if printf '%s\n' "$state" | grep -q 'RECOVERY_CANDIDATE=true'; then echo 'needed=true' >> "$GITHUB_OUTPUT"; fi
+
+      - name: Stop only the superseded iOS runner
+        if: steps.candidate.outputs.needed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner=context.repo.owner, repo=context.repo.repo, run_id=37313252261;
+            let run=(await github.rest.actions.getWorkflowRun({owner,repo,run_id})).data;
+            if(run.name!=="A+ Cloud Mac") throw new Error("Unexpected runner");
+            if(run.status!=="completed") {
+              await github.rest.actions.cancelWorkflowRun({owner,repo,run_id});
+              for(let i=0;i<60;i++) {
+                await new Promise(resolve=>setTimeout(resolve,3000));
+                run=(await github.rest.actions.getWorkflowRun({owner,repo,run_id})).data;
+                if(run.status==="completed") break;
+              }
+            }
+            if(run.status!=="completed") throw new Error("Old runner still active");
+
+      - name: Queue the same iOS build on the corrected agent
+        if: steps.candidate.outputs.needed == 'true'
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import inspect,json
+          from django.db import transaction
+          from django.utils import timezone
+          from apps.publisher.models import Job, Release
+          from apps.publisher.tasks import enqueue_job
+          with transaction.atomic():
+              r=Release.objects.select_for_update().get(pk=126,app__slug="be-different",build_number=7)
+              old=Job.objects.select_for_update().select_related("build","build__agent").get(pk=3623,release=r)
+              b=old.build
+              if b.artifact or old.status=="succeeded":
+                  print("IOS_RECOVERY_SKIPPED_ALREADY_BUILT")
+              else:
+                  old.status="cancelled"
+                  old.error="Superseded by corrected batched-log iOS runner."
+                  old.finished_at=timezone.now()
+                  old.save(update_fields=["status","error","finished_at","updated_at"])
+                  if b.agent and b.agent.current_job_id==old.pk:
+                      b.agent.current_job=None
+                      b.agent.save(update_fields=["current_job","updated_at"])
+                  b.status="queued"
+                  b.agent=None
+                  b.started_at=None
+                  b.finished_at=None
+                  b.save(update_fields=["status","agent","started_at","finished_at","updated_at"])
+                  j=enqueue_job("build_ios",app=r.app,release=r,build=b,agent=True,platform="macos")
+                  print("IOS_BATCHED_RETRY="+json.dumps({"release":r.pk,"build":r.build_number,"job":j.pk}))
+          PY

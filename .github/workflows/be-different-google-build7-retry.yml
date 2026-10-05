@@ -1,0 +1,56 @@
+name: Retry BE DIFFERENT Google build 7 delivery
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-google-build7-retry.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: be-different-google-build7-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Wait for media fix, test it and retry delivery
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          ready=false
+          for attempt in $(seq 1 40); do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "import inspect; from apps.integrations.google_play import GooglePlayClient; assert \"normalize_store_asset\" in inspect.getsource(GooglePlayClient._upload_request)"'; then
+              ready=true
+              break
+            fi
+            sleep 15
+          done
+          test "$ready" = true
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py test apps.compliance.test_asset_normalization'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json
+          from django.db import transaction
+          from apps.publisher.models import Release, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          with transaction.atomic():
+              r = Release.objects.select_for_update().get(pk=126, app__slug="be-different", build_number=7)
+              b = r.builds.get(platform="android", status="succeeded")
+              submitted = Submission.objects.filter(release=r,platform="android",state__in=["ready_for_review","in_review","approved","live"]).exists()
+              active = Job.objects.filter(release=r,type="submit_google",status__in=["queued","running","succeeded"]).first()
+              if not submitted and active is None:
+                  j = enqueue_job("submit_google",app=r.app,release=r,build=b)
+                  print("GOOGLE_RETRY_QUEUED="+json.dumps({"job":j.pk,"release":r.pk,"build":r.build_number}))
+              else:
+                  print("GOOGLE_RETRY_SKIPPED="+json.dumps({"submitted":submitted,"active":active.pk if active else None}))
+          PY

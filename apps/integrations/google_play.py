@@ -397,6 +397,13 @@ class GooglePlayClient:
         return response.json() if response.content else {}
 
     def _upload_request(self, edit: EditSession, path: str, data: bytes, content_type: str):
+        image_type = path.rsplit("/", 1)[-1]
+        if image_type in {"icon", "featureGraphic"}:
+            from scripts.google_play_cloud_operation import normalize_store_asset
+            data, normalized_type, warning = normalize_store_asset(image_type, data)
+            content_type = normalized_type or content_type
+            if warning:
+                logger.info("%s", warning)
         response = edit.session.post(
             f"{edit.upload_base}{path}",
             params={"uploadType": "media"},

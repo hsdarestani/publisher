@@ -49,3 +49,36 @@ class GooglePlayAssetNormalizationTests(SimpleTestCase):
         self.assertEqual(normalized, content)
         self.assertIsNone(content_type)
         self.assertIsNone(warning)
+
+    def test_native_client_normalizes_icon_before_upload(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from apps.integrations.google_play import GooglePlayClient
+
+        response = Mock(ok=True, content=b"{}", json=Mock(return_value={}))
+        session = Mock(post=Mock(return_value=response))
+        edit = SimpleNamespace(session=session, upload_base="https://example.test/upload")
+        client = object.__new__(GooglePlayClient)
+        client._upload_request(
+            edit, "/applications/example/edits/1/listings/de-DE/icon",
+            self.image_bytes((1254, 1254)), "image/png",
+        )
+
+        uploaded = session.post.call_args.kwargs
+        with Image.open(io.BytesIO(uploaded["data"])) as result:
+            self.assertEqual(result.size, (512, 512))
+            self.assertEqual(result.mode, "RGBA")
+        self.assertEqual(uploaded["headers"]["Content-Type"], "image/png")
+
+    def test_native_client_keeps_bundle_bytes_unchanged(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from apps.integrations.google_play import GooglePlayClient
+
+        response = Mock(ok=True, content=b"{}", json=Mock(return_value={}))
+        session = Mock(post=Mock(return_value=response))
+        edit = SimpleNamespace(session=session, upload_base="https://example.test/upload")
+        client = object.__new__(GooglePlayClient)
+        client._upload_request(edit, "/applications/example/edits/1/bundles", b"aab-data", "application/octet-stream")
+
+        self.assertEqual(session.post.call_args.kwargs["data"], b"aab-data")

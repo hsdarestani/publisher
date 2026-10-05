@@ -87,6 +87,11 @@ class CloudMacAgent(Agent):
             self.execute(job)
             processed += 1
 
+    def run_shell(self, job_id, command, cwd, env, progress):
+        # Custom native build scripts need the same bounded log batching as
+        # direct Xcode builds; per-line HTTP delivery stalls verbose archives.
+        self._run(job_id, ["/bin/sh", "-c", command], cwd, progress, env=env)
+
     def _run(self, job_id, command, cwd, progress, env=None, redact=None):
         display = " ".join(shlex.quote(str(value)) for value in command)
         for value in redact or []:

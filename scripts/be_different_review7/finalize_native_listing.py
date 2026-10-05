@@ -21,11 +21,19 @@ with Image.open(icon.file.path) as source:
   image=Image.new("RGB",(1024,500),(5,6,6))
   mark=logo.copy();mark.thumbnail((340,340));image.paste(mark,((1024-mark.width)//2,30),mark)
   draw=ImageDraw.Draw(image)
-  font=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",25)
-  draw.text((512,424),tag,font=font,fill=(215,255,0),anchor="mm")
+  font=ImageFont.load_default(size=25)
+  draw.text((512,390),"BE DIFFERENT",font=ImageFont.load_default(size=36),fill=(255,255,255),anchor="mm")
+  draw.text((512,454),tag,font=font,fill=(215,255,0),anchor="mm")
   raw=io.BytesIO();image.save(raw,format="PNG")
   asset,_=AppAsset.objects.get_or_create(app=a,kind="feature_graphic",platform="android",locale=locale,device_type="",sort_order=0,defaults={"width":1024,"height":500})
   asset.width=1024;asset.height=500;asset.file.save("be-different-feature-"+locale+".png",ContentFile(raw.getvalue()),save=True)
+# Normalize only Android listing icons; preserve the original brand source.
+with Image.open(icon.file.path) as source:
+ normalized=source.convert("RGBA").resize((512,512),Image.Resampling.LANCZOS)
+ raw=io.BytesIO();normalized.save(raw,format="PNG")
+ for locale in ("de-DE","en-US"):
+  asset,_=AppAsset.objects.get_or_create(app=a,kind="icon",platform="android",locale=locale,device_type="",sort_order=0,defaults={"width":512,"height":512})
+  asset.width=512;asset.height=512;asset.file.save("be-different-icon-"+locale+".png",ContentFile(raw.getvalue()),save=True)
 # Do not replace or withdraw a submitted Apple version.
 r=Release.objects.get(pk=126,app=a,build_number=7)
 client=AppleStoreClient(a.apple_account)
@@ -63,4 +71,4 @@ else:print("APPLE_ACTUAL_REVIEW_STATE="+state)
 g=GooglePlayClient(a.google_account)
 for locale in ("de-DE","en-US"):
  assert a.assets.filter(kind="screenshot",platform="android",locale=locale).count()>=3,"Native Android screenshots pending"
-print("GOOGLE_NATIVE_LISTING="+json.dumps(g.apply_store_content(a,list(a.localizations.all()),list(a.assets.exclude(platform="ios")))))
+print("GOOGLE_NATIVE_LISTING="+json.dumps(g.apply_store_content(a,list(a.localizations.all()),list(a.assets.filter(platform="android")))))

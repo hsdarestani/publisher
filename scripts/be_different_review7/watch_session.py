@@ -11,5 +11,9 @@ r=s.post(base+"/api/auth/login",json={"email":a.review_username,"password":a.get
 s.headers["Authorization"]="Bearer "+r.json()["sessionToken"]
 r=s.post(base+"/api/companion/pair/start",timeout=40);r.raise_for_status()
 claim=s.post(base+"/api/companion/pair/claim",json={"code":r.json()["code"]},timeout=40);claim.raise_for_status()
-print(json.dumps({"token":claim.json()["sessionToken"]}))
+token=claim.json()["sessionToken"]
+check=requests.get(base+"/api/companion",headers={"Authorization":"Bearer "+token,"x-bd-client":"watch"},timeout=40)
+check.raise_for_status()
+assert check.json().get("ok")
+print(json.dumps({"token":token}))
 s.post(base+"/api/auth/logout",timeout=30).raise_for_status()

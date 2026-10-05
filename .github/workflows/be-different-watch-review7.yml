@@ -55,7 +55,10 @@ jobs:
           # Simulator harness initializes the real paired session. Views and API
           # responses are unchanged; no score or workout data is fabricated.
           init='\n  init(){if let token=ProcessInfo.processInfo.environment["BD_CAPTURE_SESSION"]{KeychainStore.save(token);paired=true}}\n'
-          path.write_text(text.replace(marker,marker+init))
+          text=text.replace(marker,marker+init)
+          text=text.replace('private var token:String?{KeychainStore.load()}', 'private var token:String?{ProcessInfo.processInfo.environment["BD_CAPTURE_SESSION"] ?? KeychainStore.load()}')
+          text=text.replace('syncWidget()\n    }catch{self.error=', 'syncWidget();print("BD_CAPTURE_DATA_OK")\n    }catch{print("BD_CAPTURE_ERROR=\\(error)");self.error=')
+          path.write_text(text)
           PY
           CI=1 npx expo prebuild --platform ios --clean
           cd ios
@@ -75,9 +78,18 @@ jobs:
             if [ "$locale" = de-DE ]; then language=de; else language=en; fi
             curl -fsS -X PATCH -H "Authorization: Bearer $WATCH_SESSION" -H 'x-bd-client: mobile' -H 'Content-Type: application/json' -d "{\"locale\":\"$language\"}" https://bedifferent.smarbiz.sbs/api/profile >/dev/null
             xcrun simctl terminate "$udid" com.smarbiz.bedifferent.watch || true
-            SIMCTL_CHILD_BD_CAPTURE_SESSION="$WATCH_SESSION" xcrun simctl launch "$udid" com.smarbiz.bedifferent.watch
-            sleep 12
+            SIMCTL_CHILD_BD_CAPTURE_SESSION="$WATCH_SESSION" xcrun simctl launch --console "$udid" com.smarbiz.bedifferent.watch > /tmp/bd-watch-runtime.log 2>&1 &
+            console_pid=$!
+            ready=0
+            for attempt in $(seq 1 30); do
+              if rg -q BD_CAPTURE_DATA_OK /tmp/bd-watch-runtime.log; then ready=1; break; fi
+              if rg -q BD_CAPTURE_ERROR /tmp/bd-watch-runtime.log; then break; fi
+              sleep 2
+            done
+            if [ "$ready" != 1 ]; then cat /tmp/bd-watch-runtime.log; exit 1; fi
+            sleep 3
             xcrun simctl io "$udid" screenshot "screenshots/ios--$locale--APP_WATCH_SERIES_7--0-watch.png"
+            kill "$console_pid" || true
           done
       - name: Save captured native screenshots in Publisher
         run: |

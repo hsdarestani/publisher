@@ -1,0 +1,29 @@
+name: Recover interrupted BE DIFFERENT review 10 queue
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-unblock-review10.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Record verified failed worker and unblock corrected iOS build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in 1 2 3 4; do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/recover_queue10.py; then exit 0; fi
+            sleep 15
+          done
+          exit 1

@@ -55,9 +55,9 @@ jobs:
           # Simulator harness initializes the real paired session. Views and API
           # responses are unchanged; no score or workout data is fabricated.
           init='\n  init(){if let token=ProcessInfo.processInfo.environment["BD_CAPTURE_SESSION"]{KeychainStore.save(token);paired=true}}\n'
-          text=text.replace(marker,marker+init)
+          text=text.replace(marker,marker+init).replace('import SwiftUI','import SwiftUI\nimport Darwin')
           text=text.replace('private var token:String?{KeychainStore.load()}', 'private var token:String?{ProcessInfo.processInfo.environment["BD_CAPTURE_SESSION"] ?? KeychainStore.load()}')
-          text=text.replace('syncWidget()\n    }catch{self.error=', 'syncWidget();print("BD_CAPTURE_DATA_OK")\n    }catch{print("BD_CAPTURE_ERROR=\\(error)");self.error=')
+          text=text.replace('syncWidget()\n    }catch{self.error=', 'syncWidget();print("BD_CAPTURE_DATA_OK");fflush(stdout)\n    }catch{print("BD_CAPTURE_ERROR=\\(error)");fflush(stdout);self.error=')
           path.write_text(text)
           PY
           CI=1 npx expo prebuild --platform ios --clean

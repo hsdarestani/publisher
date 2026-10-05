@@ -14,7 +14,7 @@ jobs:
   watch:
     runs-on: macos-15
     environment: production
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -43,7 +43,9 @@ jobs:
         working-directory: native-source/mobile
         run: |
           set -euo pipefail
-          npm ci
+          export NODE_ENV=production
+          npm ci --include=dev
+          npm install --include=dev --no-save --package-lock=false query-string@7.1.3 react-native-screens@4.11.1 react-native-safe-area-context@5.4.0
           python3 - <<'PY'
           from pathlib import Path
           path=Path("targets/watch/BeDifferentWatchApp.swift")
@@ -57,7 +59,7 @@ jobs:
           PY
           CI=1 npx expo prebuild --platform ios --clean
           cd ios
-          xcodebuild -workspace BEDIFFERENT.xcworkspace -scheme watch -configuration Release -destination 'generic/platform=watchOS Simulator' -derivedDataPath /tmp/bd-watch-derived CODE_SIGNING_ALLOWED=NO build >/tmp/bd-watch-build.log 2>&1 || { tail -n 100 /tmp/bd-watch-build.log; exit 1; }
+          xcodebuild -project BEDIFFERENT.xcodeproj -target watch -configuration Release -sdk watchsimulator SYMROOT=/tmp/bd-watch-derived/Build/Products CODE_SIGNING_ALLOWED=NO build >/tmp/bd-watch-build.log 2>&1 || { tail -n 100 /tmp/bd-watch-build.log; exit 1; }
           tail -n 10 /tmp/bd-watch-build.log
       - name: Capture real paired Watch UI in both languages
         run: |
@@ -92,3 +94,5 @@ jobs:
           name: ${{ github.job }}-native-store-screenshots
           path: screenshots/*.png
           retention-days: 14
+
+# Build only the standalone Watch target, not the containing iPhone app.

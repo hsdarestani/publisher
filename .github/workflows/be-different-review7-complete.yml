@@ -62,7 +62,7 @@ jobs:
           python3 - <<'PY'
           import os,json
           data=json.load(open("/tmp/bd-review-private.json"))
-          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"]),("FIREBASE_ANDROID_GOOGLE_SERVICES_B64",data["FIREBASE_ANDROID_GOOGLE_SERVICES_B64"]),("FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64",data["FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64"])):
               print("::add-mask::"+value)
               with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
           os.remove("/tmp/bd-review-private.json")
@@ -74,6 +74,7 @@ jobs:
           export NODE_ENV=production
           npm ci --include=dev
           npm install --include=dev --no-save --package-lock=false query-string@7.1.3 react-native-screens@4.11.1 react-native-safe-area-context@5.4.0
+          node scripts/prepare-native-config.mjs --require-ios
           CI=1 npx expo prebuild --platform ios --clean
           python3 scripts/patch-fmt-apple-clang.py ios/Pods
           cd ios
@@ -101,9 +102,14 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review7 "$CID":/tmp/'
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/save_screenshots.py
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ github.job }}-native-store-screenshots
-          path: screenshots/*.png
+          path: |
+            screenshots/*.png
+            ~/.maestro/tests/**/*
+            native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
+            /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14
   android:
     needs: prepare
@@ -140,7 +146,7 @@ jobs:
           python3 - <<'PY'
           import os,json
           data=json.load(open("/tmp/bd-review-private.json"))
-          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"]),("FIREBASE_ANDROID_GOOGLE_SERVICES_B64",data["FIREBASE_ANDROID_GOOGLE_SERVICES_B64"]),("FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64",data["FIREBASE_IOS_GOOGLE_SERVICE_INFO_B64"])):
               print("::add-mask::"+value)
               with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
           os.remove("/tmp/bd-review-private.json")
@@ -151,6 +157,7 @@ jobs:
           export NODE_ENV=production
           npm ci --include=dev
           npm install --include=dev --no-save --package-lock=false query-string@7.1.3 react-native-screens@4.11.1 react-native-safe-area-context@5.4.0
+          node scripts/prepare-native-config.mjs --require-android
           CI=1 npx expo prebuild --platform android --clean
           chmod +x android/gradlew
           ./android/gradlew -p android --no-daemon :app:assembleRelease
@@ -178,9 +185,16 @@ jobs:
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review7 "$CID":/tmp/'
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/save_screenshots.py
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ${{ github.job }}-native-store-screenshots
-          path: screenshots/*.png
+          path: |
+            screenshots/*.png
+            ~/.maestro/tests/**/*
+            native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
+            /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14
 
 # Include explicit App Info localizations before version localization creation.
+
+# Native Firebase configuration is required for the actual launch path.

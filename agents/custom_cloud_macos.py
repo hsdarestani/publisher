@@ -252,6 +252,12 @@ class CustomBuildMacAgent(CloudMacAgent):
             installed = self._install_distribution_signing(job_id, workspace)
             payload = dict(payload)
             config = dict(config)
+            bundle_id = str(payload.get("bundle_id") or "")
+            profile_specifier = installed.get("bundle_profiles", {}).get(bundle_id, "")
+            if not profile_specifier:
+                raise RuntimeError(
+                    f"No installed App Store provisioning profile matches bundle id {bundle_id!r}."
+                )
             custom_env = dict(config.get("env") or {})
             custom_env.update(
                 {
@@ -259,10 +265,11 @@ class CustomBuildMacAgent(CloudMacAgent):
                     "APPLE_KEY_ID": apple["key_id"],
                     "APPLE_ISSUER_ID": apple["issuer_id"],
                     "IOS_TEAM_ID": apple["team_id"],
-                    "IOS_BUNDLE_ID": str(payload.get("bundle_id") or ""),
+                    "IOS_BUNDLE_ID": bundle_id,
                     "IOS_SIGNING_STYLE": "Manual",
                     "IOS_TARGET_PROFILES_JSON": json.dumps(installed.get("target_profiles", {})),
                     "IOS_BUNDLE_PROFILES_JSON": json.dumps(installed.get("bundle_profiles", {})),
+                    "IOS_PROVISIONING_PROFILE_SPECIFIER": profile_specifier,
                     "IOS_CODE_SIGN_IDENTITY": "Apple Distribution",
                     "IOS_SIGNING_KEYCHAIN": str(installed["keychain_path"]),
                 }

@@ -1,5 +1,5 @@
 name: Run A+ iOS recovery agent
-# Build 53 Apple upload recovery: claim exactly one queued macOS job.
+# A+ Solution build 58 recovery: claim exactly one A+ Solution macOS job.
 
 on:
   workflow_dispatch:
@@ -38,6 +38,8 @@ jobs:
           PYTHONUNBUFFERED: '1'
           PUBLISHER_URL: https://publisher.smarbiz.sbs
           PUBLISHER_MAX_JOBS: '1'
+          PUBLISHER_AGENT_PLATFORM: macos_aplus
+          PUBLISHER_AGENT_APP_SLUG: a-plus-solution
         run: |
           set -o pipefail
           python agents/custom_cloud_macos_altool.py 2>&1 | tee /tmp/aplus-ios-agent.log

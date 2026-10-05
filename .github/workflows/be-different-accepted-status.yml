@@ -25,13 +25,17 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
-          import json
+          import json, re
           from apps.publisher.models import MobileApp, Release, Job, Submission
           a = MobileApp.objects.get(slug="be-different")
+          def diagnostics(job):
+              lines = (job.logs or "").splitlines()
+              selected = [x for x in lines if re.search(r"(?:error:|FAILURE:|Caused by:|What went wrong|ARCHIVE (?:FAILED|SUCCEEDED)|BUILD (?:FAILED|SUCCESSFUL)|No profiles for|Could not resolve|> Task |CompileSwift|CompileC |Ld )", x)]
+              return selected[-12:]
           rows = []
           for r in Release.objects.filter(app=a).order_by("-build_number")[:4]:
-              rows.append({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"source":r.source_commit,"builds":[{"id":b.pk,"platform":b.platform,"status":b.status,"artifact":bool(b.artifact),"external_id":b.external_build_id} for b in r.builds.all()],"jobs":[{"id":j.pk,"type":j.type,"status":j.status,"progress":j.progress,"error":(j.error or "")[-600:]} for j in Job.objects.filter(release=r).order_by("-created_at")[:10]],"submissions":[{"platform":s.platform,"state":s.state,"external_id":s.external_id,"error":s.last_error} for s in Submission.objects.filter(release=r)]})
+              rows.append({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"source":r.source_commit,"builds":[{"id":b.pk,"platform":b.platform,"status":b.status,"artifact":bool(b.artifact),"external_id":b.external_build_id} for b in r.builds.all()],"jobs":[{"id":j.pk,"type":j.type,"status":j.status,"progress":j.progress,"diagnostics":diagnostics(j),"error":(j.error or "")[-600:]} for j in Job.objects.filter(release=r).order_by("-created_at")[:10]],"submissions":[{"platform":s.platform,"state":s.state,"external_id":s.external_id,"error":s.last_error} for s in Submission.objects.filter(release=r)]})
           print("BE_DIFFERENT_STATUS="+json.dumps(rows,default=str))
           PY
 
-# accepted source b0060746ff6e8b519074ecdf13b81ebc8938311e
+# accepted release 126, build 7, source f440cfd19a1c5489da065d6cbd4905e597dd1d7e

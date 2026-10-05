@@ -41,7 +41,17 @@ c=AppleStoreClient(a.apple_account)
 record=c.find_app(a.bundle_id)
 v=c.ensure_version(record["id"],r.version_name)
 c.request("PATCH",f"/appStoreVersions/{v['id']}",data=json.dumps({"data":{"type":"appStoreVersions","id":v["id"],"attributes":{"copyright":"2026 BE DIFFERENT"}}}))
+from apps.integrations.apple_compliance import find_editable_app_info
+info=find_editable_app_info(c,record["id"])
+info_locs=c.request("GET",f"/appInfos/{info['id']}/appInfoLocalizations?limit=200").get("data",[])
 for loc in a.localizations.all():
+    existing=next((x for x in info_locs if x["attributes"].get("locale")==loc.locale),None)
+    attrs={"privacyPolicyUrl":a.privacy_policy_url,"subtitle":loc.subtitle}
+    if existing:
+        c.request("PATCH",f"/appInfoLocalizations/{existing['id']}",data=json.dumps({"data":{"type":"appInfoLocalizations","id":existing["id"],"attributes":attrs}}))
+    else:
+        attrs.update({"locale":loc.locale,"name":"BE DIFFERENT Training"})
+        c.request("POST","/appInfoLocalizations",data=json.dumps({"data":{"type":"appInfoLocalizations","attributes":attrs,"relationships":{"appInfo":{"data":{"type":"appInfos","id":info["id"]}}}}}))
     c.set_localization(v["id"],loc)
 detail=c.request("GET",f"/appStoreVersions/{v['id']}/appStoreReviewDetail").get("data")
 contact={}

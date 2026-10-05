@@ -178,3 +178,5 @@ jobs:
           name: ${{ github.job }}-native-store-screenshots
           path: screenshots/*.png
           retention-days: 14
+
+# Include explicit App Info localizations before version localization creation.

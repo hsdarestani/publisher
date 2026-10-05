@@ -17,11 +17,14 @@ for source in files:
     platform,locale,device,screen=parts
     with Image.open(source) as image:
         width,height=image.size
+        rgb=image.convert("RGB")
         assert image.mode in ("RGB","RGBA"),image.mode
         assert width>=320 and height>=320
     asset,_=AppAsset.objects.get_or_create(app=app,kind="screenshot",platform=platform,locale=locale,device_type=device,sort_order=int(screen.split("-")[0]),defaults={"width":width,"height":height})
     asset.checksum=""
     asset.width=width;asset.height=height
-    asset.file.save(name,ContentFile(source.read_bytes()),save=True)
+    import io
+    data=io.BytesIO();rgb.save(data,format="PNG")
+    asset.file.save(name,ContentFile(data.getvalue()),save=True)
     source.unlink()
     print("CAPTURED_NATIVE_ASSET="+json.dumps({"platform":platform,"locale":locale,"device":device,"width":width,"height":height,"asset":asset.pk}))

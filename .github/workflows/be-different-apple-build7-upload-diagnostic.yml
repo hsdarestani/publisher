@@ -1,0 +1,33 @@
+name: Diagnose BE DIFFERENT Apple build 7 upload
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-apple-build7-upload-diagnostic.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - name: Read exact App Store validation errors
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json,re
+          from apps.publisher.models import Job
+          j=Job.objects.get(pk=3635,release_id=126,app__slug="be-different",type="upload_apple")
+          lines=[x for x in (j.logs or "").splitlines() if re.search(r"ERROR|Validation|ITMS|Invalid|Missing|NotFound|90[0-9]{3}|Error Domain",x,re.I) and not re.search(r"private|password|token|Authorization|apiKey|apiIssuer",x,re.I)]
+          print("APPLE_UPLOAD_DIAGNOSTIC="+json.dumps({"job":j.pk,"status":j.status,"error":j.error,"validation_lines":[x[-5000:] for x in lines[-20:]]}))
+          PY

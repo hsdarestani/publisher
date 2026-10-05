@@ -42,3 +42,5 @@ jobs:
               g._safe_delete_edit(e)
           
           PY
+
+# Refresh verified paired Watch images after native capture success.

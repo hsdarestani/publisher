@@ -34,12 +34,13 @@ jobs:
           from apps.publisher.models import Job
           j=Job.objects.select_related("release","build","build__agent").get(pk=3623,release_id=126,app__slug="be-different",type="build_ios")
           assert j.release.build_number == 7
-          assert j.release.source_commit == "f440cfd19a1c5489da065d6cbd4905e597dd1d7e"
-          if j.build.artifact or j.status == "succeeded":
+          assert j.release.source_commit in ("f440cfd19a1c5489da065d6cbd4905e597dd1d7e","baa598e0316284115a090f1507b2f4f7ba3c717a")
+          if j.build.artifact or j.status == "succeeded" or Job.objects.filter(release=j.release,build=j.build,type="build_ios",status__in=["queued","running"]).exclude(pk=j.pk).exists():
               print("RECOVERY_CANDIDATE=false")
           else:
-              assert j.status == "running", j.status
-              assert j.build.agent.name == "A+ Cloud Mac · GitHub Actions", j.build.agent.name
+              assert j.status in ("running","failed","cancelled"), j.status
+              if j.status == "running":
+                  assert j.build.agent.name == "A+ Cloud Mac · GitHub Actions", j.build.agent.name
               print("RECOVERY_CANDIDATE=true")
           PY
           )"
@@ -81,7 +82,7 @@ jobs:
           from apps.publisher.tasks import enqueue_job
           with transaction.atomic():
               r=Release.objects.select_for_update().get(pk=126,app__slug="be-different",build_number=7)
-              old=Job.objects.select_for_update().select_related("build","build__agent").get(pk=3623,release=r)
+              old=Job.objects.select_for_update(of=("self",)).select_related("build","build__agent").get(pk=3623,release=r)
               b=old.build
               if b.artifact or old.status=="succeeded":
                   print("IOS_RECOVERY_SKIPPED_ALREADY_BUILT")
@@ -98,6 +99,8 @@ jobs:
                   b.started_at=None
                   b.finished_at=None
                   b.save(update_fields=["status","agent","started_at","finished_at","updated_at"])
+                  r.source_commit="baa598e0316284115a090f1507b2f4f7ba3c717a"
+                  r.save(update_fields=["source_commit","updated_at"])
                   j=enqueue_job("build_ios",app=r.app,release=r,build=b,agent=True,platform="macos")
                   print("IOS_BATCHED_RETRY="+json.dumps({"release":r.pk,"build":r.build_number,"job":j.pk}))
           PY

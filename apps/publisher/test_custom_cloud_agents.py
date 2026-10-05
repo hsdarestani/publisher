@@ -55,7 +55,7 @@ class CustomCloudAgentSyntaxTests(SimpleTestCase):
         )
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             agent.run_shell(1, command, directory, os.environ.copy(), 20)
-        output = "\\n".join(call.args[1] for call in agent.log.call_args_list[1:])
+        output = "\n".join(call.args[1] for call in agent.log.call_args_list[1:])
         self.assertEqual(output.splitlines(), ["compiler-line-" + str(i) for i in range(205)])
         self.assertLess(agent.log.call_count, 10)
 

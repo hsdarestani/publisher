@@ -26,6 +26,14 @@ _AGENT_CONFIG = {
         "labels": ["github-hosted", "ephemeral", "xcode", "cloud"],
         "capabilities": {"oidc": True, "ephemeral": True, "xcode": True},
     },
+    "macos_aplus": {
+        "name": "A+ Cloud Mac · A+ Solution",
+        "workflows": [
+            ".github/workflows/run-aplus-ios-rebuild-agent.yml@",
+        ],
+        "labels": ["github-hosted", "ephemeral", "xcode", "cloud", "a-plus-solution"],
+        "capabilities": {"oidc": True, "ephemeral": True, "xcode": True, "app": "a-plus-solution"},
+    },
     "macos_bedifferent": {
         "name": "A+ Cloud Mac · BE DIFFERENT",
         "workflows": [

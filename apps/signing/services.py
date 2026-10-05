@@ -363,7 +363,7 @@ def ensure_be_different_ios_signing_bundle(app):
         ("BEDIFFERENT", app.bundle_id, "BE DIFFERENT"),
         ("widget", f"{app.bundle_id}.widget", "BE DIFFERENT Widget"),
         ("watch", f"{app.bundle_id}.watch", "BE DIFFERENT Watch"),
-        ("watchwidget", f"{app.bundle_id}.watch-widget", "BE DIFFERENT Watch Widget"),
+        ("watchwidget", f"{app.bundle_id}.watch.widget", "BE DIFFERENT Watch Widget"),
     ]
 
     material = []

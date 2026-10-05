@@ -1,0 +1,60 @@
+name: Correct BE DIFFERENT watch widget signing and rebuild iOS 7
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-ios-build7-bundle-retry.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: be-different-ios-build7-bundle-recovery
+  cancel-in-progress: false
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Provision corrected watch widget and queue iOS only
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import inspect,json,time
+          from django.db import transaction
+          from apps.publisher.models import Job,Release,Build
+          from apps.publisher.tasks import enqueue_job
+          import apps.signing.services as signing
+          import importlib
+          for attempt in range(120):
+              importlib.reload(signing)
+              if '.watch.widget' in inspect.getsource(signing.ensure_be_different_ios_signing_bundle):
+                  break
+              time.sleep(5)
+          else:
+              raise RuntimeError("Corrected signing service not deployed")
+          r=Release.objects.get(pk=126,app__slug="be-different",build_number=7)
+          signing.ensure_be_different_ios_signing_bundle(r.app)
+          with transaction.atomic():
+              r=Release.objects.select_for_update().get(pk=r.pk)
+              b=Build.objects.select_for_update().get(pk=226,release=r,platform="ios")
+              if r.source_commit=="2a9d0e7f01e00528735ad6c4a0a196b36b554ed5":
+                  print("IOS_BUNDLE_RETRY_ALREADY_QUEUED")
+              else:
+                  assert not Job.objects.filter(build=b,type__in=["build_ios","upload_apple"],status__in=["queued","running"]).exists()
+                  assert Job.objects.get(pk=3635,build=b).status=="failed"
+                  r.source_commit="2a9d0e7f01e00528735ad6c4a0a196b36b554ed5"
+                  r.save(update_fields=["source_commit","updated_at"])
+                  b.status="queued"
+                  b.agent=None
+                  b.started_at=None
+                  b.finished_at=None
+                  b.save(update_fields=["status","agent","started_at","finished_at","updated_at"])
+                  j=enqueue_job("build_ios",app=r.app,release=r,build=b,agent=True,platform="macos")
+                  print("IOS_BUNDLE_RETRY="+json.dumps({"release":r.pk,"build":b.pk,"job":j.pk}))
+          PY

@@ -30,7 +30,7 @@ jobs:
           PORT="${SSH_PORT:-22}"
           ready=false
           for attempt in $(seq 1 40); do
-            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "import inspect; from apps.integrations.google_play import GooglePlayClient; assert \"normalize_store_asset\" in inspect.getsource(GooglePlayClient._upload_request)"'; then
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "import inspect; from apps.integrations.google_play import GooglePlayClient; from apps.publisher.tasks import handle_upload_google; assert \"normalize_store_asset\" in inspect.getsource(GooglePlayClient._upload_request); assert \"client.apply_store_content\" in inspect.getsource(handle_upload_google)"'; then
               ready=true
               break
             fi

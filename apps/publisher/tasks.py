@@ -200,6 +200,7 @@ def handle_upload_google(job):
     except Exception as exc:
         if "already been used" not in str(exc).lower():
             raise
+        client.apply_store_content(release.app, release.app.localizations.all(), release.app.assets.all())
         result = _publish_existing_google_version(client, release.app, release)
     edit_result = result.get("edit", {}) if isinstance(result, dict) else {}
     manual_review_required = bool(

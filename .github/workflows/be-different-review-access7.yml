@@ -1,0 +1,35 @@
+name: Prepare permanent BE DIFFERENT reviewer access
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-review-access7.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  access:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Grant all features only to isolated review athlete
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/bedifferent && docker compose --env-file .env.production exec -T db psql -U bedifferent -d bedifferent -v ON_ERROR_STOP=1' <<'SQL'
+          UPDATE "User" SET "subscriptionTier"='ELITE', "updatedAt"=NOW() WHERE email='appreview@bedifferent.smarbiz.sbs' AND role='ATHLETE';
+          SELECT email,role,"subscriptionTier" FROM "User" WHERE email='appreview@bedifferent.smarbiz.sbs';
+          SQL
+      - name: Encrypt review-only credentials for store form transport
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/encrypt_review.py

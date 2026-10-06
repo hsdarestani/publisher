@@ -27,7 +27,7 @@ jobs:
           r=Release.objects.get(app=app,version_name='1.0.24',build_number=59)
           for kind in ['submit_google','upload_apple','submit_apple']:
               j=Job.objects.filter(release=r,type=kind).order_by('-created_at').first()
-              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|{(j.error or "")[:400] if j else ""}')
+              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|progress={j.progress if j else ""}|created={j.created_at if j else ""}|started={j.started_at if j else ""}|updated={j.updated_at if j else ""}|error={(j.error or "")[:400] if j else ""}|logs={(j.logs or "")[-600:].replace(chr(10)," ") if j else ""}')
           for platform in ['android','ios']:
               s=Submission.objects.filter(release=r,platform=platform).order_by('-updated_at').first()
               print(f'SUBMISSION|{platform}|{s.state if s else ""}|{s.external_id if s else ""}')
@@ -48,3 +48,5 @@ jobs:
 # status trigger 6
 
 # status trigger final
+
+# diagnostic trigger 7

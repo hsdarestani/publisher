@@ -36,3 +36,5 @@ jobs:
               print(f'BUILD|{platform}|{b.status}|{bool(b.artifact)}|{b.external_build_id or ""}')
           print(f'RELEASE|{r.id}|{r.version_name}|{r.build_number}|{r.status}|{r.source_commit}')
           PY
+
+# status trigger 2

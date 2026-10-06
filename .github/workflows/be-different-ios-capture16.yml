@@ -1,0 +1,115 @@
+name: Build simulator entitlements and capture BE DIFFERENT 1.1
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-ios-capture16.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: be-different-ios-capture16-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+jobs:
+  ios:
+    runs-on: macos-15
+    environment: production
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/aymantraining
+          ref: d4de6f7cf2055d21a756798c7cb597f87bf424fa
+          path: native-source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install capture tools
+        run: |
+          brew install sshpass
+          curl -fsSL https://get.maestro.mobile.dev | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+      - name: Read review credentials privately
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          ready=0
+          for attempt in 1 2 3 4; do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/read_credentials.py > /tmp/bd-review-private.json; then ready=1; break; fi
+            sleep 15
+          done
+          test "$ready" = 1
+          python3 - <<'PY'
+          import os,json
+          data=json.load(open("/tmp/bd-review-private.json"))
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
+              print("::add-mask::"+value)
+              with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
+          os.remove("/tmp/bd-review-private.json")
+          PY
+      - name: Build actual iOS app for simulator
+        working-directory: native-source/mobile
+        run: |
+          set -euo pipefail
+          export NODE_ENV=production
+          npm ci --include=dev
+          node scripts/prepare-native-config.mjs --require-ios
+          CI=1 npx expo prebuild --platform ios --clean
+          python3 scripts/patch-fmt-apple-clang.py ios/Pods
+          python3 - <<'PY'
+          import plistlib
+          with open("/tmp/bd-simulator.entitlements","wb") as f:
+              plistlib.dump({"application-identifier":"com.smarbiz.bedifferent","keychain-access-groups":["com.smarbiz.bedifferent"]},f)
+          PY
+          cd ios
+          ruby -rxcodeproj -e 'p=Xcodeproj::Project.open("BEDIFFERENT.xcodeproj"); t=p.targets.find{|x| x.name=="BEDIFFERENT"}; t.build_configurations.each{|x| x.build_settings["OTHER_LDFLAGS"]=Array(x.build_settings["OTHER_LDFLAGS"]||"$(inherited)")+["-sectcreate","__TEXT","__entitlements","/tmp/bd-simulator.entitlements"]}; p.save'
+          xcodebuild -workspace BEDIFFERENT.xcworkspace -scheme BEDIFFERENT -configuration Release -destination 'generic/platform=iOS Simulator' -derivedDataPath /tmp/bd-review-derived CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build > /tmp/bd-review-build.log 2>&1 || { tail -n 100 /tmp/bd-review-build.log; exit 1; }
+          tail -n 12 /tmp/bd-review-build.log
+      - name: Capture authenticated native iPhone UI in both languages
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; print(next(x["identifier"] for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")))')"
+          udid="$(xcrun simctl create 'BE DIFFERENT Store Capture' com.apple.CoreSimulator.SimDeviceType.iPhone-14-Plus "$runtime")"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100
+          xcrun simctl install "$udid" /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          mkdir -p screenshots capture-debug
+          trap 'xcrun simctl io "$udid" screenshot capture-debug/last-screen.png; cp -R "$HOME/.maestro/tests/." capture-debug/ || true' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("scripts/be_different_review7/ios.yaml").read_text().replace("BE DIFFERENT LEISTUNGSWERT","BE DIFFERENT SCORE")
+          s=s.replace('- tapOn: "E Mail"', '- tapOn:\n    text: "E Mail"\n    index: 1').replace('- tapOn: "Passwort"', '- tapOn:\n    text: "Passwort"\n    index: 1')
+          Path("/tmp/bd-current-ios.yaml").write_text(s)
+          PY
+          maestro --device "$udid" test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" /tmp/bd-current-ios.yaml
+      - name: Save captured native screenshots in Publisher
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sed 's@/tmp/be-different-review7@/tmp/be-different-review9-ios@g' scripts/be_different_review7/save_screenshots.py > /tmp/save-ios-screenshots.py
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review9-ios'
+          for image in screenshots/*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review9-ios/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review9-ios "$CID":/tmp/'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < /tmp/save-ios-screenshots.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ github.job }}-native-store-screenshots
+          path: |
+            screenshots/*.png
+            capture-debug/**/*
+            /tmp/bd-review-build.log
+            native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
+            /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          retention-days: 14

@@ -30,3 +30,5 @@ jobs:
           for r in Release.objects.filter(pk__in=[130,131],app__slug="be-different"):
               print("RELEASE_STATUS="+json.dumps({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"track":r.android_track,"builds":list(r.builds.values("id","platform","status","external_build_id","artifact_size")),"jobs":list(Job.objects.filter(release=r).values("id","type","status","error")),"submissions":list(Submission.objects.filter(release=r).values("platform","state","external_id","last_error"))}))
           PY
+
+# Status refresh after store account access and build 9 upload.

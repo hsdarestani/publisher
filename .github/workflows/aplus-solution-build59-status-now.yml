@@ -1,0 +1,38 @@
+name: A+ Solution 1.0.24 Build 59 Status Now
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build59-status-now.yml'
+permissions:
+  contents: read
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Read Publisher store state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job,MobileApp,Release,Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.24',build_number=59)
+          for kind in ['submit_google','upload_apple','submit_apple']:
+              j=Job.objects.filter(release=r,type=kind).order_by('-created_at').first()
+              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|{(j.error or "")[:400] if j else ""}')
+          for platform in ['android','ios']:
+              s=Submission.objects.filter(release=r,platform=platform).order_by('-updated_at').first()
+              print(f'SUBMISSION|{platform}|{s.state if s else ""}|{s.external_id if s else ""}')
+          for platform in ['android','ios']:
+              b=r.builds.get(platform=platform)
+              print(f'BUILD|{platform}|{b.status}|{bool(b.artifact)}|{b.external_build_id or ""}')
+          print(f'RELEASE|{r.id}|{r.version_name}|{r.build_number}|{r.status}|{r.source_commit}')
+          PY

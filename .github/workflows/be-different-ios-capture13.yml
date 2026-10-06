@@ -67,7 +67,12 @@ jobs:
           mkdir -p /tmp/bd-review-derived/Build/Products/Release-iphonesimulator
           cp -R cached-native/tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/
           chmod +x /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app/BEDIFFERENT
-          codesign --force --sign - /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          python3 - <<'PY'
+          import plistlib
+          with open("/tmp/bd-simulator.entitlements","wb") as f:
+              plistlib.dump({"application-identifier":"com.smarbiz.bedifferent","keychain-access-groups":["com.smarbiz.bedifferent"]},f)
+          PY
+          codesign --force --sign - --entitlements /tmp/bd-simulator.entitlements /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
       - name: Capture authenticated native iPhone UI in both languages
         run: |
           set -euo pipefail
@@ -79,7 +84,12 @@ jobs:
           xcrun simctl install "$udid" /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           mkdir -p screenshots
           trap 'xcrun simctl io "$udid" screenshot screenshots/capture-debug.png; mkdir -p capture-debug; cp -R "$HOME/.maestro/tests/." capture-debug/ || true' EXIT
-          sed 's/BE DIFFERENT LEISTUNGSWERT/BE DIFFERENT SCORE/' scripts/be_different_review7/ios.yaml > /tmp/bd-current-ios.yaml
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("scripts/be_different_review7/ios.yaml").read_text().replace("BE DIFFERENT LEISTUNGSWERT","BE DIFFERENT SCORE")
+          s=s.replace('- tapOn: "E Mail"', '- tapOn:\n    text: "E Mail"\n    index: 1').replace('- tapOn: "Passwort"', '- tapOn:\n    text: "Passwort"\n    index: 1')
+          Path("/tmp/bd-current-ios.yaml").write_text(s)
+          PY
           maestro --device "$udid" test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" /tmp/bd-current-ios.yaml
       - name: Save captured native screenshots in Publisher
         run: |

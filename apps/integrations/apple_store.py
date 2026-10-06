@@ -345,17 +345,23 @@ class AppleStoreClient:
 
         submission = None
         item = None
+        empty_draft = None
         for ready in self.list_review_submissions(app_id, "READY_FOR_REVIEW"):
-            ready_item, _ = self._review_submission_matches(ready, version_id)
+            ready_item, ready_items = self._review_submission_matches(ready, version_id)
+            if not ready_items and empty_draft is None:
+                empty_draft = ready
             if ready_item:
                 submission = ready
                 item = ready_item
                 break
 
+        if submission is None:
+            submission = empty_draft
         reused = submission is not None
-        if not reused:
+        if submission is None:
             body = {"data": {"type": "reviewSubmissions", "attributes": {}, "relationships": {"app": {"data": {"type": "apps", "id": app_id}}}}}
             submission = self.request("POST", "/reviewSubmissions", data=json.dumps(body))["data"]
+        if item is None:
             item_body = {"data": {"type": "reviewSubmissionItems", "relationships": {
                 "reviewSubmission": {"data": {"type": "reviewSubmissions", "id": submission["id"]}},
                 "appStoreVersion": {"data": {"type": "appStoreVersions", "id": version_id}},

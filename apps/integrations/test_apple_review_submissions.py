@@ -136,7 +136,7 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
         self.assertTrue(result["resubmitted_unresolved"])
         self.assertFalse(any(method == "POST" for method, _, _ in calls))
 
-    def test_creates_new_submission_only_when_no_ready_draft_targets_version(self):
+    def test_reuses_empty_ready_draft_without_allocating_another_slot(self):
         client = self._client()
         calls = []
 
@@ -152,23 +152,21 @@ class AppleReviewSubmissionRetryTests(SimpleTestCase):
                 return {"data": [{"id": "empty-sub", "attributes": {"state": "READY_FOR_REVIEW"}}]}
             if path.startswith("/reviewSubmissions/empty-sub/items?"):
                 return {"data": []}
-            if method == "POST" and path == "/reviewSubmissions":
-                return {"data": {"id": "new-sub", "attributes": {"state": "READY_FOR_REVIEW"}}}
             if method == "POST" and path == "/reviewSubmissionItems":
                 return {"data": version_item("new-item", "version-1")}
-            if method == "PATCH" and path == "/reviewSubmissions/new-sub":
-                return {"data": {"id": "new-sub", "attributes": {"state": "WAITING_FOR_REVIEW"}}}
+            if method == "PATCH" and path == "/reviewSubmissions/empty-sub":
+                return {"data": {"id": "empty-sub", "attributes": {"state": "WAITING_FOR_REVIEW"}}}
             self.fail(f"Unexpected Apple request: {method} {path}")
 
         client.request = Mock(side_effect=request)
 
         result = client.submit_version("app-1", "version-1")
 
-        self.assertEqual(result["submission"]["id"], "new-sub")
-        self.assertFalse(result["reused"])
+        self.assertEqual(result["submission"]["id"], "empty-sub")
+        self.assertTrue(result["reused"])
         self.assertFalse(
             any(
-                method == "PATCH" and path == "/reviewSubmissions/empty-sub"
+                method == "POST" and path == "/reviewSubmissions"
                 for method, path, _ in calls
             )
         )

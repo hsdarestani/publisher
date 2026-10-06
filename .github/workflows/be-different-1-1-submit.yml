@@ -1,4 +1,4 @@
-name: Submit BE DIFFERENT 1.1 build 8
+name: Prepare BE DIFFERENT 1.1 build 9 Google draft
 on:
   push:
     branches: [main]
@@ -26,9 +26,21 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
           import json
-          from apps.publisher.models import Release,Job,Submission
-          for r in Release.objects.filter(pk__in=[130,131],app__slug="be-different"):
-              print("RELEASE_STATUS="+json.dumps({"id":r.pk,"version":r.version_name,"build":r.build_number,"status":r.status,"track":r.android_track,"builds":list(r.builds.values("id","platform","status","external_build_id","artifact_size")),"jobs":list(Job.objects.filter(release=r).values("id","type","status","error")),"submissions":list(Submission.objects.filter(release=r).values("platform","state","external_id","last_error"))}))
+          from apps.publisher.models import Release,Submission
+          from apps.integrations.google_play import GooglePlayClient
+          r=Release.objects.get(pk=131,app__slug="be-different")
+          assert r.build_number==9 and r.version_name=="1.1.0"
+          a=r.app
+          c=GooglePlayClient(a.google_account)
+          e=c._open_edit(a.package_name)
+          try:
+              body={"track":"production","releases":[{"name":r.version_name,"versionCodes":["9"],"status":"draft","releaseNotes":[{"language":loc.locale,"text":(loc.release_notes or r.release_notes)[:500]} for loc in a.localizations.all() if (loc.release_notes or r.release_notes)]}]}
+              c._edit_request(e,"PUT",f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/tracks/production",json_body=body)
+              c._validate_edit(e)
+              result=c._commit_edit(e)
+              Submission.objects.update_or_create(app=a,release=r,platform="android",defaults={"state":"ready_for_review","last_error":""})
+              print("GOOGLE_BUILD9_DRAFT_COMMITTED="+json.dumps(result))
+          except Exception:
+              c._safe_delete_edit(e)
+              raise
           PY
-
-# Status refresh after store account access and build 9 upload.

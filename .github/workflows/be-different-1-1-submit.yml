@@ -32,8 +32,12 @@ jobs:
           assert r.build_number==9 and r.version_name=="1.1.0"
           a=r.app
           c=GooglePlayClient(a.google_account)
+          from pathlib import Path
+          b=r.builds.get(platform="android",status="succeeded")
           e=c._open_edit(a.package_name)
           try:
+              bundle=c._upload_request(e,f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/bundles",Path(b.artifact.path).read_bytes(),"application/octet-stream")
+              assert int(bundle["versionCode"])==9
               body={"track":"production","releases":[{"name":r.version_name,"versionCodes":["9"],"status":"draft","releaseNotes":[{"language":loc.locale,"text":(loc.release_notes or r.release_notes)[:500]} for loc in a.localizations.all() if (loc.release_notes or r.release_notes)]}]}
               c._edit_request(e,"PUT",f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/tracks/production",json_body=body)
               c._validate_edit(e)

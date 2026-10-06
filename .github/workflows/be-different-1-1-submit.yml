@@ -1,0 +1,46 @@
+name: Submit BE DIFFERENT 1.1 build 8
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-1-1-submit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: be-different-1-1-submit
+  cancel-in-progress: false
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Advance and inspect exact release
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json
+          from apps.publisher.models import Release,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(pk=130,app__slug="be-different",version_name="1.1.0",build_number=8)
+          r.auto_submit=True
+          r.save(update_fields=["auto_submit","updated_at"])
+          for b in r.builds.all():
+              submitted=Submission.objects.filter(release=r,platform=b.platform,state__in=["in_review","approved","live"]).exists()
+              if submitted: continue
+              kind=("submit_google" if b.platform=="android" else ("submit_apple" if b.external_build_id else "upload_apple"))
+              if b.status!="succeeded": continue
+              if Job.objects.filter(release=r,type=kind,status__in=["queued","running"]).exists(): continue
+              j=enqueue_job(kind,release=r,build=b,agent=kind=="upload_apple",platform="macos" if kind=="upload_apple" else "")
+              print("QUEUED="+json.dumps({"id":j.pk,"type":kind}))
+          print("RELEASE="+json.dumps({"id":r.pk,"status":r.status,"track":r.android_track,"source":r.source_commit}))
+          print("BUILDS="+json.dumps(list(r.builds.values("id","platform","status","external_build_id","artifact_size"))))
+          print("JOBS="+json.dumps(list(Job.objects.filter(release=r).values("id","type","status","error"))))
+          print("SUBMISSIONS="+json.dumps(list(Submission.objects.filter(release=r).values("platform","state","external_id","last_error"))))
+          PY

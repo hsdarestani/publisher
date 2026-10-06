@@ -1,0 +1,107 @@
+name: Capture BE DIFFERENT corrected build 9
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-ios-capture12.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: be-different-ios-capture12-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+jobs:
+  ios:
+    runs-on: macos-15
+    environment: production
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/aymantraining
+          ref: d4de6f7cf2055d21a756798c7cb597f87bf424fa
+          path: native-source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install capture tools
+        run: |
+          brew install sshpass
+          curl -fsSL https://get.maestro.mobile.dev | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+      - name: Read review credentials privately
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          ready=0
+          for attempt in 1 2 3 4; do
+            if sshpass -p "$PASS" ssh -p "$PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/read_credentials.py > /tmp/bd-review-private.json; then ready=1; break; fi
+            sleep 15
+          done
+          test "$ready" = 1
+          python3 - <<'PY'
+          import os,json
+          data=json.load(open("/tmp/bd-review-private.json"))
+          for key,value in (("REVIEW_USER",data["username"]),("REVIEW_PASS",data["password"])):
+              print("::add-mask::"+value)
+              with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
+          os.remove("/tmp/bd-review-private.json")
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-native-store-screenshots
+          run-id: 37419347076
+          github-token: ${{ github.token }}
+          path: cached-native
+      - name: Rebundle corrected source into verified simulator app
+        working-directory: native-source/mobile
+        run: |
+          set -euo pipefail
+          npm ci --include=dev
+          mkdir -p /tmp/bd-review-derived/Build/Products/Release-iphonesimulator
+          cp -R ../../cached-native/tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/
+          APP=/tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          npx expo export:embed --entry-file node_modules/expo-router/entry.js --platform ios --dev false --bundle-output "$APP/main.jsbundle" --assets-dest "$APP"
+          chmod +x "$APP/BEDIFFERENT"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 9' "$APP/Info.plist"
+          codesign --force --sign - "$APP"
+      - name: Capture authenticated native iPhone UI in both languages
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; print(next(x["identifier"] for x in json.load(sys.stdin)["runtimes"] if x["isAvailable"] and x["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")))')"
+          udid="$(xcrun simctl create 'BE DIFFERENT Store Capture' com.apple.CoreSimulator.SimDeviceType.iPhone-14-Plus "$runtime")"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100
+          xcrun simctl install "$udid" /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          mkdir -p screenshots
+          maestro --device "$udid" test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" scripts/be_different_review7/ios.yaml
+      - name: Save captured native screenshots in Publisher
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review7'
+          for image in screenshots/*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review7/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review7 "$CID":/tmp/'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/save_screenshots.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ github.job }}-native-store-screenshots
+          path: |
+            screenshots/*.png
+            ~/.maestro/tests/**/*.png
+            native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
+            /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
+          retention-days: 14

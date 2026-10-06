@@ -1,0 +1,65 @@
+name: Save verified BE DIFFERENT Android build 9 screenshots
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-save-android9.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  save:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-retry-native-screenshots
+          run-id: 37452255915
+          github-token: ${{ github.token }}
+          path: captured
+      - name: Save verified captures and localized Google listing
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          test "$(ls captured/screenshots/android--*.png | wc -l)" -eq 6
+          sed 's@/tmp/be-different-review7@/tmp/be-different-review9-android@g' scripts/be_different_review7/save_screenshots.py > /tmp/save-android9.py
+          cat >> /tmp/save-android9.py <<'PY'
+          import json
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Release
+          r=Release.objects.get(pk=131,app__slug="be-different",build_number=9)
+          a=r.app
+          for locale in ("de-DE","en-US"):
+              assert a.assets.filter(kind="screenshot",platform="android",locale=locale,device_type="phone").count()==3
+          c=GooglePlayClient(a.google_account)
+          print("GOOGLE_NATIVE_LISTING="+json.dumps(c.apply_store_content(a,list(a.localizations.all()),list(a.assets.filter(platform="android")))))
+          e=c._open_edit(a.package_name)
+          try:
+              t=c._edit_request(e,"GET",f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/tracks/production")
+              assert t["releases"][0]["versionCodes"]==["9"] and t["releases"][0]["status"]=="draft"
+              print("VERIFIED_GOOGLE_PRODUCTION="+json.dumps(t))
+          finally:c._safe_delete_edit(e)
+          PY
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/save-android9.py root@"$HOST":/tmp/save-android9.py
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review9-android'
+          for image in captured/screenshots/android--*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review9-android/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'bash -s' <<'SH'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          for attempt in 1 2 3 4 5 6; do
+            CID=$(docker compose ps -q web)
+            if test -n "$CID" && docker cp /tmp/be-different-review9-android "$CID":/tmp/ && docker cp /tmp/save-android9.py "$CID":/tmp/save-android9.py && docker compose exec -T web python /tmp/save-android9.py; then exit 0; fi
+            sleep 15
+          done
+          exit 1
+          SH

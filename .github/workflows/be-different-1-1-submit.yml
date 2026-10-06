@@ -43,4 +43,15 @@ jobs:
           print("BUILDS="+json.dumps(list(r.builds.values("id","platform","status","external_build_id","artifact_size"))))
           print("JOBS="+json.dumps(list(Job.objects.filter(release=r).values("id","type","status","error"))))
           print("SUBMISSIONS="+json.dumps(list(Submission.objects.filter(release=r).values("platform","state","external_id","last_error"))))
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          c=AppleStoreClient(r.app.apple_account)
+          a=c.find_app(r.app.bundle_id)
+          versions=c.request("GET",f"/apps/{a['id']}/appStoreVersions",params={"filter[versionString]":"1.1.0","filter[platform]":"IOS"})
+          print("APPLE_STORE="+json.dumps([{"id":v["id"],"attributes":v["attributes"]} for v in versions.get("data",[])]))
+          g=GooglePlayClient(r.app.google_account)
+          e=g._open_edit(r.app.package_name)
+          try:
+              print("GOOGLE_STORE="+json.dumps(g._edit_request(e,"GET",f"/applications/{g._q(r.app.package_name)}/edits/{e.edit_id}/tracks")))
+          finally: g._safe_delete_edit(e)
           PY

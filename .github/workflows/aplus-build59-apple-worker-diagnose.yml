@@ -1,0 +1,34 @@
+name: A+ Build 59 Apple Worker Diagnose
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-build59-apple-worker-diagnose.yml'
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Inspect Publisher worker
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" <<'SH'
+          cd /opt/aplus-publisher
+          echo '=== worker ps ==='
+          docker compose ps worker
+          echo '=== worker logs tail ==='
+          docker compose logs --since 20m --tail 500 worker | grep -E -i '3726|submit_apple|handle_submit_apple|Traceback|ERROR|RuntimeError|Apple|review' || true
+          echo '=== celery inspect active ==='
+          docker compose exec -T worker celery -A config inspect active || true
+          echo '=== celery inspect reserved ==='
+          docker compose exec -T worker celery -A config inspect reserved || true
+          SH

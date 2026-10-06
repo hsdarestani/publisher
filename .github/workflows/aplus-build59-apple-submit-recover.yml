@@ -1,0 +1,48 @@
+name: A+ Build 59 Apple Submit Recover
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-build59-apple-submit-recover.yml'
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Requeue orphaned Apple review submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import Job,MobileApp,Release
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.24',build_number=59)
+          ios=r.builds.get(platform='ios')
+          assert ios.status=='succeeded' and ios.artifact and ios.external_build_id
+
+          old=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          if old and old.status=='running':
+              old.status='failed'
+              old.error='Worker restarted during Apple submission; orphaned task recovered and requeued.'
+              old.finished_at=timezone.now()
+              old.save(update_fields=['status','error','finished_at','updated_at'])
+
+          existing=Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if existing and existing.status=='succeeded':
+              print(f'ALREADY_DONE|{existing.id}')
+          else:
+              job=enqueue_job('submit_apple',app=app,release=r,build=ios)
+              print(f'REQUEUED|{job.id}|build={r.build_number}|version={r.version_name}|external_build={ios.external_build_id}')
+          PY

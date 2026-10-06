@@ -54,12 +54,14 @@ jobs:
           from pathlib import Path
           s=Path("scripts/be_different_review7/android.yaml").read_text().replace("BE DIFFERENT LEISTUNGSWERT","BE DIFFERENT SCORE")
           s=s.replace('- tapOn: "E Mail"', '- tapOn:\n    text: "E Mail"\n    index: 1').replace('- tapOn: "Passwort"', '- tapOn:\n    text: "Passwort"\n    index: 1')
+          s=s.replace("- extendedWaitUntil:", '- tapOn:\n    text: "Close app"\n    optional: true\n- extendedWaitUntil:', 1)
           Path("/tmp/bd-current-android.yaml").write_text(s)
           PY
           cat > /tmp/bd-android-capture.sh <<'SH'
           set -euo pipefail
           adb install /tmp/bd9.apk
           mkdir -p screenshots capture-debug capture-output
+          adb shell settings put global anr_show_background 0
           trap 'adb exec-out screencap -p > capture-debug/last-screen.png; adb logcat -d -s AndroidRuntime ReactNativeJS > capture-debug/android-runtime.log; cp -R "$HOME/.maestro/tests/." capture-debug/maestro/ || true' EXIT
           maestro test --test-output-dir "$PWD/capture-output" -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR=. /tmp/bd-current-android.yaml
           find capture-output -name 'android--*.png' -exec cp '{}' screenshots/ \;

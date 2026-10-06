@@ -31,6 +31,9 @@ jobs:
           r=Release.objects.get(pk=130,app__slug="be-different",version_name="1.1.0",build_number=8)
           r.auto_submit=True
           r.save(update_fields=["auto_submit","updated_at"])
+          print("ASSETS="+json.dumps(list(r.app.assets.values("id","platform","kind","locale","device_type","width","height","file"))))
+          for failed in Job.objects.filter(release=r,type="submit_apple",status="failed").order_by("-id")[:1]:
+              print("APPLE_ERROR="+json.dumps((failed.logs or "")[-18000:]))
           for b in r.builds.all():
               submitted=Submission.objects.filter(release=r,platform=b.platform,state__in=["in_review","approved","live"]).exists()
               if submitted: continue

@@ -78,6 +78,7 @@ jobs:
           xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100
           xcrun simctl install "$udid" /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           mkdir -p screenshots
+          trap 'xcrun simctl io "$udid" screenshot screenshots/capture-debug.png; mkdir -p capture-debug; cp -R "$HOME/.maestro/tests/." capture-debug/ || true' EXIT
           sed 's/BE DIFFERENT LEISTUNGSWERT/BE DIFFERENT SCORE/' scripts/be_different_review7/ios.yaml > /tmp/bd-current-ios.yaml
           maestro --device "$udid" test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" /tmp/bd-current-ios.yaml
       - name: Save captured native screenshots in Publisher
@@ -96,7 +97,7 @@ jobs:
           name: ${{ github.job }}-native-store-screenshots
           path: |
             screenshots/*.png
-            ~/.maestro/tests/**/*
+            capture-debug/**/*
             native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
             /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14

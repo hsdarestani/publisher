@@ -30,12 +30,23 @@ jobs:
           from apps.integrations.google_play import GooglePlayClient
           r=Release.objects.get(pk=131,app__slug="be-different")
           a=r.app
+          notes={"de-DE":"Neue BE DIFFERENT Oberfläche mit klarer Trainingsübersicht, persönlichem Leistungswert und verbesserter Navigation. Optimierter Start und Anmeldung.","en-US":"New BE DIFFERENT brand experience with a clear training overview, personal performance score and improved navigation. Smoother startup and sign in."}
+          for loc in a.localizations.all():
+              if loc.locale in notes:
+                  loc.release_notes=notes[loc.locale]
+                  loc.save(update_fields=["release_notes"])
           c=GooglePlayClient(a.google_account)
           e=c._open_edit(a.package_name)
           try:
               t=c._edit_request(e,"GET",f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/tracks/production")
+              assert t["releases"][0]["versionCodes"]==["9"] and t["releases"][0]["status"]=="draft"
+              t["releases"][0]["releaseNotes"]=[{"language":k,"text":v} for k,v in notes.items()]
+              c._edit_request(e,"PUT",f"/applications/{c._q(a.package_name)}/edits/{e.edit_id}/tracks/production",json_body=t)
+              c._validate_edit(e)
+              c._commit_edit(e)
               print("GOOGLE_PRODUCTION_TRACK="+json.dumps(t))
           finally:
               c._safe_delete_edit(e)
           print("BUILD9_STORE_STATUS="+json.dumps({"builds":list(r.builds.values("platform","status","external_build_id")),"submissions":list(Submission.objects.filter(release=r).values("platform","state","external_id"))}))
+          print("STORE_SCREENSHOT_ASSETS="+json.dumps(list(a.assets.filter(kind="screenshot").values("platform","locale","device_type","width","height","file"))))
           PY

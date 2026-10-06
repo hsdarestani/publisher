@@ -75,7 +75,18 @@ jobs:
               result=_publish_existing_google_version(g,r.app,r)
               Submission.objects.filter(release=r,platform="android").update(raw=result,state="ready_for_review" if result.get("edit",{}).get("_changes_not_sent_for_review") else "in_review")
               print("GOOGLE_PRODUCTION="+json.dumps(result))
-          except Exception as exc: print("GOOGLE_PRODUCTION_ERROR="+str(exc))
+          except Exception as exc:
+              print("GOOGLE_PRODUCTION_ERROR="+str(exc))
+              if "draft app" in str(exc):
+                  edit=g._open_edit(r.app.package_name)
+                  try:
+                      g._edit_request(edit,"PUT",f"/applications/{g._q(r.app.package_name)}/edits/{edit.edit_id}/tracks/production",json_body={"track":"production","releases":[{"name":"1.1.0","versionCodes":["8"],"status":"draft","releaseNotes":[{"language":"en-US","text":"A complete BE DIFFERENT redesign with a new visual identity, updated navigation and redesigned screens and forms."},{"language":"de-DE","text":"Komplettes BE DIFFERENT Redesign mit neuer visueller Identität, überarbeiteter Navigation und neu gestalteten Ansichten und Formularen."}]}]})
+                      g._validate_edit(edit)
+                      print("GOOGLE_PRODUCTION_DRAFT="+json.dumps(g._commit_edit(edit)))
+                      Submission.objects.filter(release=r,platform="android").update(state="ready_for_review")
+                  except Exception:
+                      g._safe_delete_edit(edit)
+                      raise
           import requests
           from apps.integrations.apple_store import BASE_URL
           original=c.request
@@ -88,6 +99,14 @@ jobs:
                   raise RuntimeError("Apple eligibility failed: "+str(response.status_code))
               return {} if response.status_code==204 else response.json()
           c.request=detailed
-          try: c.submit_version(a["id"],versions["data"][0]["id"])
+          try:
+              version_id=versions["data"][0]["id"]
+              drafts=c.list_review_submissions(a["id"],"READY_FOR_REVIEW")
+              draft=next((s for s in drafts if not c.request("GET",f"/reviewSubmissions/{s['id']}/items").get("data")),None)
+              if draft:
+                  c.request("POST","/reviewSubmissionItems",data=json.dumps({"data":{"type":"reviewSubmissionItems","relationships":{"reviewSubmission":{"data":{"type":"reviewSubmissions","id":draft["id"]}},"appStoreVersion":{"data":{"type":"appStoreVersions","id":version_id}}}}}))
+                  result=c.request("PATCH",f"/reviewSubmissions/{draft['id']}",data=json.dumps({"data":{"type":"reviewSubmissions","id":draft["id"],"attributes":{"submitted":True}}}))
+                  print("APPLE_SUBMITTED="+json.dumps(result))
+              else: print("APPLE_DRAFTS="+json.dumps([{"id":s["id"],"attributes":s.get("attributes",{})} for s in drafts]))
           except Exception as exc: print("ELIGIBILITY="+str(exc))
           PY

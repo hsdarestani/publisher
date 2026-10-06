@@ -1,4 +1,4 @@
-name: Submit verified BE DIFFERENT iOS build 9 for review
+name: Inspect BE DIFFERENT 1.1 build 9 store status
 on:
   push:
     branches: [main]
@@ -15,7 +15,7 @@ jobs:
     environment: production
     timeout-minutes: 12
     steps:
-      - name: Advance and inspect exact release
+      - name: Verify exact store states without publishing changes
         env:
           HOST: ${{ secrets.HOST }}
           PASS: ${{ secrets.PASS }}
@@ -26,24 +26,20 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
           import json
-          from django.utils import timezone
-          from apps.publisher.models import Release,Submission,Job
-          from apps.publisher.tasks import handle_submit_apple
+          from apps.publisher.models import Release,Submission
           from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
           r=Release.objects.get(pk=131,app__slug="be-different",build_number=9)
           a=r.app
           c=AppleStoreClient(a.apple_account)
-          vid="bec48543-3f4a-47b5-9fb6-53701512abb2"
-          v=c.request("GET","/appStoreVersions/"+vid)["data"]
-          if v["attributes"]["appStoreState"] not in ("WAITING_FOR_REVIEW","IN_REVIEW","PENDING_DEVELOPER_RELEASE","READY_FOR_SALE"):
-              for locale in ("de-DE","en-US"):
-                  assert a.assets.filter(kind="screenshot",platform="ios",locale=locale,device_type="APP_IPHONE_65").count()==3
-              j=Job.objects.get(pk=3696,release=r)
-              result=handle_submit_apple(j)
-              print("APPLE_REVIEW_SUBMISSION_STATE="+result["submission"]["attributes"]["state"])
-              j.status="succeeded";j.result=result;j.error="";j.finished_at=timezone.now()
-              j.save(update_fields=["status","result","error","finished_at","updated_at"])
-          v=c.request("GET","/appStoreVersions/"+vid)["data"]
-          print("APPLE_ACTUAL_VERSION_STATE="+v["attributes"]["appStoreState"])
+          v=c.request("GET","/appStoreVersions/bec48543-3f4a-47b5-9fb6-53701512abb2")["data"]
+          print("APPLE_VERIFIED_VERSION="+json.dumps({"id":v["id"],"version":v["attributes"]["versionString"],"state":v["attributes"]["appStoreState"]}))
+          g=GooglePlayClient(a.google_account)
+          e=g._open_edit(a.package_name)
+          try:
+              t=g._edit_request(e,"GET",f"/applications/{g._q(a.package_name)}/edits/{e.edit_id}/tracks/production")
+              print("GOOGLE_VERIFIED_PRODUCTION="+json.dumps(t))
+          finally:g._safe_delete_edit(e)
           print("BUILD9_SUBMISSIONS="+json.dumps(list(Submission.objects.filter(release=r).values("platform","state","external_id"))))
+          print("NATIVE_SCREENSHOTS="+json.dumps(list(a.assets.filter(kind="screenshot").values("platform","locale","device_type","width","height"))))
           PY

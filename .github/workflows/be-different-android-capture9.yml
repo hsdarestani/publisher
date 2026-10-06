@@ -1,0 +1,94 @@
+name: Capture BE DIFFERENT Android build 9 store screenshots
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/be-different-android-capture9.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare capture tools and private login
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          curl -fsSL https://get.maestro.mobile.dev | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < scripts/be_different_review7/read_credentials.py > /tmp/bd-private.json
+          python3 - <<'PY'
+          import os,json
+          d=json.load(open("/tmp/bd-private.json"))
+          for key,value in (("REVIEW_USER",d["username"]),("REVIEW_PASS",d["password"])):
+              print("::add-mask::"+value)
+              with open(os.environ["GITHUB_ENV"],"a") as f:f.write(key+"="+value+"\n")
+          os.remove("/tmp/bd-private.json")
+          PY
+      - name: Download exact build 9 AAB and prepare native APK
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && ARTIFACT=$(docker compose exec -T web python -c "import os; os.environ.setdefault(\"DJANGO_SETTINGS_MODULE\",\"config.settings\"); import django; django.setup(); from apps.publisher.models import Release; r=Release.objects.get(pk=131,app__slug=\"be-different\"); assert r.build_number==9; print(r.builds.get(platform=\"android\",status=\"succeeded\").artifact.path)") && docker cp "$CID:$ARTIFACT" /tmp/bd-build9.aab'
+          sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no root@"$HOST":/tmp/bd-build9.aab /tmp/bd-build9.aab
+          curl -fsSL https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar -o /tmp/bundletool.jar
+          keytool -genkeypair -keystore /tmp/bd-debug.jks -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug' -keyalg RSA -keysize 2048 -validity 30
+          java -jar /tmp/bundletool.jar build-apks --bundle=/tmp/bd-build9.aab --output=/tmp/bd9.apks --mode=universal --ks=/tmp/bd-debug.jks --ks-pass=pass:android --ks-key-alias=androiddebugkey --key-pass=pass:android
+          unzip -p /tmp/bd9.apks universal.apk > /tmp/bd9.apk
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("scripts/be_different_review7/android.yaml").read_text().replace("BE DIFFERENT LEISTUNGSWERT","BE DIFFERENT SCORE")
+          s=s.replace('- tapOn: "E Mail"', '- tapOn:\n    text: "E Mail"\n    index: 1').replace('- tapOn: "Passwort"', '- tapOn:\n    text: "Passwort"\n    index: 1')
+          Path("/tmp/bd-current-android.yaml").write_text(s)
+          PY
+          cat > /tmp/bd-android-capture.sh <<'SH'
+          set -euo pipefail
+          adb install /tmp/bd9.apk
+          mkdir -p screenshots capture-debug
+          trap 'adb exec-out screencap -p > capture-debug/last-screen.png' EXIT
+          maestro test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" /tmp/bd-current-android.yaml
+          SH
+      - name: Capture actual build 9 UI in both languages
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: bash /tmp/bd-android-capture.sh
+      - name: Save successful native screenshots
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sed 's@/tmp/be-different-review7@/tmp/be-different-review9-android@g' scripts/be_different_review7/save_screenshots.py > /tmp/save-android-screenshots.py
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'mkdir -p /tmp/be-different-review9-android'
+          for image in screenshots/android--*.png; do
+            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no "$image" root@"$HOST":/tmp/be-different-review9-android/
+          done
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && CID=$(docker compose ps -q web) && docker cp /tmp/be-different-review9-android "$CID":/tmp/'
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python -' < /tmp/save-android-screenshots.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-retry-native-screenshots
+          path: |
+            screenshots/*.png
+            capture-debug/last-screen.png
+          retention-days: 14

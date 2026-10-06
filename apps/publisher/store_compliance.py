@@ -6,6 +6,8 @@ APPLE_USES_NON_EXEMPT_ENCRYPTION = {
     # explicitly sets ITSAppUsesNonExemptEncryption=NO. It does not ship custom
     # cryptographic algorithms or a separate crypto library.
     "a-studio": False,
+    # BE DIFFERENT uses platform TLS and declares non-exempt encryption false.
+    "be-different": False,
     # A+Bau likewise declares ITSAppUsesNonExemptEncryption=NO in its native iOS
     # release configuration and relies on ordinary platform HTTPS/TLS.
     "a-bau": False,
@@ -24,6 +26,8 @@ APPLE_CONTENT_RIGHTS = {
     # verify content and third-party rights before production use, so the
     # conservative App Store declaration is that third-party content may be used.
     "a-studio": "USES_THIRD_PARTY_CONTENT",
+    # Athlete/coach messages and user-created content may include third-party material.
+    "be-different": "USES_THIRD_PARTY_CONTENT",
     # A+Bau allows authenticated business users to attach photos, documents and
     # other project material. Treat this conservatively as possible third-party
     # content rather than claiming the app can never access such material.
@@ -76,6 +80,8 @@ _BASE_BUSINESS_AGE_RATING = {
 
 APPLE_AGE_RATING_PROFILES = {
     "a-studio": dict(_BASE_BUSINESS_AGE_RATING),
+    # Training/recovery topics and private coach chat are present; no medical diagnosis.
+    "be-different": {**_BASE_BUSINESS_AGE_RATING, "healthOrWellnessTopics": True, "messagingAndChat": True},
     # A+Bau is a restricted-access construction/business ERP. Users can create
     # project records, reports, photos and documents, hence UGC is declared
     # conservatively. It has no unrestricted browser, social network, advertising,

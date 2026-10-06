@@ -59,9 +59,10 @@ jobs:
           cat > /tmp/bd-android-capture.sh <<'SH'
           set -euo pipefail
           adb install /tmp/bd9.apk
-          mkdir -p screenshots capture-debug
-          trap 'adb exec-out screencap -p > capture-debug/last-screen.png' EXIT
-          maestro test -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR="$PWD/screenshots" /tmp/bd-current-android.yaml
+          mkdir -p screenshots capture-debug capture-output
+          trap 'adb exec-out screencap -p > capture-debug/last-screen.png; adb logcat -d -s AndroidRuntime ReactNativeJS > capture-debug/android-runtime.log; cp -R "$HOME/.maestro/tests/." capture-debug/maestro/ || true' EXIT
+          maestro test --test-output-dir "$PWD/capture-output" -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR=. /tmp/bd-current-android.yaml
+          find capture-output -name 'android--*.png' -exec cp '{}' screenshots/ \;
           SH
       - name: Capture actual build 9 UI in both languages
         uses: reactivecircus/android-emulator-runner@v2
@@ -90,5 +91,5 @@ jobs:
           name: android-retry-native-screenshots
           path: |
             screenshots/*.png
-            capture-debug/last-screen.png
+            capture-debug/**/*
           retention-days: 14

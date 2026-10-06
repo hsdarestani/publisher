@@ -83,6 +83,7 @@ jobs:
           from pathlib import Path
           s=Path("scripts/be_different_review7/ios.yaml").read_text().replace("BE DIFFERENT LEISTUNGSWERT","BE DIFFERENT SCORE")
           s=s.replace('- tapOn: "E Mail"', '- tapOn:\n    text: "E Mail"\n    index: 1').replace('- tapOn: "Passwort"', '- tapOn:\n    text: "Passwort"\n    index: 1')
+          s=s.replace('- tapOn: "TRAINING"', '- tapOn:\n    point: "30%, 96%"').replace('- tapOn: "ATHLET"', '- tapOn:\n    point: "90%, 96%"').replace('- tapOn: "HOME"', '- tapOn:\n    point: "10%, 96%"')
           Path("/tmp/bd-current-ios.yaml").write_text(s)
           PY
           maestro --device "$udid" test --test-output-dir "$PWD/capture-output" -e REVIEW_USER="$REVIEW_USER" -e REVIEW_PASS="$REVIEW_PASS" -e SHOTDIR=. /tmp/bd-current-ios.yaml
@@ -106,6 +107,7 @@ jobs:
           path: |
             screenshots/*.png
             capture-debug/**/*
+            capture-output/**/*.png
             native-source/mobile/android/app/build/outputs/apk/release/app-release.apk
             /tmp/bd-review-derived/Build/Products/Release-iphonesimulator/BEDIFFERENT.app
           retention-days: 14

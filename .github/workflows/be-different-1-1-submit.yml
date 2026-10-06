@@ -34,7 +34,7 @@ jobs:
           print("ASSETS="+json.dumps(list(r.app.assets.values("id","platform","kind","locale","device_type","width","height","file"))))
           for failed in Job.objects.filter(release=r,type="submit_apple",status="failed").order_by("-id")[:1]:
               print("APPLE_ERROR="+json.dumps((failed.logs or "")[-18000:]))
-          for b in r.builds.all():
+          for b in []:
               submitted=Submission.objects.filter(release=r,platform=b.platform,state__in=["in_review","approved","live"]).exists()
               if submitted: continue
               kind=("submit_google" if b.platform=="android" else ("submit_apple" if b.external_build_id else "upload_apple"))
@@ -57,4 +57,18 @@ jobs:
           try:
               print("GOOGLE_STORE="+json.dumps(g._edit_request(e,"GET",f"/applications/{g._q(r.app.package_name)}/edits/{e.edit_id}/tracks")))
           finally: g._safe_delete_edit(e)
+          import requests
+          from apps.integrations.apple_store import BASE_URL
+          original=c.request
+          def detailed(method,path,**kwargs):
+              headers=kwargs.pop("headers",{})
+              headers.update({"Authorization":"Bearer "+c.token(),"Content-Type":"application/json"})
+              response=requests.request(method,BASE_URL+path,headers=headers,timeout=90,**kwargs)
+              if not response.ok:
+                  print("APPLE_BLOCKERS="+json.dumps(response.json()))
+                  raise RuntimeError("Apple eligibility failed: "+str(response.status_code))
+              return {} if response.status_code==204 else response.json()
+          c.request=detailed
+          try: c.submit_version(a["id"],versions["data"][0]["id"])
+          except Exception as exc: print("ELIGIBILITY="+str(exc))
           PY

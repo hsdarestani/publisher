@@ -57,6 +57,25 @@ jobs:
           try:
               print("GOOGLE_STORE="+json.dumps(g._edit_request(e,"GET",f"/applications/{g._q(r.app.package_name)}/edits/{e.edit_id}/tracks")))
           finally: g._safe_delete_edit(e)
+          from apps.integrations.apple_compliance import apply_app_store_compliance,find_editable_app_info,ensure_build_encryption_declaration
+          from apps.publisher.store_compliance import _BASE_BUSINESS_AGE_RATING
+          profile=dict(_BASE_BUSINESS_AGE_RATING)
+          profile.update({"healthOrWellnessTopics":True,"messagingAndChat":True,"userGeneratedContent":True})
+          print("COMPLIANCE="+json.dumps(apply_app_store_compliance(c,a["id"],content_rights="USES_THIRD_PARTY_CONTENT",age_rating=profile)))
+          info=find_editable_app_info(c,a["id"])
+          c.request("PATCH",f"/appInfos/{info['id']}",data=json.dumps({"data":{"type":"appInfos","id":info["id"],"relationships":{"primaryCategory":{"data":{"type":"appCategories","id":"HEALTH_AND_FITNESS"}}}}}))
+          ensure_build_encryption_declaration(c,r.builds.get(platform="ios").external_build_id,False)
+          import apps.signing.management.commands.set_a_bau_apple_free_price as pricing
+          pricing.APP_SLUG="be-different"
+          pricing.Command().handle()
+          r.android_track="production"
+          r.save(update_fields=["android_track","updated_at"])
+          from apps.publisher.tasks import _publish_existing_google_version
+          try:
+              result=_publish_existing_google_version(g,r.app,r)
+              Submission.objects.filter(release=r,platform="android").update(raw=result,state="ready_for_review" if result.get("edit",{}).get("_changes_not_sent_for_review") else "in_review")
+              print("GOOGLE_PRODUCTION="+json.dumps(result))
+          except Exception as exc: print("GOOGLE_PRODUCTION_ERROR="+str(exc))
           import requests
           from apps.integrations.apple_store import BASE_URL
           original=c.request

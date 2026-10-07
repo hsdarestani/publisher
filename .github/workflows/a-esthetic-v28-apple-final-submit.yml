@@ -1,0 +1,162 @@
+name: Finalize A+ Esthetic 1.0.28 Apple review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-v28-apple-final-submit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-esthetic-v28-apple-final-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    steps:
+      - name: Let Publisher deployment settle
+        run: sleep 150
+
+      - name: Attach Build 33 and submit 1.0.28 to Apple review
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+          PY_CODE=$(cat <<'PY'
+          import json, traceback
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Job, MobileApp, Release, Submission
+          from apps.publisher.tasks import handle_submit_apple
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,version_name='1.0.28',build_number=33).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('release_missing')
+          ios=release.builds.get(platform='ios')
+          if ios.status!='succeeded' or not ios.external_build_id:
+              raise SystemExit('ios_build33_not_ready')
+
+          client=AppleStoreClient(app.apple_account)
+          app_id=client.find_app(app.bundle_id)['id']
+
+          def versions():
+              return client.list_versions(app_id)
+          def vstate(v):
+              attrs=v.get('attributes',{})
+              return attrs.get('appStoreState') or attrs.get('appVersionState') or ''
+          def reviews():
+              return client.request('GET',f'/apps/{app_id}/reviewSubmissions?limit=200').get('data',[])
+          def rstate(r):
+              return r.get('attributes',{}).get('state') or ''
+          def item_version_id(item):
+              return str((item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id') or '')
+          def live_item(r,version_id):
+              for item in client.list_review_submission_items(r['id']):
+                  if item_version_id(item)==str(version_id) and (item.get('attributes',{}).get('state') or '')!='REMOVED':
+                      return item
+              return None
+
+          current=versions()
+          target=next((v for v in current if v.get('attributes',{}).get('versionString')=='1.0.28'),None)
+          if not target:
+              raise SystemExit('apple_1_0_28_version_missing_after_recovery')
+          print('APPLE_TARGET_BEFORE',target['id'],vstate(target),ios.external_build_id)
+
+          for r in reviews():
+              if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target['id']):
+                  Submission.objects.update_or_create(
+                      app=app,release=release,platform='ios',
+                      defaults={'state':'in_review','external_id':r['id'],'submitted_at':timezone.now(),'last_error':''},
+                  )
+                  release.status='in_review'; release.save(update_fields=['status','updated_at'])
+                  print('APPLE_ALREADY_SUBMITTED',r['id'],rstate(r))
+                  print('FINAL apple=in_review version=1.0.28 build=33')
+                  raise SystemExit(0)
+
+          # Ensure the processed Build 33 is attached before the full submit handler.
+          try:
+              client.set_build_uses_non_exempt_encryption(ios.external_build_id,False)
+              print('APPLE_ENCRYPTION_READY')
+          except Exception as exc:
+              msg=str(exc)
+              if 'already set' not in msg.lower() and 'cannot update when the value is already set' not in msg.lower():
+                  raise
+              print('APPLE_ENCRYPTION_ALREADY_READY')
+          client.attach_build(target['id'],ios.external_build_id)
+          print('APPLE_BUILD33_ATTACHED',target['id'],ios.external_build_id)
+
+          # Run the normal Publisher submit handler synchronously so no worker race remains.
+          job=Job.objects.create(
+              type='submit_apple',
+              app=app,
+              release=release,
+              build=ios,
+              status='running',
+              progress=5,
+              started_at=timezone.now(),
+          )
+          try:
+              result=handle_submit_apple(job) or {}
+              job.status='succeeded'
+              job.result=result
+              job.progress=100
+              job.finished_at=timezone.now()
+              job.error=''
+              job.logs=(job.logs+'\nCompleted successfully.').strip()
+              job.save(update_fields=['status','result','progress','finished_at','error','logs','updated_at'])
+              print('APPLE_SUBMIT_JOB_SUCCEEDED',job.pk,json.dumps(result,default=str)[:5000])
+          except Exception as exc:
+              job.status='failed'
+              job.error=str(exc)
+              job.finished_at=timezone.now()
+              job.logs=(job.logs+'\n'+traceback.format_exc())[-200000:]
+              job.save(update_fields=['status','error','finished_at','logs','updated_at'])
+              print('APPLE_SUBMIT_JOB_FAILED',job.pk,str(exc)[:4000])
+              raise
+
+          refreshed=next((v for v in versions() if v['id']==target['id']),None)
+          print('APPLE_TARGET_AFTER',target['id'],vstate(refreshed) if refreshed else 'MISSING')
+
+          active=None
+          for r in reviews():
+              if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target['id']):
+                  active=r
+                  break
+          if not active:
+              raise SystemExit('apple_review_not_active_after_submit')
+
+          Submission.objects.update_or_create(
+              app=app,release=release,platform='ios',
+              defaults={'state':'in_review','external_id':active['id'],'submitted_at':timezone.now(),'last_error':''},
+          )
+          release.status='in_review'; release.save(update_fields=['status','updated_at'])
+          print('APPLE_FINAL',active['id'],rstate(active),'1.0.28',33)
+          print('FINAL apple=in_review version=1.0.28 build=33')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+
+          # Publisher may restart once because this workflow file itself is deployed.
+          # Retry the idempotent finalizer if an SSH/docker session is interrupted.
+          success=0
+          for attempt in 1 2 3; do
+            echo "APPLE_FINALIZE_ATTEMPT=$attempt"
+            if sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"; then
+              success=1
+              break
+            fi
+            sleep 30
+          done
+          test "$success" = "1"

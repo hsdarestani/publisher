@@ -1,0 +1,273 @@
+name: Recover A+ Esthetic 1.0.28 Build 33 stores
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-v28-build33-store-recovery.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-esthetic-v28-build33-store-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    steps:
+      - name: Promote Google Build 33 and replace Apple review with 1.0.28
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import json, time
+          from django.utils import timezone
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job, _publish_existing_google_version
+
+          TARGET_VERSION='1.0.28'
+          TARGET_BUILD=33
+          SAFE_NOTES='Verbessertes App Design, optimierte Anmeldung sowie mehr Stabilität bei Terminorganisation, Kundenkonto und App Nutzung.'
+          EDITABLE={'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'}
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,version_name=TARGET_VERSION,build_number=TARGET_BUILD).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('target_release_missing')
+
+          android=release.builds.get(platform='android')
+          ios=release.builds.get(platform='ios')
+          if android.status!='succeeded' or not android.artifact:
+              raise SystemExit('android_build_not_ready')
+          if ios.status!='succeeded' or not ios.external_build_id:
+              raise SystemExit('ios_build_not_ready')
+
+          # Keep release metadata aligned with the branded production app.
+          changed=[]
+          if release.android_track != 'production':
+              release.android_track='production'; changed.append('android_track')
+          if float(release.android_rollout) != 1.0:
+              release.android_rollout=1; changed.append('android_rollout')
+          if release.release_notes != SAFE_NOTES:
+              release.release_notes=SAFE_NOTES; changed.append('release_notes')
+          if changed:
+              release.save(update_fields=changed+['updated_at'])
+          for loc in app.localizations.all():
+              if loc.release_notes != SAFE_NOTES:
+                  loc.release_notes=SAFE_NOTES
+                  loc.save(update_fields=['release_notes','updated_at'])
+          app_updates=[]
+          if app.privacy_policy_url != 'https://app.a-esthetic.de/datenschutz/':
+              app.privacy_policy_url='https://app.a-esthetic.de/datenschutz/'; app_updates.append('privacy_policy_url')
+          if app.support_url != 'https://app.a-esthetic.de/support/':
+              app.support_url='https://app.a-esthetic.de/support/'; app_updates.append('support_url')
+          if app_updates:
+              app.save(update_fields=app_updates+['updated_at'])
+
+          print('TARGET',release.pk,release.version_name,release.build_number,release.source_commit)
+          print('BUILDS',android.pk,android.status,ios.pk,ios.status,ios.external_build_id)
+
+          # ---- GOOGLE PLAY: promote already-uploaded versionCode 33 to production ----
+          gc=GooglePlayClient(app.google_account)
+
+          def google_track(track):
+              edit=gc._open_edit(app.package_name)
+              try:
+                  return gc._edit_request(
+                      edit,'GET',
+                      f'/applications/{gc._q(app.package_name)}/edits/{edit.edit_id}/tracks/{gc._q(track)}'
+                  )
+              finally:
+                  gc._safe_delete_edit(edit)
+
+          def track_has_build(data, build):
+              for r in (data or {}).get('releases',[]) or []:
+                  if str(build) in [str(x) for x in (r.get('versionCodes') or [])]:
+                      return True
+              return False
+
+          prod=google_track('production')
+          print('GOOGLE_PRODUCTION_BEFORE',json.dumps(prod,ensure_ascii=False)[:5000])
+          google_commit=None
+          if track_has_build(prod,TARGET_BUILD):
+              print('GOOGLE_ALREADY_PRODUCTION',TARGET_BUILD)
+          else:
+              last_exc=None
+              for attempt in range(1,7):
+                  try:
+                      google_commit=_publish_existing_google_version(gc,app,release)
+                      print('GOOGLE_PROMOTE_OK',attempt,json.dumps(google_commit,default=str)[:5000])
+                      break
+                  except Exception as exc:
+                      last_exc=exc
+                      msg=str(exc)
+                      print('GOOGLE_PROMOTE_RETRY',attempt,msg[:1800])
+                      if attempt < 6 and ('503' in msg or 'UNAVAILABLE' in msg.upper() or 'service is currently unavailable' in msg.lower()):
+                          time.sleep(20)
+                          continue
+                      raise
+              if google_commit is None:
+                  raise last_exc or RuntimeError('google_promote_failed')
+
+          prod_after=google_track('production')
+          print('GOOGLE_PRODUCTION_AFTER',json.dumps(prod_after,ensure_ascii=False)[:5000])
+          if not track_has_build(prod_after,TARGET_BUILD):
+              raise SystemExit('google_build33_not_on_production_track')
+
+          manual=bool(isinstance((google_commit or {}).get('edit'),dict) and (google_commit or {}).get('edit',{}).get('_changes_not_sent_for_review'))
+          Submission.objects.update_or_create(
+              app=app,release=release,platform='android',
+              defaults={
+                  'state':'ready_for_review' if manual else 'in_review',
+                  'submitted_at':timezone.now(),
+                  'last_error':'',
+                  'raw':google_commit or {'verified_production':prod_after},
+              },
+          )
+          print('GOOGLE_FINAL','ready_for_review' if manual else 'in_review')
+
+          # ---- APPLE: replace superseded 1.0.27 review with 1.0.28 Build 33 ----
+          ac=AppleStoreClient(app.apple_account)
+          app_id=ac.find_app(app.bundle_id)['id']
+
+          def versions():
+              return ac.list_versions(app_id)
+          def vstate(v):
+              a=v.get('attributes',{})
+              return a.get('appStoreState') or a.get('appVersionState') or ''
+          def reviews():
+              return ac.request('GET',f'/apps/{app_id}/reviewSubmissions?limit=200').get('data',[])
+          def rstate(r):
+              return r.get('attributes',{}).get('state') or ''
+          def items(r):
+              return ac.list_review_submission_items(r['id'])
+          def item_version_id(i):
+              return str((i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id') or '')
+          def live_item(r,version_id):
+              return next((i for i in items(r) if item_version_id(i)==str(version_id) and (i.get('attributes',{}).get('state') or '')!='REMOVED'),None)
+
+          current=versions()
+          for v in current:
+              print('APPLE_VERSION_BEFORE',v['id'],v.get('attributes',{}).get('versionString'),vstate(v))
+          target=next((v for v in current if v.get('attributes',{}).get('versionString')==TARGET_VERSION),None)
+
+          if target:
+              for r in reviews():
+                  if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target['id']):
+                      Submission.objects.update_or_create(
+                          app=app,release=release,platform='ios',
+                          defaults={'state':'in_review','external_id':r['id'],'submitted_at':timezone.now(),'last_error':''},
+                      )
+                      release.status='in_review'; release.save(update_fields=['status','updated_at'])
+                      print('APPLE_ALREADY_ACTIVE',r['id'],rstate(r))
+                      print('RECOVERY_DONE google=production apple=in_review')
+                      raise SystemExit(0)
+
+          # Cancel active review(s) for superseded versions so Apple frees the single editable version slot.
+          reusable_version_id=None
+          for v in current:
+              if target and v['id']==target['id']:
+                  continue
+              if vstate(v) not in {'WAITING_FOR_REVIEW','IN_REVIEW'}:
+                  continue
+              for r in reviews():
+                  if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,v['id']):
+                      print('APPLE_CANCEL_SUPERSEDED',v.get('attributes',{}).get('versionString'),v['id'],r['id'],rstate(r))
+                      ac.cancel_review_submission(r['id'])
+                      reusable_version_id=reusable_version_id or v['id']
+
+          if reusable_version_id:
+              deadline=time.time()+300
+              last=''
+              while time.time()<deadline:
+                  cur=next((v for v in versions() if v['id']==reusable_version_id),None)
+                  if not cur:
+                      raise SystemExit('apple_reusable_version_disappeared')
+                  last=vstate(cur)
+                  print('APPLE_WAIT_EDITABLE',last)
+                  if last in EDITABLE:
+                      break
+                  time.sleep(5)
+              if last not in EDITABLE:
+                  raise SystemExit('apple_superseded_version_not_editable:'+last)
+
+          current=versions()
+          target=next((v for v in current if v.get('attributes',{}).get('versionString')==TARGET_VERSION),None)
+          if target is None:
+              if reusable_version_id:
+                  target=ac.update_version_string(reusable_version_id,TARGET_VERSION)
+                  print('APPLE_VERSION_RENAMED',target['id'],TARGET_VERSION)
+              else:
+                  editable=next((v for v in current if vstate(v) in EDITABLE),None)
+                  if editable:
+                      target=editable if editable.get('attributes',{}).get('versionString')==TARGET_VERSION else ac.update_version_string(editable['id'],TARGET_VERSION)
+                      print('APPLE_EDITABLE_REUSED',target['id'],TARGET_VERSION)
+                  else:
+                      target=ac.create_version(app_id,TARGET_VERSION)
+                      print('APPLE_VERSION_CREATED',target['id'],TARGET_VERSION)
+
+          target_id=target['id']
+          try:
+              ac.set_build_uses_non_exempt_encryption(ios.external_build_id,False)
+              print('APPLE_ENCRYPTION_SET')
+          except Exception as exc:
+              msg=str(exc)
+              if 'already set' not in msg.lower() and 'cannot update when the value is already set' not in msg.lower():
+                  raise
+              print('APPLE_ENCRYPTION_ALREADY_SET')
+          ac.attach_build(target_id,ios.external_build_id)
+          print('APPLE_BUILD33_ATTACHED',target_id,ios.external_build_id)
+
+          # Remove stale failed submit jobs from consideration; queue one fresh server-side submission.
+          fresh=release.jobs.filter(type='submit_apple',status__in=['queued','running']).order_by('-pk').first()
+          if not fresh:
+              fresh=enqueue_job('submit_apple',app=app,release=release,build=ios)
+          print('APPLE_SUBMIT_JOB',fresh.pk,fresh.status)
+
+          deadline=time.time()+900
+          while time.time()<deadline:
+              fresh.refresh_from_db()
+              print('APPLE_SUBMIT_STATE',fresh.pk,fresh.status,fresh.progress)
+              if fresh.status in {'succeeded','failed'}:
+                  break
+              time.sleep(10)
+          if fresh.status!='succeeded':
+              raise SystemExit('apple_submit_failed:'+(fresh.error or 'timeout')[:3000])
+
+          active=None
+          for r in reviews():
+              if rstate(r) in {'WAITING_FOR_REVIEW','IN_REVIEW'} and live_item(r,target_id):
+                  active=r
+                  break
+          if not active:
+              raise SystemExit('apple_1_0_28_not_active_after_submit')
+
+          Submission.objects.update_or_create(
+              app=app,release=release,platform='ios',
+              defaults={
+                  'state':'in_review',
+                  'external_id':active['id'],
+                  'submitted_at':timezone.now(),
+                  'last_error':'',
+              },
+          )
+          release.status='in_review'; release.save(update_fields=['status','updated_at'])
+          print('APPLE_FINAL',active['id'],rstate(active),TARGET_VERSION,TARGET_BUILD)
+          print('RECOVERY_DONE google=production apple=in_review')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

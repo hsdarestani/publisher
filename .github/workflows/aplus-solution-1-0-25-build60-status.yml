@@ -26,6 +26,7 @@ jobs:
           PORT="${SSH_PORT:-22}"
           sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.integrations.apple_store import AppleStoreClient
           from apps.publisher.models import BuildAgent, Job, MobileApp, Release, Submission
           app=MobileApp.objects.get(slug='a-plus-solution')
           r=Release.objects.get(app=app,version_name='1.0.25',build_number=60)
@@ -37,6 +38,14 @@ jobs:
           s=Submission.objects.filter(release=r,platform='ios').order_by('-updated_at').first()
           print(f'SUBMISSION|{s.state if s else ""}|{s.external_id if s else ""}')
           print(f'RELEASE|{r.status}|{r.source_commit}')
+          apple=AppleStoreClient(app.apple_account)
+          aa=apple.find_app(app.bundle_id)
+          matches=[]
+          for item in apple.list_builds(aa['id'], limit=100):
+              attrs=item.get('attributes') or {}
+              if str(attrs.get('version') or '') == '60':
+                  matches.append((item.get('id',''), attrs.get('processingState',''), attrs.get('uploadedDate','')))
+          print('APPLE_BUILDS|' + ';'.join('|'.join(map(str,x)) for x in matches))
           for agent in BuildAgent.objects.filter(platform__in=['macos','macos_aplus']):
               cj=agent.current_job
               print(f'AGENT|{agent.platform}|{agent.id}|current={cj.id if cj else ""}|status={cj.status if cj else ""}|type={cj.type if cj else ""}|app={cj.app.slug if cj and cj.app else ""}')
@@ -47,3 +56,5 @@ jobs:
 # probe 3
 
 # probe 4
+
+# apple processing probe

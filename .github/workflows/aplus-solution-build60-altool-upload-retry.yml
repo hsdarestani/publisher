@@ -1,0 +1,43 @@
+name: A+ Solution Build 60 altool Upload Retry
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build60-altool-upload-retry.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Requeue exact Build 60 Apple upload on generic Mac
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+          CODE="from apps.publisher.models import MobileApp,Release,Job; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name='1.0.25',build_number=60); b=r.builds.get(platform='ios'); assert r.source_commit=='686a2d34b4232ae3886fcacba3d9535f8f6a7d9a'; assert b.status=='succeeded' and bool(b.artifact); j=Job.objects.filter(release=r,build=b,type='upload_apple').order_by('-created_at').first(); assert j is not None; print('external_build_id='+str(b.external_build_id or '')); j.status='queued'; j.error=''; j.logs=''; j.progress=0; j.started_at=None; j.finished_at=None; j.available_to_agents=True; j.required_platform='macos'; j.save(update_fields=['status','error','logs','progress','started_at','finished_at','available_to_agents','required_platform','updated_at']); print('apple_upload_requeued=yes'); print('job_id='+str(j.id)); print('platform='+j.required_platform)"
+          ENCODED=$(printf '%s' "$CODE" | base64 | tr -d '\n')
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+      - name: Wake altool Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

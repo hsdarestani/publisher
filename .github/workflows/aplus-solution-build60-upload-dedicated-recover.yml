@@ -1,0 +1,91 @@
+name: A+ Solution Build 60 Dedicated Apple Upload Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build60-upload-dedicated-recover.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Move build 60 upload to dedicated A+ Mac queue
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import BuildAgent, Job, MobileApp, Release
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.get(app=app, version_name='1.0.25', build_number=60)
+          ios = r.builds.get(platform='ios')
+          assert ios.status == 'succeeded' and ios.artifact
+
+          job = Job.objects.filter(release=r, build=ios, type='upload_apple').order_by('-created_at').first()
+          assert job, 'Missing upload_apple job for build 60'
+          if ios.external_build_id:
+              print('UPLOAD_ALREADY_DONE|' + ios.external_build_id)
+          else:
+              assert job.status in {'queued','running'}, (job.id, job.status, job.error)
+              if job.status == 'queued':
+                  job.available_to_agents = True
+                  job.required_platform = 'macos_aplus'
+                  job.save(update_fields=['available_to_agents','required_platform','updated_at'])
+                  print(f'RETAGGED|{job.id}|macos_aplus')
+              else:
+                  print(f'ALREADY_RUNNING|{job.id}|{job.required_platform}')
+
+          agent = BuildAgent.objects.filter(platform='macos_aplus').first()
+          if agent and agent.current_job and agent.current_job.status not in {'queued','running'}:
+              agent.current_job = None
+              agent.save(update_fields=['current_job','updated_at'])
+              print('CLEARED_STALE_DEDICATED_AGENT')
+          PY
+
+      - name: Wake dedicated A+ Solution Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'run-aplus-ios-rebuild-agent.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for dedicated upload completion
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 120); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Job,MobileApp,Release; a=MobileApp.objects.get(slug='a-plus-solution'); r=Release.objects.get(app=a,version_name='1.0.25',build_number=60); b=r.builds.get(platform='ios'); j=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first(); print('|'.join([j.status if j else 'missing',str(j.error or '').replace('|','/')[:400] if j else '',b.external_build_id or '']))\"" | tail -n 1 | tr -d '\r')"
+            echo "Dedicated Apple upload: $STATE"
+            IFS='|' read -r STATUS ERR BUILD_ID <<< "$STATE"
+            if [ "$STATUS" = failed ]; then echo "$ERR" >&2; exit 1; fi
+            if [ "$STATUS" = succeeded ] && [ -n "$BUILD_ID" ]; then exit 0; fi
+            sleep 15
+          done
+          echo "Timed out waiting for dedicated A+ Apple upload." >&2
+          exit 1

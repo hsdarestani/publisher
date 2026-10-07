@@ -1,0 +1,236 @@
+name: A+ Solution PDF Fullscreen iOS Build 2026-10-08
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-pdf-fullscreen-ios-build-20261008.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APLUS_COMMIT: '686a2d34b4232ae3886fcacba3d9535f8f6a7d9a'
+
+jobs:
+  build-ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Verify exact A+ source is deployed
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | jq -r '.commit.sha')"
+          test "$HEAD" = "$APLUS_COMMIT"
+          RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
+          printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null
+          curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
+          echo "Verified deployed source: $APLUS_COMMIT"
+
+      - name: Queue signed iOS build in Publisher
+        id: prepare
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os, re
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          assert app.apple_account and app.apple_account.configured
+          assert app.repository_url
+
+          cfg = dict(app.build_config or {})
+          cfg['ios_command'] = 'bash frontend/scripts/build-publisher-ios-opaque.sh'
+          cfg['ios_artifact'] = 'frontend/ios/build/export/*.ipa'
+          env = dict(cfg.get('env') or {})
+          env['VITE_API_URL'] = 'https://app.aplus-solution.de/api'
+          cfg['env'] = env
+          app.build_config = cfg
+          app.save(update_fields=['build_config', 'updated_at'])
+
+          apple = AppleStoreClient(app.apple_account)
+          apple_app = apple.find_app(app.bundle_id)
+          versions = apple.list_versions(apple_app['id'], limit=50)
+
+          def semver(value):
+              nums = [int(x) for x in re.findall(r'\d+', str(value or ''))[:3]]
+              while len(nums) < 3:
+                  nums.append(0)
+              return tuple(nums)
+
+          def bump(value):
+              a, b, c = semver(value)
+              return f'{a}.{b}.{c + 1}'
+
+          current = max(
+              versions,
+              key=lambda x: semver((x.get('attributes') or {}).get('versionString')),
+              default=None,
+          )
+          attrs = (current or {}).get('attributes') or {}
+          current_version = attrs.get('versionString') or '1.0.24'
+          current_state = attrs.get('appStoreState') or attrs.get('appVersionState') or 'UNKNOWN'
+          replaceable = {
+              'PREPARE_FOR_SUBMISSION', 'READY_FOR_REVIEW', 'DEVELOPER_REJECTED',
+              'METADATA_REJECTED', 'REJECTED', 'WAITING_FOR_REVIEW',
+              'IN_REVIEW', 'INVALID_BINARY'
+          }
+          target_version = current_version if current_state in replaceable else bump(current_version)
+
+          db_max = max(
+              Release.objects.filter(app=app).values_list('build_number', flat=True),
+              default=0,
+          )
+          apple_max = 0
+          for item in apple.list_builds(apple_app['id'], limit=100):
+              try:
+                  apple_max = max(apple_max, int((item.get('attributes') or {}).get('version')))
+              except (TypeError, ValueError):
+                  pass
+
+          build_number = max(db_max, apple_max) + 1
+          release, _ = Release.objects.get_or_create(
+              app=app,
+              version_name=target_version,
+              build_number=build_number,
+          )
+          release.status = 'building'
+          release.source_branch = 'main'
+          release.source_commit = os.environ['APLUS_COMMIT']
+          release.ios_release_type = 'manual'
+          release.auto_submit = False
+          release.release_notes = (
+              'iOS PDF Vorschau vollständig im Vollbild. '
+              'App Header, Kalender, Filter und Tabbar liegen nicht mehr über dem PDF.'
+          )
+          release.save()
+
+          build, _ = Build.objects.get_or_create(release=release, platform='ios')
+          Job.objects.filter(
+              build=build,
+              type='build_ios',
+              status__in=['queued', 'running'],
+          ).update(status='cancelled')
+          if build.artifact:
+              build.artifact.delete(save=False)
+          build.artifact = ''
+          build.artifact_size = 0
+          build.artifact_checksum = ''
+          build.external_build_id = ''
+          build.metadata = {}
+          build.logs = ''
+          build.finished_at = None
+          build.status = 'queued'
+          build.save()
+
+          job = enqueue_job(
+              'build_ios',
+              app=app,
+              release=release,
+              build=build,
+              payload={'source': 'pdf-fullscreen-ios-build-20261008'},
+              agent=True,
+              platform='macos',
+          )
+
+          meta = {
+              'release_id': str(release.id),
+              'version': target_version,
+              'build': build_number,
+              'apple_state': current_state,
+              'job_id': str(job.id),
+          }
+          print('RELEASE_META_JSON=' + json.dumps(meta, separators=(',', ':')))
+          PY
+          )"
+
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^RELEASE_META_JSON=//p' | tail -n 1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | jq -r '.release_id')" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | jq -r '.build')" >> "$GITHUB_OUTPUT"
+          echo "job_id=$(printf '%s' "$META" | jq -r '.job_id')" >> "$GITHUB_OUTPUT"
+          echo "Queued iOS version $(printf '%s' "$META" | jq -r '.version') build $(printf '%s' "$META" | jq -r '.build')"
+
+      - name: Wake Publisher Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Wait for signed IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 300); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os, re
+          from apps.publisher.models import Job, Release
+          r = Release.objects.get(id=os.environ['RELEASE_ID'])
+          b = r.builds.get(platform='ios')
+          failed = Job.objects.filter(build=b, type='build_ios', status='failed').order_by('-created_at').first()
+          err = re.sub(r'\s+', ' ', str(failed.error or '')).replace('|', '/')[:500] if failed else ''
+          print('|'.join([b.status, 'artifact' if b.artifact else '', err]))
+          PY
+            )"
+            echo "iOS build state: $STATE"
+            IFS='|' read -r STATUS ARTIFACT ERROR <<< "$STATE"
+            if [ "$STATUS" = failed ]; then
+              echo "$ERROR" >&2
+              exit 1
+            fi
+            if [ "$STATUS" = succeeded ] && [ "$ARTIFACT" = artifact ]; then
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for iOS IPA." >&2
+          exit 1
+
+      - name: Confirm iOS build
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Release; r=Release.objects.get(id=os.environ['RELEASE_ID']); b=r.builds.get(platform='ios'); assert b.status=='succeeded' and b.artifact; print(f'IOS_BUILD_OK version={r.version_name} build={r.build_number} source={r.source_commit}')\""

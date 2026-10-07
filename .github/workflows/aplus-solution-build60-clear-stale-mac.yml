@@ -1,0 +1,34 @@
+name: A+ Solution Build 60 Clear Stale Mac
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build60-clear-stale-mac.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  clear:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel confirmed stale generic Mac run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method POST repos/${{ github.repository }}/actions/runs/37702265499/cancel >/dev/null || true
+
+      - name: Wake fresh altool Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });

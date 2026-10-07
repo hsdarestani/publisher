@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 90
     environment: production
     env:
-      SOURCE_COMMIT: 70d993b2cdd75184fc95afe4164e1eedef7d6844
+      SOURCE_COMMIT: 904d3dad7395ee31118db17ad8194921a011bb18
     steps:
       - name: Prepare Publisher release and queue native builds
         env:
@@ -80,7 +80,7 @@ jobs:
                   if m: patches.append(int(m.group(1)))
               version=f'1.0.{max(patches or [0])+1}'
               build=(Release.objects.filter(app=app).aggregate(v=Max('build_number'))['v'] or 0)+1
-              notes='Das App-Symbol wurde mit dem neuen A+ Esthetic Design aktualisiert.'
+              notes='Kunden-App und Patientenakte optimiert: verbesserte Anmeldung, Buchungs-Autofill, neues Branding, Datei-Vorschau und stabilere Dokumentfunktionen.'
               release=Release.objects.create(
                   app=app,version_name=version,build_number=build,status='building',
                   source_branch='main',source_commit=source_commit,android_track='production',

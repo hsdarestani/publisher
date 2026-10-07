@@ -33,10 +33,12 @@ jobs:
           print(f'BUILD|{b.status}|artifact={bool(b.artifact)}|external={b.external_build_id or ""}')
           for kind in ['upload_apple','submit_apple']:
               j=Job.objects.filter(release=r,type=kind).order_by('-created_at').first()
-              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|progress={j.progress if j else ""}|error={(j.error or "")[:500] if j else ""}')
+              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|progress={j.progress if j else ""}|platform={j.required_platform if j else ""}|agent={j.available_to_agents if j else ""}|app={j.app.slug if j and j.app else ""}|error={(j.error or "")[:500] if j else ""}')
           s=Submission.objects.filter(release=r,platform='ios').order_by('-updated_at').first()
           print(f'SUBMISSION|{s.state if s else ""}|{s.external_id if s else ""}')
           print(f'RELEASE|{r.status}|{r.source_commit}')
           PY
 
 # probe 2
+
+# probe 3

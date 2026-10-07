@@ -1,0 +1,278 @@
+name: A+ Solution Build 60 Direct Apple Submit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build60-direct-apple-submit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  direct-submit:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: production
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      VERSION_NAME: '1.0.25'
+      BUILD_NUMBER: '60'
+      SOURCE_COMMIT: '686a2d34b4232ae3886fcacba3d9535f8f6a7d9a'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install direct submit dependencies
+        run: pip install 'paramiko>=3.5,<4' 'requests>=2.32,<3' 'PyJWT[crypto]>=2.10,<3'
+
+      - name: Upload exact IPA and submit exact build to App Review
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import shlex
+          import subprocess
+          import sys
+          import time
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          import jwt
+          import paramiko
+          import requests
+
+          HOST = os.environ['HOST']
+          PASSWORD = os.environ['PASS']
+          PORT = int(os.environ.get('SSH_PORT') or '22')
+          VERSION = os.environ['VERSION_NAME']
+          BUILD_NUMBER = int(os.environ['BUILD_NUMBER'])
+          SOURCE_COMMIT = os.environ['SOURCE_COMMIT']
+          BUNDLE_ID = 'de.aplussolution.workforce'
+
+          ssh = paramiko.SSHClient()
+          ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+          ssh.connect(HOST, port=PORT, username='root', password=PASSWORD, timeout=30)
+
+          def remote(command: str, binary: bool = False):
+              stdin, stdout, stderr = ssh.exec_command(command, timeout=3600)
+              out = stdout.read()
+              err = stderr.read().decode('utf-8', errors='replace')
+              code = stdout.channel.recv_exit_status()
+              if code != 0:
+                  raise RuntimeError(f'Remote command failed ({code}): {err[-3000:]}')
+              return out if binary else out.decode('utf-8', errors='replace')
+
+          meta_script = r"""
+          import base64, json
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.get(app=app, version_name='1.0.25', build_number=60)
+          b = r.builds.get(platform='ios')
+          assert r.source_commit == '686a2d34b4232ae3886fcacba3d9535f8f6a7d9a'
+          assert b.status == 'succeeded' and b.artifact
+          assert app.apple_account and app.apple_account.configured
+          assert app.review_username == 'store-review@aplus-solution.de'
+          assert app.get_review_password()
+          a = app.apple_account
+          payload = {
+              'issuer_id': a.apple_issuer_id,
+              'key_id': a.apple_key_id,
+              'team_id': a.apple_team_id,
+              'private_key': a.get_credentials().get('private_key',''),
+              'bundle_id': app.bundle_id,
+              'artifact_name': b.artifact.name,
+              'release_id': str(r.id),
+          }
+          assert payload['issuer_id'] and payload['key_id'] and payload['private_key']
+          print('META64=' + base64.b64encode(json.dumps(payload).encode()).decode())
+          """
+          command = "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell <<'PY'\n" + meta_script + "\nPY"
+          meta_out = remote(command)
+          import base64
+          marker = next((line for line in meta_out.splitlines() if line.startswith('META64=')), None)
+          if not marker:
+              raise RuntimeError('Could not read Publisher Apple metadata.')
+          meta = json.loads(base64.b64decode(marker.split('=',1)[1]).decode())
+
+          print(f"Verified Publisher release {VERSION} build {BUILD_NUMBER} from source {SOURCE_COMMIT}")
+
+          artifact_script = r"""
+          import os, sys
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings')
+          import django
+          django.setup()
+          from apps.publisher.models import MobileApp, Release
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.get(app=app, version_name='1.0.25', build_number=60)
+          b = r.builds.get(platform='ios')
+          with open(b.artifact.path, 'rb') as handle:
+              while True:
+                  chunk = handle.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  sys.stdout.buffer.write(chunk)
+          """
+          artifact_cmd = "cd /opt/aplus-publisher && docker compose exec -T web python - <<'PY'\n" + artifact_script + "\nPY"
+          ipa_bytes = remote(artifact_cmd, binary=True)
+          if len(ipa_bytes) < 100000:
+              raise RuntimeError(f'IPA payload is unexpectedly small: {len(ipa_bytes)} bytes')
+          ipa = Path('/tmp/APlusSolution-1.0.25-60.ipa')
+          ipa.write_bytes(ipa_bytes)
+          print(f"Fetched signed IPA: {len(ipa_bytes)} bytes")
+
+          issuer = meta['issuer_id']
+          key_id = meta['key_id']
+          private_key = meta['private_key']
+          bundle_id = meta.get('bundle_id') or BUNDLE_ID
+
+          def token():
+              now = datetime.now(timezone.utc)
+              return jwt.encode(
+                  {'iss': issuer, 'iat': int(now.timestamp()), 'exp': int((now + timedelta(minutes=19)).timestamp()), 'aud': 'appstoreconnect-v1'},
+                  private_key,
+                  algorithm='ES256',
+                  headers={'kid': key_id},
+              )
+
+          def apple_get(path, params=None):
+              response = requests.get(
+                  'https://api.appstoreconnect.apple.com' + path,
+                  params=params or {},
+                  headers={'Authorization': f'Bearer {token()}'},
+                  timeout=60,
+              )
+              response.raise_for_status()
+              return response.json()
+
+          apps = apple_get('/v1/apps', {'filter[bundleId]': bundle_id, 'limit': 1}).get('data', [])
+          if not apps:
+              raise RuntimeError(f'App Store app not found for {bundle_id}')
+          app_id = apps[0]['id']
+
+          def builds():
+              return apple_get('/v1/builds', {
+                  'filter[app]': app_id,
+                  'filter[version]': str(BUILD_NUMBER),
+                  'sort': '-uploadedDate',
+                  'limit': 10,
+              }).get('data', [])
+
+          existing = builds()
+          apple_build = None
+          if existing:
+              candidate = existing[0]
+              state = (candidate.get('attributes') or {}).get('processingState')
+              if state in {'FAILED','INVALID'}:
+                  raise RuntimeError(f'Existing Apple build {BUILD_NUMBER} is {state}; refusing to overwrite the build number.')
+              print(f"Apple already knows build {BUILD_NUMBER}; processing state: {state}")
+              if state == 'VALID':
+                  apple_build = candidate
+
+          if not existing:
+              key_dir = Path.home() / '.appstoreconnect' / 'private_keys'
+              key_dir.mkdir(parents=True, exist_ok=True)
+              key_path = key_dir / f'AuthKey_{key_id}.p8'
+              key_path.write_text(private_key)
+              key_path.chmod(0o600)
+              try:
+                  proc = subprocess.run(
+                      ['xcrun','iTMSTransporter','-m','upload','-assetFile',str(ipa),'-apiKey',key_id,'-apiIssuer',issuer],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      timeout=2400,
+                  )
+                  if proc.returncode != 0:
+                      tail = proc.stdout[-4000:].replace(key_id,'***').replace(issuer,'***')
+                      raise RuntimeError('iTMSTransporter upload failed:\n' + tail)
+                  print('IPA upload to App Store Connect completed.')
+              finally:
+                  key_path.unlink(missing_ok=True)
+
+          if apple_build is None:
+              deadline = time.time() + 1800
+              while time.time() < deadline:
+                  found = builds()
+                  if found:
+                      candidate = found[0]
+                      state = (candidate.get('attributes') or {}).get('processingState')
+                      print(f'Apple processing state: {state}')
+                      if state == 'VALID':
+                          apple_build = candidate
+                          break
+                      if state in {'FAILED','INVALID'}:
+                          raise RuntimeError(f'Apple processing failed: {state}')
+                  time.sleep(20)
+              if apple_build is None:
+                  raise RuntimeError('Timed out waiting for Apple to process build 60.')
+
+          apple_build_id = str(apple_build['id'])
+          print(f"Apple build 60 is VALID. Build ID: {apple_build_id}")
+
+          submit_script = f"""
+          import os
+          from django.utils import timezone
+          from apps.publisher.models import Job, MobileApp, Release, Submission
+          from apps.publisher.tasks import run_job
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.get(app=app, version_name='1.0.25', build_number=60)
+          b = r.builds.get(platform='ios')
+          assert b.status == 'succeeded' and b.artifact
+          b.external_build_id = {apple_build_id!r}
+          meta = dict(b.metadata or {{}})
+          meta.update({{'external_build_id': {apple_build_id!r}, 'processing_state': 'VALID', 'direct_submit': True}})
+          b.metadata = meta
+          b.save(update_fields=['external_build_id','metadata','updated_at'])
+
+          upload = Job.objects.filter(release=r, build=b, type='upload_apple').order_by('-created_at').first()
+          if upload:
+              upload.status = 'succeeded'
+              upload.progress = 100
+              upload.error = ''
+              upload.result = {{'external_build_id': {apple_build_id!r}, 'processing_state': 'VALID', 'direct_submit': True}}
+              upload.finished_at = timezone.now()
+              upload.save(update_fields=['status','progress','error','result','finished_at','updated_at'])
+
+          existing = Job.objects.filter(release=r, type='submit_apple', status='succeeded').order_by('-created_at').first()
+          if existing and Submission.objects.filter(release=r, platform='ios', state='in_review').exists():
+              job = existing
+          else:
+              Job.objects.filter(release=r, type='submit_apple', status__in=['queued','running']).update(
+                  status='cancelled', finished_at=timezone.now()
+              )
+              job = Job.objects.create(type='submit_apple', app=app, release=r, build=b)
+              run_job.run(job.pk)
+              job.refresh_from_db()
+
+          submission = Submission.objects.filter(release=r, platform='ios').order_by('-updated_at').first()
+          r.refresh_from_db()
+          print('FINAL|' + '|'.join([
+              job.status,
+              (job.error or '').replace('|','/')[:600],
+              submission.state if submission else '',
+              submission.external_id if submission else '',
+              r.status or '',
+          ]))
+          if job.status != 'succeeded' or not submission or submission.state != 'in_review':
+              raise SystemExit(2)
+          """
+          submit_cmd = "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell <<'PY'\n" + submit_script + "\nPY"
+          final_out = remote(submit_cmd)
+          final = next((line for line in final_out.splitlines() if line.startswith('FINAL|')), None)
+          if not final:
+              raise RuntimeError('Publisher did not return a final submission state.')
+          print(final)
+          parts = final.split('|')
+          if len(parts) < 6 or parts[1] != 'succeeded' or parts[3] != 'in_review':
+              raise RuntimeError('App Review submission did not reach in_review.')
+
+          ssh.close()
+          print('A+ Solution 1.0.25 build 60 submitted to App Review successfully.')
+          PY

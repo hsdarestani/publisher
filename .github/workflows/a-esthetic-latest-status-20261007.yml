@@ -1,0 +1,47 @@
+name: A+ Esthetic latest release status
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-latest-status-20261007.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SOURCE_COMMIT: 904d3dad7395ee31118db17ad8194921a011bb18
+    steps:
+      - name: Read Publisher release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,source_commit=os.environ['SOURCE_COMMIT']).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('RELEASE_MISSING')
+          print('RELEASE',release.pk,release.version_name,release.build_number,release.status,release.source_commit)
+          for build in release.builds.order_by('platform'):
+              print('BUILD',build.platform,build.status,build.external_build_id or '-',bool(build.artifact),build.commit_sha)
+          for job in release.jobs.order_by('pk'):
+              print('JOB',job.pk,job.type,job.status,job.progress,(job.error or '')[:500].replace('\n',' '))
+          for sub in Submission.objects.filter(release=release).order_by('platform'):
+              print('SUBMISSION',sub.platform,sub.state,getattr(sub,'external_id',None) or '-')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell"

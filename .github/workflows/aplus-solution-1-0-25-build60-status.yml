@@ -1,0 +1,40 @@
+name: A+ Solution 1.0.25 Build 60 Status
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-1-0-25-build60-status.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
+      - name: Read build 60 Publisher state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job, MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name='1.0.25',build_number=60)
+          b=r.builds.get(platform='ios')
+          print(f'BUILD|{b.status}|artifact={bool(b.artifact)}|external={b.external_build_id or ""}')
+          for kind in ['upload_apple','submit_apple']:
+              j=Job.objects.filter(release=r,type=kind).order_by('-created_at').first()
+              print(f'JOB|{kind}|{j.id if j else ""}|{j.status if j else "missing"}|progress={j.progress if j else ""}|error={(j.error or "")[:500] if j else ""}')
+          s=Submission.objects.filter(release=r,platform='ios').order_by('-updated_at').first()
+          print(f'SUBMISSION|{s.state if s else ""}|{s.external_id if s else ""}')
+          print(f'RELEASE|{r.status}|{r.source_commit}')
+          PY

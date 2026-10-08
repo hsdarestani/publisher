@@ -1,0 +1,254 @@
+name: A+ Solution Calendar and Native PDF Signed Build 2026-10-08
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-calendar-native-pdf-signed-build-20261008.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  APLUS_COMMIT: '58bbad570d547a087a8324132d9c55bda2e22ff3'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass jq >/dev/null
+
+      - name: Wait for exact A+ source commit to validate and deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | jq -r '.commit.sha')"
+          test "$HEAD" = "$APLUS_COMMIT"
+          VERIFIED=0
+          for i in $(seq 1 120); do
+            RUNS="$(curl -fsSL "https://api.github.com/repos/hsdarestani/aplussolution/actions/runs?head_sha=$APLUS_COMMIT&per_page=20")"
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "success")' >/dev/null; then
+              VERIFIED=1
+              break
+            fi
+            if printf '%s' "$RUNS" | jq -e '.workflow_runs[] | select(.name == "Validate and deploy A+ Solution" and .status == "completed" and .conclusion == "failure")' >/dev/null; then
+              echo "A+ validation/deploy failed for $APLUS_COMMIT" >&2
+              exit 1
+            fi
+            echo "Waiting for A+ validation/deploy ($i/120)..."
+            sleep 15
+          done
+          test "$VERIFIED" = "1"
+          curl -fsS --retry 12 --retry-delay 5 https://app.aplus-solution.de/health/ >/dev/null
+          echo "Source commit validated and production is healthy."
+
+      - name: Prepare Publisher release and queue Android + iOS
+        id: prepare
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
+
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
+          import json, os, re
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.models import Build, Job, MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          assert app.google_account and app.google_account.configured
+          assert app.apple_account and app.apple_account.configured
+          assert app.repository_url
+
+          cfg=dict(app.build_config or {})
+          cfg['android_command']='bash frontend/scripts/build-publisher-android.sh'
+          cfg['android_artifact']='frontend/android/app/build/outputs/bundle/release/*.aab'
+          cfg['ios_command']='bash frontend/scripts/build-publisher-ios-opaque.sh'
+          cfg['ios_artifact']='frontend/ios/build/export/*.ipa'
+          env=dict(cfg.get('env') or {})
+          env['VITE_API_URL']='https://app.aplus-solution.de/api'
+          cfg['env']=env
+          app.build_config=cfg
+          app.save(update_fields=['build_config','updated_at'])
+
+          apple=AppleStoreClient(app.apple_account)
+          apple_app=apple.find_app(app.bundle_id)
+          versions=apple.list_versions(apple_app['id'], limit=50)
+
+          def semver(value):
+              nums=[int(x) for x in re.findall(r'\d+', str(value or ''))[:3]]
+              while len(nums)<3: nums.append(0)
+              return tuple(nums)
+
+          def bump(value):
+              major,minor,patch=semver(value)
+              return f'{major}.{minor}.{patch+1}'
+
+          current=max(versions, key=lambda x: semver((x.get('attributes') or {}).get('versionString')), default=None)
+          attrs=(current or {}).get('attributes') or {}
+          current_version=attrs.get('versionString') or '1.0.22'
+          current_state=attrs.get('appStoreState') or attrs.get('appVersionState') or 'UNKNOWN'
+          replaceable={
+              'PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED',
+              'METADATA_REJECTED','REJECTED','WAITING_FOR_REVIEW','IN_REVIEW','INVALID_BINARY'
+          }
+          target_version=current_version if current_state in replaceable else bump(current_version)
+
+          db_max=max(Release.objects.filter(app=app).values_list('build_number',flat=True), default=0)
+
+          apple_max=0
+          for item in apple.list_builds(apple_app['id'], limit=50):
+              try: apple_max=max(apple_max,int((item.get('attributes') or {}).get('version')))
+              except (TypeError,ValueError): pass
+
+          google_max=0
+          gp=GooglePlayClient(app.google_account)
+          edit=None
+          try:
+              edit=gp._open_edit(app.package_name)
+              tracks=gp._edit_request(edit,'GET',f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}/tracks').get('tracks',[])
+              for track in tracks:
+                  for rel in track.get('releases') or []:
+                      for code in rel.get('versionCodes') or []:
+                          try: google_max=max(google_max,int(code))
+                          except (TypeError,ValueError): pass
+          finally:
+              if edit:
+                  gp._safe_delete_edit(edit)
+
+          build_number=max(db_max,apple_max,google_max)+1
+          release,_=Release.objects.get_or_create(app=app,version_name=target_version,build_number=build_number)
+          release.status='building'
+          release.source_branch='main'
+          release.source_commit=os.environ['APLUS_COMMIT']
+          release.auto_submit=False
+          release.release_notes=(
+              'Native Vollbild PDF Vorschau mit Zwei Finger Zoom ohne App Leisten. '
+              'Apple Kalender Abo direkt starten und sichere HTTPS Kalenderfeeds.'
+          )
+          release.save()
+
+          queued=[]
+          for platform,job_type,runner in [('android','build_android','linux'),('ios','build_ios','macos')]:
+              build,_=Build.objects.get_or_create(release=release,platform=platform)
+              Job.objects.filter(build=build,type=job_type,status__in=['queued','running']).update(status='cancelled')
+              if build.artifact:
+                  build.artifact.delete(save=False)
+              build.artifact=''
+              build.artifact_size=0
+              build.artifact_checksum=''
+              build.external_build_id=''
+              build.metadata={}
+              build.logs=''
+              build.finished_at=None
+              build.status='queued'
+              build.save()
+              job=enqueue_job(
+                  job_type,
+                  app=app,
+                  release=release,
+                  build=build,
+                  payload={'source':'calendar-native-pdf-signed-build-20261008'},
+                  agent=True,
+                  platform=runner,
+              )
+              queued.append(str(job.id))
+
+          meta={
+              'release_id':str(release.id),
+              'version':target_version,
+              'build':build_number,
+              'apple_state':current_state,
+              'db_max':db_max,
+              'apple_max':apple_max,
+              'google_max':google_max,
+              'queued':queued,
+          }
+          print('RELEASE_META_JSON='+json.dumps(meta,separators=(',',':')))
+          PY
+          )"
+
+          printf '%s\n' "$OUT"
+          META="$(printf '%s\n' "$OUT" | sed -n 's/^RELEASE_META_JSON=//p' | tail -n 1)"
+          test -n "$META"
+          echo "release_id=$(printf '%s' "$META" | jq -r '.release_id')" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$META" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+          echo "build=$(printf '%s' "$META" | jq -r '.build')" >> "$GITHUB_OUTPUT"
+          echo "queued=$(printf '%s' "$META" | jq -c '.queued')" >> "$GITHUB_OUTPUT"
+          echo "Publisher release: version $(printf '%s' "$META" | jq -r '.version'), build $(printf '%s' "$META" | jq -r '.build')"
+
+      - name: Wake Publisher Android and iOS cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: 'main'
+              });
+            }
+
+      - name: Wait for signed AAB and IPA
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for i in $(seq 1 300); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os, re
+          from apps.publisher.models import Job, Release
+          r=Release.objects.get(id=os.environ['RELEASE_ID'])
+          values=[]
+          for platform,job_type in [('android','build_android'),('ios','build_ios')]:
+              b=r.builds.get(platform=platform)
+              failed=Job.objects.filter(build=b,type=job_type,status='failed').order_by('-created_at').first()
+              err=re.sub(r'\s+',' ',str(failed.error or '')).replace('|','/')[:300] if failed else ''
+              values.append(':'.join([platform,b.status,'artifact' if b.artifact else '',err]))
+          print('|'.join(values))
+          PY
+            )"
+            echo "Publisher native build state: $STATE"
+            if [[ "$STATE" == *":failed:"* ]]; then
+              echo "$STATE" >&2
+              exit 1
+            fi
+            if [[ "$STATE" == android:succeeded:artifact:*"|"ios:succeeded:artifact:* ]]; then
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for Publisher artifacts." >&2
+          exit 1
+
+      - name: Confirm build-only result
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          RELEASE_ID: ${{ steps.prepare.outputs.release_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST"             "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell -c \"import os; from apps.publisher.models import Release; r=Release.objects.get(id=os.environ['RELEASE_ID']); a=r.builds.get(platform='android'); i=r.builds.get(platform='ios'); assert a.status=='succeeded' and a.artifact; assert i.status=='succeeded' and i.artifact; assert not r.auto_submit; print(f'BUILD_ONLY_OK version={r.version_name} build={r.build_number} android={a.status} ios={i.status}')\""

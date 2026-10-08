@@ -1,0 +1,154 @@
+name: A+ Solution Calendar PDF Store Test Upload 2026-10-08
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-calendar-pdf-upload-20261008.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: aplus-calendar-pdf-upload-20261008
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    env:
+      SOURCE_COMMIT: '58bbad570d547a087a8324132d9c55bda2e22ff3'
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Wait for both signed artifacts from exact commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 300); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+                "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os, re
+          from apps.publisher.models import MobileApp, Release, Job
+          a = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.filter(app=a, source_commit=os.environ['SOURCE_COMMIT']).order_by('-created_at').first()
+          if not r:
+              print('pending|release_not_created')
+          else:
+              values = []
+              for platform, typ in [('android', 'build_android'), ('ios', 'build_ios')]:
+                  b = r.builds.filter(platform=platform).first()
+                  if not b:
+                      values.append(platform+':missing')
+                      continue
+                  failed = Job.objects.filter(build=b, type=typ, status='failed').order_by('-created_at').first()
+                  error = re.sub(r'\s+', ' ', str(failed.error or '')).replace('|', '/')[:150] if failed else ''
+                  values.append(':'.join([platform, b.status, 'artifact' if b.artifact else 'no_artifact', error]))
+              print(str(r.id)+'|'+'|'.join(values))
+          PY
+            )"
+            echo "Signed build check: $STATE"
+            if [[ "$STATE" == *":failed:"* ]]; then
+              echo "Publisher signed build failed: $STATE" >&2
+              exit 1
+            fi
+            if [[ "$STATE" == *"android:succeeded:artifact:"*"|"*"ios:succeeded:artifact:"* ]]; then
+              echo "Both signed builds are ready."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo 'Timeout waiting for signed artifacts.' >&2
+          exit 1
+
+      - name: Queue Google Play internal test upload and Apple TestFlight upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          a = MobileApp.objects.get(slug='a-plus-solution')
+          r = Release.objects.filter(app=a,source_commit=os.environ['SOURCE_COMMIT']).order_by('-created_at').first()
+          assert r is not None
+          android = r.builds.get(platform='android')
+          ios = r.builds.get(platform='ios')
+          assert android.status == 'succeeded' and android.artifact
+          assert ios.status == 'succeeded' and ios.artifact
+          assert a.apple_account and a.apple_account.configured
+          assert a.google_account and a.google_account.configured
+          # Test first. Never unintentionally roll a new build into production.
+          r.android_track = 'internal'
+          r.android_rollout = 1
+          r.auto_submit = False
+          r.save(update_fields=['android_track','android_rollout','auto_submit','updated_at'])
+          done_google = Submission.objects.filter(release=r,platform='android',state__in=['in_review','approved','live']).exists()
+          if not done_google and not Job.objects.filter(release=r,type='upload_google',status__in=['queued','running','succeeded']).exists():
+              j = enqueue_job('upload_google',app=a,release=r,build=android)
+              print('queued_google_internal='+str(j.id))
+          if not ios.external_build_id and not Job.objects.filter(build=ios,type='upload_apple',status__in=['queued','running','succeeded']).exists():
+              j = enqueue_job('upload_apple',app=a,release=r,build=ios,agent=True,platform='macos')
+              print('queued_apple_testflight='+str(j.id))
+          print('release='+r.version_name+' build='+str(r.build_number)+' source='+r.source_commit)
+          PY
+
+      - name: Wake Publisher Cloud Mac for App Store upload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+
+      - name: Verify Google internal upload and Apple build delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 240); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+               "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os,re
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          a=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.filter(app=a,source_commit=os.environ['SOURCE_COMMIT']).order_by('-created_at').first()
+          assert r
+          ios=r.builds.get(platform='ios')
+          g=Job.objects.filter(release=r,type='upload_google').order_by('-created_at').first()
+          u=Job.objects.filter(release=r,type='upload_apple').order_by('-created_at').first()
+          gs=Submission.objects.filter(release=r,platform='android').first()
+          def status(job): return job.status if job else 'missing'
+          def err(job): return re.sub(r'\s+',' ',str(job.error or '')).replace('|','/')[:250] if job else ''
+          print('|'.join([status(g),err(g),status(u),err(u),str(ios.external_build_id or ''),gs.state if gs else '']))
+          PY
+            )"
+            echo "Store test upload: $STATE"
+            IFS='|' read -r GS GE AS AE AID GSTORE <<< "$STATE"
+            if [ "$GS" = failed ]; then echo "Google upload failed: $GE" >&2; exit 1; fi
+            if [ "$AS" = failed ]; then echo "Apple upload failed: $AE" >&2; exit 1; fi
+            if [ "$GS" = succeeded ] && [ -n "$AID" ]; then
+              echo "Google internal track submitted; Apple build uploaded/processed."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo 'Timed out waiting for store uploads.' >&2
+          exit 1

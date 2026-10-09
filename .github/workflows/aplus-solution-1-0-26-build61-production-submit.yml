@@ -1,0 +1,229 @@
+name: A+ Solution 1.0.26 Build 61 Production Submit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-1-0-26-build61-production-submit.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aplus-solution-1026-61-production-submission
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: '58bbad570d547a087a8324132d9c55bda2e22ff3'
+  VERSION_NAME: '1.0.26'
+  BUILD_NUMBER: '61'
+  HOST: ${{ secrets.HOST }}
+  PASS: ${{ secrets.PASS }}
+  SSH_PORT: ${{ secrets.SSH_PORT }}
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 120
+    steps:
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Verify exact signed artifacts and set up public production release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release
+
+          app = MobileApp.objects.get(slug='a-plus-solution')
+          release = Release.objects.get(app=app, version_name=os.environ['VERSION_NAME'], build_number=int(os.environ['BUILD_NUMBER']))
+          assert release.source_commit == os.environ['SOURCE_COMMIT'], 'Wrong source code: refusing release'
+          a = release.builds.get(platform='android')
+          i = release.builds.get(platform='ios')
+          assert a.status == 'succeeded' and bool(a.artifact), 'Signed AAB missing'
+          assert i.status == 'succeeded' and bool(i.artifact), 'Signed IPA missing'
+          assert i.external_build_id, 'Uploaded and processed Apple build ID missing'
+          assert app.google_account and app.google_account.configured, 'Google account missing'
+          assert app.apple_account and app.apple_account.configured, 'Apple account missing'
+          assert app.review_username == 'store-review@aplus-solution.de' and app.get_review_password(), 'App Review login missing'
+
+          release.android_track = 'production'
+          release.android_rollout = 1
+          release.ios_release_type = 'automatic'
+          release.auto_submit = False
+          release.status = 'submitting'
+          release.release_notes = (
+              'Verbesserte Apple Kalender Anmeldung und automatische Synchronisierung der Schichten. '
+              'PDF Dokumente lassen sich auf Mobilgeräten im Vollbild öffnen und mit zwei Fingern vergrößern.'
+          )
+          release.save(update_fields=['android_track','android_rollout','ios_release_type','auto_submit','status','release_notes','updated_at'])
+
+          app.review_notes = (
+              'A+ Solution is a workforce application for employees and authorized customers, '
+              'including schedules, time tracking, documents and notifications. '
+              'Use the supplied active employee review account to sign in without invitation or two factor authentication. '
+              'Open the Profile page and use Apple Kalender to add the shift subscription. '
+              'Open an assigned PDF attachment in a shift to test native fullscreen PDF preview and pinch zoom. '
+              'There are no in app purchases.'
+          )
+          app.save(update_fields=['review_notes','updated_at'])
+          loc = app.localizations.filter(locale='de-DE').first()
+          if loc:
+              loc.release_notes = release.release_notes
+              loc.save(update_fields=['release_notes','updated_at'])
+          print('PREFLIGHT_OK version='+release.version_name+' build='+str(release.build_number)+' source='+release.source_commit+' apple_build='+str(i.external_build_id)+' android_track='+release.android_track)
+          PY
+
+      - name: Validate active reviewer credentials against production login
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          B64="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); print(base64.b64encode(a.get_review_password().encode()).decode())\"" | tail -n 1 | tr -d '\r')"
+          test -n "$B64"
+          echo "::add-mask::$B64"
+          REVIEW_PASSWORD="$(printf '%s' "$B64" | base64 -d)"
+          echo "::add-mask::$REVIEW_PASSWORD"
+          export REVIEW_PASSWORD
+          STATUS="$(python3 - <<'PY' | curl -sS -o /tmp/aplus-review-auth.json -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @- https://app.aplus-solution.de/api/auth/login/
+          import os,json
+          print(json.dumps({'email':'store-review@aplus-solution.de','password':os.environ['REVIEW_PASSWORD']}))
+          PY
+          )"
+          if [ "$STATUS" != '200' ]; then
+            echo "Reviewer login failed, HTTP $STATUS. Refusing to submit inaccessible app." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          response = json.load(open('/tmp/aplus-review-auth.json'))
+          assert response.get('access') and response.get('refresh'), 'Review authentication did not return tokens'
+          assert (response.get('user') or {}).get('role') == 'worker', 'Review account has wrong role'
+          print('APP_REVIEW_LOGIN_VERIFIED')
+          PY
+
+      - name: Queue public Google Play rollout using already uploaded versionCode
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Job
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          assert r.android_track == 'production'
+          b=r.builds.get(platform='android')
+          existing=Job.objects.filter(release=r,type='upload_google',payload__target='production',status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if existing:
+              print('GOOGLE_PRODUCTION_ALREADY_QUEUED job='+str(existing.id)+' status='+existing.status)
+          else:
+              job=enqueue_job('upload_google',app=app,release=r,build=b,payload={'target':'production','reason':'full_release_user_approved'})
+              print('GOOGLE_PRODUCTION_QUEUED job='+str(job.id))
+          PY
+
+      - name: Wait for Google production submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 150); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os,re
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          j=Job.objects.filter(release=r,type='upload_google',payload__target='production').order_by('-created_at').first()
+          s=Submission.objects.filter(release=r,platform='android').first()
+          err=re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:500] if j else ''
+          print('|'.join([j.status if j else 'missing',err,s.state if s else 'missing']))
+          PY
+            )"
+            echo "Google production: $STATE"
+            IFS='|' read -r STATUS ERROR STORESTATE <<< "$STATE"
+            if [ "$STATUS" = failed ]; then echo "Google production rejected: $ERROR" >&2; exit 1; fi
+            if [ "$STATUS" = succeeded ]; then
+              if [ "$STORESTATE" = ready_for_review ]; then
+                echo 'Google accepted changes but requires an explicit review submission in Play Console.'
+              fi
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for Google production submit" >&2
+          exit 1
+
+      - name: Queue App Store review for exact processed Apple build
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          b=r.builds.get(platform='ios')
+          assert b.status=='succeeded' and bool(b.artifact) and b.external_build_id
+          existing=Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          submitted=Submission.objects.filter(release=r,platform='ios',state__in=['in_review','approved','live']).first()
+          if submitted:
+              print('APPLE_ALREADY_SUBMITTED state='+submitted.state)
+          elif existing:
+              print('APPLE_REVIEW_ALREADY_QUEUED job='+str(existing.id)+' status='+existing.status)
+          else:
+              j=enqueue_job('submit_apple',app=app,release=r,build=b,payload={'source':'1026-61-production-user-approved'})
+              print('APPLE_REVIEW_QUEUED job='+str(j.id))
+          PY
+
+      - name: Confirm both public store submissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 160); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os,re
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          g=Job.objects.filter(release=r,type='upload_google',payload__target='production').order_by('-created_at').first()
+          a=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          gs=Submission.objects.filter(release=r,platform='android').first()
+          aps=Submission.objects.filter(release=r,platform='ios').first()
+          def err(j):return re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:500] if j else ''
+          print('|'.join([g.status if g else 'missing',err(g),a.status if a else 'missing',err(a),gs.state if gs else '',aps.state if aps else '',aps.external_id if aps else '']))
+          PY
+            )"
+            echo "Public store submission state: $STATE"
+            IFS='|' read -r GST GERR AST AERR GS AS AID <<< "$STATE"
+            if [ "$GST" = failed ]; then echo "Google failed: $GERR" >&2; exit 1; fi
+            if [ "$AST" = failed ]; then echo "Apple failed: $AERR" >&2; exit 1; fi
+            if [ "$GST" = succeeded ] && [ "$AST" = succeeded ] && [ -n "$AID" ] && [ "$AS" = in_review ]; then
+              if [ "$GS" = ready_for_review ]; then
+                echo 'BOTH_REQUESTED_WITH_GOOGLE_MANAGED_PUBLISHING_HOLD'
+              else
+                echo 'BOTH_STORES_SUBMITTED'
+              fi
+              exit 0
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for public store review states' >&2
+          exit 1

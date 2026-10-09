@@ -1,0 +1,111 @@
+name: A+ Esthetic Build 34 live store diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-build34-live-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect Publisher and Apple upload errors for 1.0.28 Build 34
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          PY_CODE=$(cat <<'PY'
+          import json
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.filter(app=app,version_name='1.0.28',build_number=34).order_by('-created_at').first()
+          if not release:
+              raise SystemExit('RELEASE_MISSING_1_0_28_BUILD_34')
+
+          print('RELEASE',release.pk,release.version_name,release.build_number,release.status,release.source_commit)
+          for build in release.builds.order_by('platform'):
+              print('BUILD',build.pk,build.platform,build.status,build.external_build_id or '-',bool(build.artifact),build.artifact_size,build.commit_sha)
+          for job in release.jobs.order_by('pk'):
+              print('JOB',job.pk,job.type,job.status,job.progress)
+              if job.error:
+                  print('JOB_ERROR',job.pk,(job.error or '')[:4000].replace('\n',' | '))
+              if job.result:
+                  print('JOB_RESULT',job.pk,json.dumps(job.result,default=str)[:4000])
+          for sub in Submission.objects.filter(release=release).order_by('platform'):
+              print('SUBMISSION',sub.pk,sub.platform,sub.state,sub.external_id or '-',sub.last_error or '-')
+              print('SUBMISSION_RAW',sub.platform,json.dumps(sub.raw,default=str)[:5000])
+
+          for kind in ['build_ios','upload_apple','submit_apple','upload_google']:
+              for job in release.jobs.filter(type=kind).order_by('-pk')[:5]:
+                  print('RECENT_JOB',kind,job.pk,job.status,'error',(job.error or '')[:1800].replace('\\n',' | '))
+
+          # Apple live state
+          if app.apple_account and app.apple_account.configured:
+              try:
+                  ac=AppleStoreClient(app.apple_account)
+                  arec=ac.find_app(app.bundle_id)
+                  aid=arec['id']
+                  versions=ac.list_versions(aid)
+                  print('APPLE_APP_ID',aid)
+                  target=None
+                  for v in versions:
+                      attrs=v.get('attributes',{})
+                      state=attrs.get('appStoreState') or attrs.get('appVersionState') or ''
+                      ver=attrs.get('versionString')
+                      print('APPLE_VERSION',v.get('id'),ver,state)
+                      if ver=='1.0.28': target=v
+                  reviews=ac.request('GET',f'/apps/{aid}/reviewSubmissions?limit=200').get('data',[])
+                  for r in reviews:
+                      rs=r.get('attributes',{}).get('state') or ''
+                      print('APPLE_REVIEW',r.get('id'),rs)
+                      try:
+                          for item in ac.list_review_submission_items(r['id']):
+                              rel=(item.get('relationships',{}).get('appStoreVersion',{}).get('data') or {})
+                              ist=item.get('attributes',{}).get('state') or ''
+                              print('APPLE_REVIEW_ITEM',r.get('id'),item.get('id'),ist,rel.get('id') or '-')
+                      except Exception as exc:
+                          print('APPLE_REVIEW_ITEMS_ERROR',r.get('id'),str(exc)[:1000])
+                  if target:
+                      print('APPLE_TARGET_ID',target.get('id'))
+              except Exception as exc:
+                  print('APPLE_LIVE_ERROR',type(exc).__name__,str(exc)[:4000])
+
+          # Google live production-track state
+          if app.google_account and app.google_account.configured:
+              try:
+                  gc=GooglePlayClient(app.google_account)
+                  edit=gc._open_edit(app.package_name)
+                  try:
+                      bundles=gc._edit_request(edit,'GET',f'/applications/{gc._q(app.package_name)}/edits/{edit.edit_id}/bundles')
+                      print('GOOGLE_BUNDLES',json.dumps(bundles,default=str)[:5000])
+                      for track in ['production','beta','alpha','internal']:
+                          try:
+                              data=gc._edit_request(edit,'GET',f'/applications/{gc._q(app.package_name)}/edits/{edit.edit_id}/tracks/{gc._q(track)}')
+                              print('GOOGLE_TRACK',track,json.dumps(data,default=str)[:5000])
+                          except Exception as exc:
+                              print('GOOGLE_TRACK_ERROR',track,str(exc)[:1500])
+                  finally:
+                      gc._safe_delete_edit(edit)
+              except Exception as exc:
+                  print('GOOGLE_LIVE_ERROR',type(exc).__name__,str(exc)[:4000])
+
+          print('STATUS_PROBE_DONE')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

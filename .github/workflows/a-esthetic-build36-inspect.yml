@@ -38,7 +38,7 @@ jobs:
                   if j: print('JOB',typ,j.status,'ERR',str(j.error or '')[:230].replace(chr(10),' '))
           print('STORE',bool(app.apple_account and app.apple_account.configured),bool(app.google_account and app.google_account.configured))
           for agent in BuildAgent.objects.filter(platform__in=['linux','macos']).order_by('platform','pk'):
-              print('AGENT',agent.platform,agent.name,agent.status,'busy',bool(agent.current_job_id))
+              print('AGENT',agent.platform,agent.name,agent.enabled,'online',agent.online,'busy',bool(agent.current_job_id))
           if app.apple_account and app.apple_account.configured:
               try:
                   api=AppleStoreClient(app.apple_account)

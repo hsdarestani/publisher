@@ -1,0 +1,92 @@
+name: A+ Solution 1.0.26 Build 61 Apple Review Submit Now
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-1-0-26-build61-apple-submit-now.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aplus-solution-1026-61-apple-review
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 75
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SOURCE_COMMIT: '58bbad570d547a087a8324132d9c55bda2e22ff3'
+      VERSION_NAME: '1.0.26'
+      BUILD_NUMBER: '61'
+    steps:
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+
+      - name: Submit exact uploaded iOS build to App Store Review
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          assert r.source_commit==os.environ['SOURCE_COMMIT']
+          b=r.builds.get(platform='ios')
+          assert b.status=='succeeded' and b.artifact and b.external_build_id
+          assert app.apple_account and app.apple_account.configured
+          assert app.review_username == 'store-review@aplus-solution.de' and app.get_review_password()
+          r.ios_release_type='automatic'
+          r.save(update_fields=['ios_release_type','updated_at'])
+          s=Submission.objects.filter(release=r,platform='ios',state__in=['in_review','approved','live']).first()
+          j=Job.objects.filter(release=r,type='submit_apple',status__in=['queued','running','succeeded']).order_by('-created_at').first()
+          if s:print('APPLE_ALREADY_SUBMITTED state='+s.state+' id='+s.external_id)
+          elif j:print('APPLE_ALREADY_QUEUED job='+str(j.id)+' status='+j.status)
+          else:
+              j=enqueue_job('submit_apple',app=app,release=r,build=b,payload={'source':'user_approved_1026_build61'})
+              print('APPLE_REVIEW_JOB_QUEUED id='+str(j.id))
+          PY
+
+      - name: Confirm Apple App Review submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for n in $(seq 1 150); do
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" <<'PY' | tail -n 1 | tr -d '\r'
+          import os,re
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          a=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.get(app=a,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          assert r.source_commit==os.environ['SOURCE_COMMIT']
+          j=Job.objects.filter(release=r,type='submit_apple').order_by('-created_at').first()
+          s=Submission.objects.filter(release=r,platform='ios').first()
+          err=re.sub(r'\s+',' ',str(j.error or '')).replace('|','/')[:700] if j else ''
+          print('|'.join([j.status if j else 'missing',err,s.state if s else '',s.external_id if s else '']))
+          PY
+            )"
+            echo "Apple App Review: $STATE"
+            IFS='|' read -r JOB ERROR STATE SUBMISSION <<< "$STATE"
+            if [ "$JOB" = failed ]; then echo "Apple rejected submission: $ERROR" >&2; exit 1; fi
+            if [ "$JOB" = succeeded ] && [ -n "$SUBMISSION" ] && [ "$STATE" = in_review ]; then
+              echo "APPLE_REVIEW_SUBMITTED_OK"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for App Store submission" >&2
+          exit 1

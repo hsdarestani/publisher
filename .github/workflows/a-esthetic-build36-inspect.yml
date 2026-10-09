@@ -1,0 +1,57 @@
+name: Inspect A+ Esthetic canonical release readiness
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/a-esthetic-build36-inspect.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment: production
+    steps:
+      - name: Read only Publisher and Apple release state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release, Submission, BuildAgent
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='a-esthetic')
+          print('SOURCE',app.github_repo_full_name if hasattr(app,'github_repo_full_name') else app.slug,'LATEST',app.latest_commit_sha)
+          for rel in Release.objects.filter(app=app).order_by('-pk')[:8]:
+              print('REL',rel.pk,rel.version_name,rel.build_number,rel.status,rel.source_commit)
+              for b in rel.builds.all():
+                  print('BLD',b.platform,b.status,str(b.commit_sha or '')[:12],bool(b.artifact),bool(b.external_build_id))
+              for s in Submission.objects.filter(release=rel):
+                  print('SUB',s.platform,s.state)
+              for typ in ['build_android','build_ios','upload_google','upload_apple','submit_apple']:
+                  j=rel.jobs.filter(type=typ).order_by('-pk').first()
+                  if j: print('JOB',typ,j.status,'ERR',str(j.error or '')[:230].replace(chr(10),' '))
+          print('STORE',bool(app.apple_account and app.apple_account.configured),bool(app.google_account and app.google_account.configured))
+          for agent in BuildAgent.objects.filter(platform__in=['linux','macos']).order_by('platform','pk'):
+              print('AGENT',agent.platform,agent.name,agent.status,'busy',bool(agent.current_job_id))
+          if app.apple_account and app.apple_account.configured:
+              try:
+                  api=AppleStoreClient(app.apple_account)
+                  record=api.find_app(app.bundle_id)
+                  for item in api.list_versions(record['id']):
+                      data=item.get('attributes',{})
+                      if data.get('versionString') in ('1.0.28','1.0.29','1.0.30'):
+                          print('APPLE_VERSION',item['id'],data.get('versionString'),data.get('appStoreState') or data.get('appVersionState'))
+              except Exception as ex:
+                  print('APPLE_STATUS_ERROR',type(ex).__name__,str(ex)[:200])
+          print('INSPECT_DONE')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

@@ -1,0 +1,49 @@
+name: A+ Solution TestFlight upload queue diagnostic 2026-10-09
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-calendar-upload-queue-diagnostic-20261009.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - name: Inspect upload job and Mac builder queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import Job, Release, MobileApp, BuildAgent
+          commit='44a2336df05e1b4f1556a69589f5549cb04b01b2'
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          r=Release.objects.filter(app=app,source_commit=commit).order_by('-created_at').first()
+          print('TARGET_RELEASE',r.pk if r else 'missing',r.version_name if r else '',r.build_number if r else '')
+          if r:
+              b=r.builds.filter(platform='ios').first()
+              print('TARGET_BUILD',b.status if b else 'missing','artifact_present' if b and b.artifact else 'no_artifact',b.external_build_id if b else '')
+              for j in Job.objects.filter(release=r,type__in=['build_ios','upload_apple']).order_by('created_at'):
+                  print('TARGET_JOB',j.pk,j.type,j.status,(j.error or '')[:250].replace('\n',' '))
+          pending=Job.objects.filter(status='queued',required_platform='macos',available_to_agents=True).order_by('created_at','pk')
+          print('MAC_QUEUE_LENGTH',pending.count())
+          for i,j in enumerate(pending[:25],start=1):
+              print('MAC_QUEUE',i,j.pk,j.type,j.app.slug if j.app else '',j.release.source_commit[:10] if j.release else '')
+          for a in BuildAgent.objects.filter(platform__startswith='macos'):
+              print('MAC_AGENT',a.name,'enabled='+str(a.enabled),'active='+str(a.current_job_id))
+          PY

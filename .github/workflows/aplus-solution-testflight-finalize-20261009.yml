@@ -70,24 +70,27 @@ jobs:
           groups=client.request('GET',f"/apps/{apple_app['id']}/betaGroups?limit=200").get('data',[])
           internal=[group for group in groups if (group.get('attributes') or {}).get('isInternalGroup')]
           print('INTERNAL_GROUP_COUNT='+str(len(internal)))
-          associated=client.request('GET',f"/builds/{apple_build_id}/betaGroups?limit=200").get('data',[])
-          associated_ids={str(g['id']) for g in associated}
-          print('EXPLICITLY_ASSOCIATED_GROUPS='+str(len(associated_ids)))
           auto_count=0
           for group in internal:
               attrs=group.get('attributes') or {}
               auto=bool(attrs.get('hasAccessToAllBuilds'))
-              in_build=str(group['id']) in associated_ids
-              print('INTERNAL_GROUP_STATUS id='+str(group['id'])+' access_all='+str(auto)+' explicit='+str(in_build))
-              if auto or in_build:
+              group_id=str(group['id'])
+              print('INTERNAL_GROUP_STATUS id='+group_id+' automatic_all_builds='+str(auto))
+              if auto:
+                  print('AUTOMATIC_INTERNAL_DISTRIBUTION id='+group_id)
                   auto_count+=1
                   continue
               try:
-                  client.request('POST',f"/betaGroups/{group['id']}/relationships/builds",data=json.dumps({'data':[{'type':'builds','id':apple_build_id}]}))
-                  print('GROUP_ADDED id='+str(group['id']))
+                  client.request('POST',f"/builds/{apple_build_id}/relationships/betaGroups",data=json.dumps({'data':[{'type':'betaGroups','id':group_id}]}))
+                  print('INTERNAL_GROUP_ASSIGNED id='+group_id)
                   auto_count+=1
               except Exception as exc:
-                  print('GROUP_NOT_ASSIGNED id='+str(group['id'])+' error='+str(exc)[:300].replace('\n',' '))
+                  msg=str(exc).lower()
+                  if any(term in msg for term in ('already','duplicate','409')):
+                      print('INTERNAL_GROUP_ALREADY_ASSIGNED id='+group_id)
+                      auto_count+=1
+                  else:
+                      print('INTERNAL_GROUP_ASSIGNMENT_ERROR id='+group_id+' detail='+str(exc)[:500].replace('\\n',' '))
           assert auto_count>0,'No eligible internal tester group is linked to this build.'
           print('TESTFLIGHT_BUILD_READY version='+release.version_name+' build='+str(release.build_number)+' apple_build='+apple_build_id+' eligible_internal_groups='+str(auto_count))
 

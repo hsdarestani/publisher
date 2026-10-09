@@ -10,12 +10,16 @@ from .models import Job
 
 @receiver(post_save, sender=Job)
 def wake_cloud_agent_for_queued_job(sender, instance: Job, created: bool, update_fields=None, **kwargs):
-    """Wake the matching ephemeral runner whenever agent work enters the queue."""
-
+    """Dispatch exactly one matching runner when agent work enters the queue."""
     if not instance.available_to_agents or instance.status != "queued":
         return
     if not created and update_fields is not None and "status" not in update_fields:
         return
-
     platform = instance.required_platform
-    transaction.on_commit(lambda: wake_cloud_agent(platform))
+    if platform not in {"linux", "macos"}:
+        return
+    app_slug = instance.app.slug if instance.app_id else ""
+    transaction.on_commit(
+        lambda platform=platform, app_slug=app_slug:
+            wake_cloud_agent(platform, app_slug=app_slug)
+    )

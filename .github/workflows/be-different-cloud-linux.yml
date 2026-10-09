@@ -2,10 +2,6 @@ name: BE DIFFERENT Cloud Linux
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/be-different-cloud-linux.yml'
 
 permissions:
   contents: read

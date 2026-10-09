@@ -3,18 +3,6 @@ name: A+ Cloud Linux
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/cloud-linux.yml'
-      - 'agents/**'
-  schedule:
-    # Combined with the watch window below, this keeps an Android runner ready
-    # for newly queued Build/Retry actions without a permanent Mac or Linux host.
-    - cron: '*/5 * * * *'
-  workflow_run:
-    workflows: ['Validate and deploy A+ Publisher']
-    types: [completed]
 
 permissions:
   contents: read

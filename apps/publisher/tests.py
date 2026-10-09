@@ -2,16 +2,18 @@ import os
 import hashlib
 import json
 from types import SimpleNamespace
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, Client, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from .github_actions import wake_cloud_agent
 from .models import MobileApp, AppLocalization, Release, Build, BuildAgent, Job, StoreAccount, Submission
 from .readiness import evaluate_release
-from .tasks import handle_submit_google
+from .tasks import handle_submit_google, enqueue_job, recover_queued_cloud_jobs
 
 
 class PublisherTests(TestCase):
@@ -198,20 +200,95 @@ class PublisherTests(TestCase):
                 available_to_agents=True,
                 required_platform="linux",
             )
-        wake.assert_called_once_with("linux")
+        wake.assert_called_once_with("linux", app_slug="test-app")
+
+
+    @patch("apps.publisher.signals.wake_cloud_agent")
+    def test_be_different_queue_wakes_only_dedicated_runner(self, wake):
+        app = MobileApp.objects.create(
+            name="BE DIFFERENT", slug="be-different",
+            package_name="com.smarbiz.bedifferent",
+            bundle_id="com.smarbiz.bedifferent",
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Job.objects.create(
+                type="build_ios", app=app, available_to_agents=True,
+                required_platform="macos",
+            )
+        wake.assert_called_once_with("macos", app_slug="be-different")
+
+    @patch("apps.publisher.signals.wake_cloud_agent")
+    def test_enqueue_agent_job_dispatches_only_once(self, wake):
+        with self.captureOnCommitCallbacks(execute=True):
+            enqueue_job(
+                "build_android", app=self.app, agent=True, platform="linux",
+            )
+        wake.assert_called_once_with("linux", app_slug="test-app")
+
+    @patch("apps.publisher.tasks.wake_cloud_agent")
+    def test_queue_watchdog_skips_empty_queue(self, wake):
+        recover_queued_cloud_jobs()
+        wake.assert_not_called()
+
+    @patch("apps.publisher.tasks.wake_cloud_agent")
+    def test_queue_watchdog_recovers_old_job_only(self, wake):
+        job = Job.objects.create(
+            type="build_ios", app=self.app, available_to_agents=True,
+            required_platform="macos",
+        )
+        Job.objects.filter(pk=job.pk).update(
+            created_at=timezone.now() - timedelta(minutes=12)
+        )
+        recover_queued_cloud_jobs()
+        wake.assert_called_once_with("macos", app_slug="")
+
+    @patch("apps.publisher.tasks.wake_cloud_agent")
+    def test_queue_watchdog_does_not_wake_busy_runner(self, wake):
+        job = Job.objects.create(
+            type="build_ios", app=self.app, available_to_agents=True,
+            required_platform="macos",
+        )
+        Job.objects.filter(pk=job.pk).update(
+            created_at=timezone.now() - timedelta(minutes=12)
+        )
+        Job.objects.create(
+            type="upload_apple", app=self.app, available_to_agents=True,
+            required_platform="macos", status="running",
+        )
+        recover_queued_cloud_jobs()
+        wake.assert_not_called()
 
     @override_settings(
         PUBLISHER_GITHUB_TOKEN="test-token",
         PUBLISHER_GITHUB_REPOSITORY="hsdarestani/publisher",
         PUBLISHER_GITHUB_REF="main",
     )
+    @patch("apps.publisher.github_actions.redis.Redis.from_url")
     @patch("apps.publisher.github_actions.requests.post")
-    def test_cloud_runner_dispatch_uses_github_workflow_api(self, post):
+    def test_cloud_runner_dispatch_uses_github_workflow_api(self, post, redis_from_url):
+        redis_from_url.return_value.set.return_value = True
         post.return_value.status_code = 204
         self.assertTrue(wake_cloud_agent("linux"))
         post.assert_called_once()
         self.assertIn("cloud-linux.yml/dispatches", post.call_args.args[0])
         self.assertEqual(post.call_args.kwargs["json"], {"ref": "main"})
+
+    @override_settings(PUBLISHER_GITHUB_TOKEN="test-token")
+    @patch("apps.publisher.github_actions.redis.Redis.from_url")
+    @patch("apps.publisher.github_actions.requests.post")
+    def test_be_different_dispatch_uses_dedicated_workflow(self, post, redis_from_url):
+        redis_from_url.return_value.set.return_value = True
+        post.return_value.status_code = 204
+        self.assertTrue(wake_cloud_agent("macos", app_slug="be-different"))
+        self.assertIn("be-different-cloud-macos.yml/dispatches", post.call_args.args[0])
+
+    @override_settings(PUBLISHER_GITHUB_TOKEN="test-token")
+    @patch("apps.publisher.github_actions.redis.Redis.from_url")
+    @patch("apps.publisher.github_actions.requests.post")
+    def test_deduplicated_queue_burst_does_not_start_second_runner(self, post, redis_from_url):
+        redis_from_url.return_value.set.return_value = False
+        self.assertTrue(wake_cloud_agent("macos", app_slug="be-different"))
+        post.assert_not_called()
 
     @override_settings(PUBLISHER_GITHUB_TOKEN="")
     @patch("apps.publisher.github_actions.requests.post")

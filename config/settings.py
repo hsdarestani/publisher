@@ -108,6 +108,7 @@ CELERY_BEAT_SCHEDULE = {
     "sync-store-statuses": {"task": "apps.publisher.tasks.sync_store_statuses", "schedule": 60 * 60 * 6},
     "sync-daily-reports": {"task": "apps.publisher.tasks.sync_daily_reports", "schedule": 60 * 60 * 24},
     "cleanup-old-jobs": {"task": "apps.publisher.tasks.cleanup_old_jobs", "schedule": 60 * 60 * 24},
+    "recover-queued-cloud-jobs": {"task": "apps.publisher.tasks.recover_queued_cloud_jobs", "schedule": 60 * 5},
 }
 
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")

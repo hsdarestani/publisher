@@ -2,17 +2,7 @@ name: A+ Cloud Mac
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_run:
-    workflows: ['Validate and deploy A+ Publisher']
-    types: [completed]
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/cloud-macos.yml'
 
-# Queue nudge marker: A+ Solution 1.0.23 (58) iOS queue recovery.
 permissions:
   contents: read
   id-token: write

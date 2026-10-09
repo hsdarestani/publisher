@@ -69,19 +69,26 @@ jobs:
           print('APPLE_VALIDATED version='+release.version_name+' build='+str(release.build_number)+' apple_build='+apple_build_id)
           groups=client.request('GET',f"/apps/{apple_app['id']}/betaGroups?limit=200").get('data',[])
           internal=[group for group in groups if (group.get('attributes') or {}).get('isInternalGroup')]
-          if not internal:
-              print('NO_INTERNAL_TESTFLIGHT_GROUP')
-              raise RuntimeError('No internal TestFlight group exists: add an internal group and testers in App Store Connect')
+          print('INTERNAL_GROUP_COUNT='+str(len(internal)))
+          associated=client.request('GET',f"/builds/{apple_build_id}/betaGroups?limit=200").get('data',[])
+          associated_ids={str(g['id']) for g in associated}
+          print('EXPLICITLY_ASSOCIATED_GROUPS='+str(len(associated_ids)))
+          auto_count=0
           for group in internal:
-              request_body=json.dumps({'data':[{'type':'builds','id':apple_build_id}]})
+              attrs=group.get('attributes') or {}
+              auto=bool(attrs.get('hasAccessToAllBuilds'))
+              in_build=str(group['id']) in associated_ids
+              print('INTERNAL_GROUP_STATUS id='+str(group['id'])+' access_all='+str(auto)+' explicit='+str(in_build))
+              if auto or in_build:
+                  auto_count+=1
+                  continue
               try:
-                  client.request('POST',f"/betaGroups/{group['id']}/relationships/builds",data=request_body)
-                  print('TESTFLIGHT_INTERNAL_GROUP_ASSIGNED id='+str(group['id']))
+                  client.request('POST',f"/betaGroups/{group['id']}/relationships/builds",data=json.dumps({'data':[{'type':'builds','id':apple_build_id}]}))
+                  print('GROUP_ADDED id='+str(group['id']))
+                  auto_count+=1
               except Exception as exc:
-                  message=str(exc).lower()
-                  if any(x in message for x in ('already exists','already associated','duplicate','409')):
-                      print('TESTFLIGHT_INTERNAL_GROUP_ALREADY_ASSIGNED id='+str(group['id']))
-                  else:
-                      raise
-          print('TESTFLIGHT_BUILD_READY version='+release.version_name+' build='+str(release.build_number)+' source='+release.source_commit+' apple_build='+apple_build_id+' internal_groups='+str(len(internal)))
+                  print('GROUP_NOT_ASSIGNED id='+str(group['id'])+' error='+str(exc)[:300].replace('\n',' '))
+          assert auto_count>0,'No eligible internal tester group is linked to this build.'
+          print('TESTFLIGHT_BUILD_READY version='+release.version_name+' build='+str(release.build_number)+' apple_build='+apple_build_id+' eligible_internal_groups='+str(auto_count))
+
           PY

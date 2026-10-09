@@ -1,0 +1,87 @@
+name: A+ Solution iOS 1.0.27 Build 62 TestFlight Finalize
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-testflight-finalize-20261009.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aplus-solution-testflight-1027-62-finalize
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SOURCE_COMMIT: '44a2336df05e1b4f1556a69589f5549cb04b01b2'
+    steps:
+      - name: Restore Publisher web service if it is not running
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && if docker compose exec -T web true >/dev/null 2>&1; then echo PUBLISHER_WEB_ALREADY_RUNNING; else docker compose up -d web; fi && for n in 1 2 3 4 5 6 7 8 9 10; do if docker compose exec -T web python manage.py check >/dev/null 2>&1; then echo PUBLISHER_WEB_HEALTHY; exit 0; fi; sleep 5; done; echo PUBLISHER_WEB_UNAVAILABLE >&2; exit 1"
+
+      - name: Confirm processed Apple build and add to internal TestFlight group
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import json,os
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.publisher.models import MobileApp,Release,Job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          release=Release.objects.get(app=app,version_name='1.0.27',build_number=62)
+          assert release.source_commit==os.environ['SOURCE_COMMIT'],'Wrong source: refusing to distribute'
+          assert not release.auto_submit,'Public submission not allowed'
+          build=release.builds.get(platform='ios')
+          assert build.status=='succeeded' and bool(build.artifact),'Signed iOS IPA missing'
+          client=AppleStoreClient(app.apple_account)
+          apple_app=client.find_app(app.bundle_id)
+          records=client.list_builds(apple_app['id'],build_number=62,limit=100)
+          valid=[item for item in records if (item.get('attributes') or {}).get('processingState')=='VALID']
+          if build.external_build_id:
+              matches=[item for item in valid if str(item['id'])==str(build.external_build_id)]
+          else:
+              matches=valid
+          assert len(matches)==1,'No unique VALID Apple build for this source and build number'
+          apple_build_id=str(matches[0]['id'])
+          if not build.external_build_id:
+              build.external_build_id=apple_build_id
+              build.save(update_fields=['external_build_id','updated_at'])
+              print('RESTORED_APPLE_BUILD_ID_FROM_VALIDATED_APPLE_API')
+          print('APPLE_VALIDATED version='+release.version_name+' build='+str(release.build_number)+' apple_build='+apple_build_id)
+          groups=client.request('GET',f"/apps/{apple_app['id']}/betaGroups?limit=200").get('data',[])
+          internal=[group for group in groups if (group.get('attributes') or {}).get('isInternalGroup')]
+          if not internal:
+              print('NO_INTERNAL_TESTFLIGHT_GROUP')
+              raise RuntimeError('No internal TestFlight group exists: add an internal group and testers in App Store Connect')
+          for group in internal:
+              request_body=json.dumps({'data':[{'type':'builds','id':apple_build_id}]})
+              try:
+                  client.request('POST',f"/betaGroups/{group['id']}/relationships/builds",data=request_body)
+                  print('TESTFLIGHT_INTERNAL_GROUP_ASSIGNED id='+str(group['id']))
+              except Exception as exc:
+                  message=str(exc).lower()
+                  if any(x in message for x in ('already exists','already associated','duplicate','409')):
+                      print('TESTFLIGHT_INTERNAL_GROUP_ALREADY_ASSIGNED id='+str(group['id']))
+                  else:
+                      raise
+          print('TESTFLIGHT_BUILD_READY version='+release.version_name+' build='+str(release.build_number)+' source='+release.source_commit+' apple_build='+apple_build_id+' internal_groups='+str(len(internal)))
+          PY

@@ -115,30 +115,71 @@ jobs:
           [ -n "$OPENAI_COMPLIANCE_MODEL" ] && printf 'OPENAI_COMPLIANCE_MODEL=%s\n' "$OPENAI_COMPLIANCE_MODEL" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$SENTRY_DSN" ] && printf 'SENTRY_DSN=%s\n' "$SENTRY_DSN" >> /tmp/aplus-publisher-overrides.env || true
           [ -n "$PUBLISHER_AUTOMATION_TOKEN" ] && printf 'PUBLISHER_AUTOMATION_TOKEN=%s\n' "$PUBLISHER_AUTOMATION_TOKEN" >> /tmp/aplus-publisher-overrides.env || true
-      - name: Deploy over SSH and verify public HTTPS
+      - name: Check SSH key setup
+        id: ssh_setup
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SSH_PRIVATE_KEY is not configured yet; publisher deployment will be skipped."
+          fi
+      - name: Deploy over SSH key and verify public HTTPS
         id: production
+        if: steps.ssh_setup.outputs.ready == 'true'
         continue-on-error: true
         timeout-minutes: 35
         env:
           HOST: ${{ secrets.HOST }}
-          PASS: ${{ secrets.PASS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
         run: |
-          set -o pipefail
+          set -euo pipefail
           {
-            test -n "$HOST" && test -n "$PASS"
+            test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
             PORT="${SSH_PORT:-22}"
-            sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
-            sshpass -p "$PASS" scp -P "$PORT" -o StrictHostKeyChecking=no /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
-            sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" 'chmod +x /tmp/deploy.sh && /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
-            echo "Verifying the public DNS, TLS certificate and reverse proxy..."
+            umask 077
+            KEY_FILE="$RUNNER_TEMP/aplus-publisher-ssh-key"
+            printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+
+            if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+              eval "$(ssh-agent -s)" > /dev/null
+              ASKPASS_FILE="$RUNNER_TEMP/aplus-publisher-askpass"
+              printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+              chmod 700 "$ASKPASS_FILE"
+              DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+                setsid ssh-add "$KEY_FILE" < /dev/null
+            fi
+
+            install -d -m 700 "$HOME/.ssh"
+            ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts"
+            test -s "$HOME/.ssh/known_hosts"
+            chmod 600 "$HOME/.ssh/known_hosts"
+            if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+              ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+            else
+              echo "::warning::SSH host key was accepted on first use; set SSH_HOST_FINGERPRINT to pin the server identity."
+            fi
+
+            SSH_ARGS=(-i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+            chmod 600 /tmp/aplus-publisher-overrides.env
+            scp "${SSH_ARGS[@]}" -P "$PORT" \
+              /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
+            ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" \
+              'umask 077; chmod 700 /tmp/deploy.sh; chmod 600 /tmp/aplus-publisher-overrides.env; trap "rm -f /tmp/aplus-publisher-overrides.env /tmp/aplus-publisher.tar.gz /tmp/deploy.sh" EXIT; /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
+            echo "Verifying public DNS, TLS certificate and reverse proxy..."
             curl --fail --silent --show-error \
               --retry 12 --retry-all-errors --retry-delay 10 \
               --connect-timeout 10 --max-time 20 \
               https://publisher.smarbiz.sbs/healthz/
           } 2>&1 | tee /tmp/deploy-ci.log
       - name: Report production result
-        if: always()
+        if: steps.production.outcome != 'skipped'
         uses: actions/github-script@v7
         with:
           script: |

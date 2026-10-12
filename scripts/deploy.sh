@@ -77,13 +77,10 @@ if [ -f "$OVERRIDES" ]; then
 fi
 chmod 600 .env
 
-# A failed first installation may leave partially-created PostgreSQL objects. There
-# is no user data before this marker exists, so reset all first-boot volumes once.
-# The marker is preserved across releases and makes this branch permanently inert
-# after the first successful health check.
+# First-boot is never allowed to delete volumes: this server may hold recovered data.
+# Resetting data requires a separately approved maintenance operation.
 if [ ! -f "$BOOTSTRAP_MARKER" ]; then
-  echo "Preparing a clean first-install database..."
-  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  echo "Initial install detected; preserving any existing Docker volumes."
 fi
 
 docker compose build --pull
@@ -104,10 +101,7 @@ print("Configured administrator authentication verified.")
     else
       echo "Administrator secrets are not both configured; login verification skipped."
     fi
-    echo "Registering SchichtPro release configuration..."
-    docker compose exec -T web python manage.py bootstrap_schichtpro
-    docker compose exec -T web python manage.py provision_schichtpro_push
-    docker compose exec -T web python manage.py bootstrap_schichtpro --queue --force-ios
+    echo "Publisher is healthy; release jobs must be queued explicitly after store credentials are validated."
     touch "$BOOTSTRAP_MARKER"
     chmod 600 "$BOOTSTRAP_MARKER"
     echo "A+ Publisher is healthy."

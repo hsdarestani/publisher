@@ -89,21 +89,105 @@ jobs:
           for app in apps:
               if app.apple_account_id != account.id or not app.apple_app_id:
                   raise RuntimeError('App Store links missing for '+app.slug)
+          from dateutil.parser import isoparse
+          from django.utils import timezone
           existing_profiles=client.request('GET','/profiles?limit=200').get('data',[])
-          existing_names={((p.get('attributes') or {}).get('name')) for p in existing_profiles}
-          for app in apps:
-              desired_name=f'A+ Publisher {app.bundle_id} App Store'
-              if not IOSProvisioningProfile.objects.filter(app=app).exists() and desired_name in existing_names:
-                  raise RuntimeError('An Apple profile with the Publisher target name already exists but has no matching local private record: '+app.slug)
-          print('IOS_CERTIFICATE_PREFLIGHT_OK=1; existing certificate validated and no new certificate will be issued.')
+          def find_and_adopt(app, bundle_resource_id, target_name):
+              for candidate in existing_profiles:
+                  attrs=candidate.get('attributes') or {}
+                  if attrs.get('name')!=target_name or attrs.get('profileType')!='IOS_APP_STORE' or attrs.get('profileState')!='ACTIVE':
+                      continue
+                  pid=candidate.get('id')
+                  try:
+                      detail=client.request('GET',f'/profiles/{pid}?include=bundleId,certificates').get('data') or {}
+                  except Exception:
+                      continue
+                  rel=detail.get('relationships') or {}
+                  bundle=(rel.get('bundleId') or {}).get('data') or {}
+                  certificates=(rel.get('certificates') or {}).get('data') or []
+                  attrs2=detail.get('attributes') or {}
+                  if str(bundle.get('id'))!=str(bundle_resource_id):
+                      continue
+                  if not any(str(c.get('id'))==str(cert.apple_certificate_id) for c in certificates):
+                      continue
+                  payload=attrs2.get('profileContent') or ''
+                  if not payload:
+                      continue
+                  expires=isoparse(attrs2['expirationDate']) if attrs2.get('expirationDate') else None
+                  record=IOSProvisioningProfile(
+                      app=app,distribution_credential=cert,
+                      apple_profile_id=pid,
+                      profile_name=attrs2.get('name') or target_name,
+                      profile_uuid=attrs2.get('uuid',''),
+                      expires_at=expires)
+                  record.set_credentials({
+                      'profile_content_base64':payload,
+                      'profile_type':'IOS_APP_STORE',
+                      'recovered_at':timezone.now().isoformat()})
+                  record.save()
+                  return record
+              return None
+          def make_profile(app, bundle_resource_id, name):
+              body={'data':{
+                  'type':'profiles',
+                  'attributes':{'name':name,'profileType':'IOS_APP_STORE'},
+                  'relationships':{
+                      'bundleId':{'data':{'type':'bundleIds','id':bundle_resource_id}},
+                      'certificates':{'data':[{'type':'certificates','id':cert.apple_certificate_id}]},
+                  },
+              }}
+              item=client.request('POST','/profiles',data=json.dumps(body))['data']
+              attrs=item.get('attributes') or {}
+              content=attrs.get('profileContent') or ''
+              if not content:
+                  raise RuntimeError('Apple generated profile without downloadable content: '+app.slug)
+              expires=isoparse(attrs['expirationDate']) if attrs.get('expirationDate') else None
+              result=IOSProvisioningProfile(
+                  app=app,distribution_credential=cert,
+                  apple_profile_id=item['id'],
+                  profile_name=attrs.get('name') or name,
+                  profile_uuid=attrs.get('uuid',''),
+                  expires_at=expires)
+              result.set_credentials({
+                  'profile_content_base64':content,
+                  'profile_type':'IOS_APP_STORE',
+                  'created_at':timezone.now().isoformat()})
+              result.save()
+              return result
+          print('IOS_CERTIFICATE_PREFLIGHT_OK=1; validated existing matching Distribution certificate; not creating a new one.')
           results={}
           for app in apps:
-              existed=IOSProvisioningProfile.objects.filter(app=app).exists()
-              profile=ensure_ios_signing(app)
-              info=profile.get_credentials()
-              if not info.get('profile_content_base64'):
-                  raise RuntimeError('Profile content missing for '+app.slug)
-              results[app.slug]={'profile_ready':True,'created_on_this_run':not existed,'apple_profile_id':profile.apple_profile_id,'profile_uuid':profile.profile_uuid,'expires':profile.expires_at.isoformat() if profile.expires_at else None}
+              existing=IOSProvisioningProfile.objects.filter(app=app).first()
+              action='already_present'
+              if existing:
+                  profile=existing
+              else:
+                  bundles=client.request('GET',f'/bundleIds?filter[identifier]={app.bundle_id}&limit=10').get('data',[])
+                  bundle=next((b for b in bundles if (b.get('attributes') or {}).get('identifier')==app.bundle_id),None)
+                  if not bundle:
+                      raise RuntimeError('Bundle ID not found in Apple Developer: '+app.slug)
+                  base_name=f'A+ Publisher {app.bundle_id} App Store'
+                  profile=find_and_adopt(app,bundle['id'],base_name)
+                  if profile:
+                      action='recovered_existing'
+                  else:
+                      recovery_name=f'A+ Publisher {app.bundle_id} STRATO Recovery 20261012'
+                      profile=find_and_adopt(app,bundle['id'],recovery_name)
+                      if profile:
+                          action='recovered_strato'
+                      else:
+                          if any((p.get('attributes') or {}).get('name')==recovery_name for p in existing_profiles):
+                              raise RuntimeError('STRATO profile name already exists but cannot be safely adopted for '+app.slug)
+                          profile=make_profile(app,bundle['id'],recovery_name)
+                          action='created_new_profile_using_existing_certificate'
+              if profile.distribution_credential_id!=cert.pk or not profile.get_credentials().get('profile_content_base64'):
+                  raise RuntimeError('Profile signing material not ready for '+app.slug)
+              results[app.slug]={
+                  'profile_ready':True,
+                  'action':action,
+                  'apple_profile_id':profile.apple_profile_id,
+                  'profile_uuid':profile.profile_uuid,
+                  'expires':profile.expires_at.isoformat() if profile.expires_at else None}
           print('IOS_SIGNING_PROFILES_RESULT='+json.dumps(results,sort_keys=True))
           PY
           REMOTE

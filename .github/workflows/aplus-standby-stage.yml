@@ -1,0 +1,99 @@
+name: Stage isolated A+ Solution standby directory on Publisher STRATO
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-stage.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Install isolated, stopped PostgreSQL standby compose and SSH identity
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/publisher-standby-stage-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/publisher-ssh-askpass"
+            chmod 700 "$RUNNER_TEMP/publisher-ssh-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/publisher-ssh-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -p "$PORT" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          test ! -e /opt/aplussolution-standby/compose.yaml
+          install -d -m 700 /opt/aplussolution-standby
+          install -d -m 700 /root/.ssh
+          if [ ! -f /root/.ssh/aplus_standby_to_primary ]; then
+            ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/aplus_standby_to_primary -C 'aplus-standby-82.165.187.14'
+          fi
+          chmod 600 /root/.ssh/aplus_standby_to_primary
+          cat >/opt/aplussolution-standby/compose.yaml <<'YAML'
+          name: aplussolution-standby
+          services:
+            db:
+              image: postgres:16-alpine
+              entrypoint:
+                - /bin/sh
+                - -ec
+                - |
+                  test -f /var/lib/postgresql/data/standby.signal || {
+                    echo 'Refusing PostgreSQL boot without standby.signal' >&2
+                    exit 1
+                  }
+                  exec docker-entrypoint.sh postgres
+              restart: unless-stopped
+              mem_limit: 768m
+              cpus: "0.60"
+              shm_size: 128m
+              environment:
+                POSTGRES_DB: aplussolution
+                POSTGRES_USER: aplussolution
+              volumes:
+                - pg_data:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U aplussolution -d aplussolution"]
+                interval: 20s
+                timeout: 5s
+                retries: 6
+          volumes:
+            pg_data:
+              name: aplus_solution_standby_pgdata
+          YAML
+          chmod 600 /opt/aplussolution-standby/compose.yaml
+          cd /opt/aplussolution-standby
+          docker compose config --quiet
+          echo "STANDBY_FILES_STAGED_NOT_STARTED"
+          echo "STANDBY_SSH_PUBLIC_KEY_BEGIN"
+          cat /root/.ssh/aplus_standby_to_primary.pub
+          echo "STANDBY_SSH_PUBLIC_KEY_END"
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_STILL_HEALTHY
+          REMOTE

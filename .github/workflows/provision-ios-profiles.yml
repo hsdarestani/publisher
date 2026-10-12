@@ -1,0 +1,109 @@
+name: Restore iOS signing profiles on STRATO
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/provision-ios-profiles.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Validate stored Apple Distribution private key and provision iOS profiles
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/publisher-apple-link-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS_FILE="$RUNNER_TEMP/publisher-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+            chmod 700 "$ASKPASS_FILE"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+              setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json, base64
+          from datetime import datetime, timezone as dt_timezone
+          from cryptography import x509
+          from cryptography.hazmat.primitives import serialization
+          from apps.publisher.models import MobileApp, StoreAccount
+          from apps.signing.models import IOSDistributionCredential, IOSProvisioningProfile
+          from apps.signing.services import ensure_ios_signing
+          from apps.integrations.apple_store import AppleStoreClient
+          account=StoreAccount.objects.get(provider='apple',name='apple',enabled=True,status='connected')
+          if not account.configured:
+              raise RuntimeError('Apple API credentials missing in Publisher database')
+          cert=IOSDistributionCredential.objects.filter(store_account=account).first()
+          if not cert:
+              raise RuntimeError('No Publisher-managed Distribution certificate found. Refusing to create a new certificate automatically.')
+          creds=cert.get_credentials()
+          private=creds.get('private_key_pem','')
+          der=creds.get('certificate_content_base64','')
+          if not private or not der:
+              raise RuntimeError('The stored Distribution certificate lacks its matching private key or certificate content')
+          private_key=serialization.load_pem_private_key(private.encode('utf-8'),password=None)
+          certificate=x509.load_der_x509_certificate(base64.b64decode(der))
+          if private_key.public_key().public_numbers()!=certificate.public_key().public_numbers():
+              raise RuntimeError('Saved Distribution private key does not match certificate')
+          now=datetime.now(dt_timezone.utc)
+          if certificate.not_valid_after_utc <= now:
+              raise RuntimeError('Distribution certificate expired')
+          client=AppleStoreClient(account)
+          apple_certs=client.request('GET','/certificates?limit=200').get('data',[])
+          matches=[item for item in apple_certs if item.get('id')==cert.apple_certificate_id]
+          if len(matches)!=1:
+              raise RuntimeError('Publisher Distribution certificate no longer exists in Apple Developer account')
+          if (matches[0].get('attributes') or {}).get('certificateType')!='DISTRIBUTION':
+              raise RuntimeError('The saved Apple certificate is not a Distribution certificate')
+          apps=[MobileApp.objects.get(slug=slug) for slug in ('a-plus-solution','a-esthetic')]
+          for app in apps:
+              if app.apple_account_id != account.id or not app.apple_app_id:
+                  raise RuntimeError('App Store links missing for '+app.slug)
+          existing_profiles=client.request('GET','/profiles?limit=200').get('data',[])
+          existing_names={((p.get('attributes') or {}).get('name')) for p in existing_profiles}
+          for app in apps:
+              desired_name=f'A+ Publisher {app.bundle_id} App Store'
+              if not IOSProvisioningProfile.objects.filter(app=app).exists() and desired_name in existing_names:
+                  raise RuntimeError('An Apple profile with the Publisher target name already exists but has no matching local private record: '+app.slug)
+          print('IOS_CERTIFICATE_PREFLIGHT_OK=1; existing certificate validated and no new certificate will be issued.')
+          results={}
+          for app in apps:
+              existed=IOSProvisioningProfile.objects.filter(app=app).exists()
+              profile=ensure_ios_signing(app)
+              info=profile.get_credentials()
+              if not info.get('profile_content_base64'):
+                  raise RuntimeError('Profile content missing for '+app.slug)
+              results[app.slug]={'profile_ready':True,'created_on_this_run':not existed,'apple_profile_id':profile.apple_profile_id,'profile_uuid':profile.profile_uuid,'expires':profile.expires_at.isoformat() if profile.expires_at else None}
+          print('IOS_SIGNING_PROFILES_RESULT='+json.dumps(results,sort_keys=True))
+          PY
+          REMOTE

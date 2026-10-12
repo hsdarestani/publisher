@@ -1,0 +1,88 @@
+name: A+ Solution Apple 63 Review Error Diagnostic
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-apple63-diagnostic-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-solution-apple-review-63
+  cancel-in-progress: false
+jobs:
+  apple-review:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - name: Verify live Apple Build 63 and submit review from Publisher
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-apple-review-63-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/aplus-apple-review-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,re
+          from apps.publisher.models import Release,Job,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          r=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          a=r.app; c=AppleStoreClient(a.apple_account)
+          jobs={}
+          for typ in ('submit_apple','upload_apple','submit_google'):
+              j=Job.objects.filter(release=r,type=typ).order_by('-created_at').first()
+              if j: jobs[typ]={'id':j.id,'status':j.status,'error':str(j.error or '')[:2800],'result_keys':list((j.result or {}).keys())}
+          aa=c.find_app(a.bundle_id)
+          vv=[v for v in c.list_versions(aa['id'],limit=100) if (v.get('attributes') or {}).get('versionString') in ('1.0.26','1.0.27')]
+          versions=[{'id':v['id'],'version':v['attributes'].get('versionString'),'state':v['attributes'].get('appStoreState'),'copyright':bool(v['attributes'].get('copyright'))} for v in vv]
+          subs={}
+          for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES'):
+              try:
+                  subs[state]=[{'id':s['id'],'state':(s.get('attributes') or {}).get('state')} for s in c.list_review_submissions(aa['id'],state)]
+              except Exception as ex: subs[state]='error '+type(ex).__name__
+          ver=next((v for v in vv if (v.get('attributes') or {}).get('versionString')=='1.0.27'),None)
+          metadata={}
+          if ver:
+              try:
+                  loc=c.request('GET',f"/appStoreVersions/{ver['id']}/appStoreVersionLocalizations?limit=200").get('data',[])
+                  metadata['localizations']=[{'locale':(x.get('attributes') or {}).get('locale'),'whatsNew':bool((x.get('attributes') or {}).get('whatsNew'),'description':bool((x.get('attributes') or {}).get('description'),'keywords':bool((x.get('attributes') or {}).get('keywords'))} for x in loc]
+                  metadata['screenshots']={}
+                  for l in loc:
+                      sets=c.request('GET',f"/appStoreVersionLocalizations/{l['id']}/appScreenshotSets?limit=200").get('data',[])
+                      metadata['screenshots'][(l.get('attributes') or {}).get('locale','?')]=[{'display':(x.get('attributes') or {}).get('screenshotDisplayType'),'id':x['id']} for x in sets]
+              except Exception as ex: metadata['localizations_error']=type(ex).__name__+str(ex)[:300]
+              try:
+                  det=c.request('GET',f"/appStoreVersions/{ver['id']}/appStoreReviewDetail").get('data') or {}
+                  attrs=det.get('attributes') or {}
+                  metadata['review_details']={'contact_fields_present':{k:bool(attrs.get(k)) for k in ('contactFirstName','contactLastName','contactPhone','contactEmail')},'demo_account_present':bool(attrs.get('demoAccountName') and attrs.get('demoAccountPassword')),'notes_present':bool(attrs.get('notes'))}
+              except Exception as ex: metadata['review_details_error']=type(ex).__name__+str(ex)[:300]
+          info={'jobs':jobs,'versions':versions,'submissions':subs,'metadata':metadata,'build_external_id':bool(r.builds.get(platform='ios').external_build_id),'publisher_assets':a.assets.count(),'localization_count':a.localizations.count()}
+          print('APPLE63_DIAGNOSTIC='+json.dumps(info,default=str,separators=(',',':')))
+          PY
+          REMOTE

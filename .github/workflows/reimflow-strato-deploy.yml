@@ -187,6 +187,14 @@ jobs:
           CADDY
           fi
           cd /opt/aplus-publisher
+          # Publisher deployment rewrites the host Caddyfile. The existing container may
+          # still bind-mount the deleted inode and serve the old Publisher-only config.
+          if ! docker compose exec -T caddy grep -qF 'reimflow.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null; then
+            echo "Recreating only the Caddy proxy to refresh the stale file bind mount."
+            docker compose up -d --no-deps --force-recreate caddy
+          fi
+          CADDY_ID="$(docker compose ps -q caddy)"
+          docker compose exec -T caddy grep -qF 'reimflow.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null
           docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
           docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
           docker exec "$CADDY_ID" wget -qO- http://reimflow-web/ | grep -q Reimflow

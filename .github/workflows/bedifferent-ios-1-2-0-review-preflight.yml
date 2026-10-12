@@ -1,0 +1,117 @@
+name: Verify BE DIFFERENT iOS 1.2.0 release readiness
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/bedifferent-ios-1-2-0-review-preflight.yml"]
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Read iOS upload and current Apple review state
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-audit-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-ios-audit-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          a=MobileApp.objects.get(slug='be-different')
+          q=Release.objects.filter(app=a,version_name='1.2.0',build_number=10).order_by('-id')
+          rows=[]
+          for release in q:
+              rows.append({
+                  'release_id':release.pk,'status':release.status,
+                  'auto_submit':release.auto_submit,
+                  'ios_builds':[{
+                      'id':b.pk,'status':b.status,'external_build_id':b.external_build_id,
+                      'artifact_present':bool(b.artifact)
+                  } for b in release.builds.filter(platform='ios')],
+                  'ios_jobs':[{
+                      'id':j.pk,'type':j.type,'status':j.status,
+                      'error_tail':(j.error or '')[-400:]
+                  } for j in Job.objects.filter(release=release,type__in=['build_ios','upload_apple','submit_apple']).order_by('id')],
+                  'ios_submissions':[{
+                      'id':s.pk,'state':s.state,'external_id':s.external_id,
+                      'last_error_tail':(s.last_error or '')[-400:]
+                  } for s in Submission.objects.filter(release=release,platform='ios')],
+              })
+          print('BD_RELEASES='+json.dumps(rows,sort_keys=True))
+          print('BD_REVIEW_SETTINGS='+json.dumps({
+              'username_present':bool(a.review_username),
+              'password_present':bool(a.get_review_password()),
+              'requires_login':a.requires_login,
+              'notes_present':bool(a.review_notes)
+          }))
+          c=AppleStoreClient(a.apple_account)
+          record=c.find_app(a.bundle_id)
+          print('APPLE_APP_ID='+str(record['id']))
+          versions=c.list_versions(record['id'],limit=60)
+          relevant=[v for v in versions if (v.get('attributes') or {}).get('versionString') in ['1.1.0','1.2.0']]
+          print('APPLE_VERSIONS='+json.dumps([
+              {'id':v['id'],'version':v.get('attributes',{}).get('versionString'),
+               'state':v.get('attributes',{}).get('appStoreState')}
+              for v in relevant],sort_keys=True))
+          for v in relevant:
+              try:
+                  detail=c.request('GET',f"/appStoreVersions/{v['id']}/appStoreReviewDetail").get('data')
+                  attrs=detail.get('attributes',{}) if detail else {}
+                  print('APPLE_REVIEW_DETAILS='+json.dumps({
+                      'version':v.get('attributes',{}).get('versionString'),
+                      'user_matches_known':attrs.get('demoAccountName','').lower()=='appreview@bedifferent.smarbiz.sbs',
+                      'password_present':bool(attrs.get('demoAccountPassword')),
+                      'notes_present':bool(attrs.get('notes'))
+                  }))
+              except Exception as exc:
+                  print('APPLE_REVIEW_DETAIL_ERROR='+json.dumps({
+                      'version':v.get('attributes',{}).get('versionString'),
+                      'error_type':type(exc).__name__,'error_short':str(exc)[:280]
+                  }))
+          for state in ['WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES','READY_FOR_REVIEW']:
+              try:
+                  subs=c.list_review_submissions(record['id'],state)
+                  out=[]
+                  for sub in subs[:15]:
+                      items=c.list_review_submission_items(sub['id'])
+                      out.append({
+                          'id':sub['id'],'state':sub.get('attributes',{}).get('state'),
+                          'versions':[i.get('relationships',{}).get('appStoreVersion',{}).get('data',{}).get('id') for i in items],
+                          'item_states':[i.get('attributes',{}).get('state') for i in items],
+                      })
+                  print('APPLE_REVIEW_SUBMISSIONS='+json.dumps({'state':state,'records':out}))
+              except Exception as exc:
+                  print('APPLE_REVIEW_SUBMISSIONS_ERROR='+json.dumps({'state':state,'type':type(exc).__name__,'msg':str(exc)[:180]}))
+          PY
+          REMOTE

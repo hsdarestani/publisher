@@ -1,0 +1,85 @@
+name: Confirm both A+ Google upload key requests match Publisher
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-two-upload-keys-ready-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Read live Apple and Google state and Publisher submission jobs
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/audit-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/audit-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import base64, json, subprocess, tempfile
+          from pathlib import Path
+          from cryptography import x509
+          from cryptography.hazmat.primitives import hashes
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.signing.models import AndroidSigningCredential
+          from apps.integrations.google_play import GooglePlayClient
+          expected={'a-plus-solution':'8D:9B:9D:F1:4D:34:B3:73:CA:79:1F:4E:8F:F0:F1:33:74:D2:95:AD','a-esthetic':'4C:F0:B8:BC:7B:2C:C7:0B:37:C9:0E:76:C6:49:1E:A1:CE:DD:08:09'}
+          all_results={}
+          for slug, sha1 in expected.items():
+              app=MobileApp.objects.get(slug=slug)
+              cred=AndroidSigningCredential.objects.get(app=app)
+              info=cred.get_credentials()
+              with tempfile.TemporaryDirectory() as td:
+                  path=Path(td)/'upload.jks'
+                  path.write_bytes(base64.b64decode(info['keystore_base64']))
+                  c=subprocess.run(['keytool','-exportcert','-rfc','-keystore',str(path),'-storepass',info['store_password'],'-alias',info['key_alias']],capture_output=True,text=True,check=True).stdout
+                  cert=x509.load_pem_x509_certificate(c.encode('utf-8'))
+                  observed=':'.join(f'{v:02X}' for v in cert.fingerprint(hashes.SHA1()))
+              recent=[]
+              for release in Release.objects.filter(app=app).order_by('-build_number')[:8]:
+                  bs=list(release.builds.values('platform','status','artifact','external_build_id'))
+                  jobs=[{'type':x.type,'status':x.status,'error':str(x.error or '')[:180]} for x in Job.objects.filter(release=release,type__in=['submit_google','upload_google']).order_by('-id')[:4]]
+                  recent.append({'version':release.version_name,'build_number':release.build_number,'source':release.source_commit,'track':release.android_track,'release_status':release.status,'builds':[{'platform':b['platform'],'status':b['status'],'artifact_ready':bool(b['artifact'])} for b in bs], 'submission_jobs':jobs})
+              result={'package':app.package_name,'sha1_actual':observed,'sha1_google':sha1,'matches_google_email':observed==sha1,'sha256_local':cred.certificate_sha256,'releases':recent}
+              try:
+                  gp=GooglePlayClient(app.google_account)
+                  edit=gp._open_edit(app.package_name)
+                  try:
+                      base=f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}'
+                      tracks=gp._edit_request(edit,'GET',base+'/tracks').get('tracks',[])
+                      result['play_tracks']=[{'track':t.get('track'),'codes':[str(code) for r in t.get('releases',[]) for code in r.get('versionCodes',[])]} for t in tracks]
+                      result['google_api_ready']=True
+                  finally:gp._safe_delete_edit(edit)
+              except Exception as exc:
+                  result['google_api_ready']=False
+                  result['google_api_error']=type(exc).__name__+': '+str(exc)[:250]
+              all_results[slug]=result
+          print('BOTH_UPLOAD_KEYS_AUDIT='+json.dumps(all_results,default=str,separators=(',',':')))
+          PY
+          REMOTE

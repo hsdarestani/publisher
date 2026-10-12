@@ -43,6 +43,8 @@ jobs:
           echo "PUBLISHER_SSH_PORT=$PORT" >> "$GITHUB_ENV"
           if [ -n "$SSH_KEY_PASSPHRASE" ]; then
             eval "$(ssh-agent -s)" >/dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
             ASKPASS="$RUNNER_TEMP/aplus-release-askpass"
             printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
             chmod 700 "$ASKPASS"

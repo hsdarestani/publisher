@@ -48,15 +48,15 @@ jobs:
           cd /opt/aplus-publisher
           echo '=== Publisher containers before recovery ==='
           docker compose ps --format json | python3 -c 'import json,sys; print("\n".join(str(x.get("Service"))+"="+str(x.get("State")) for s in sys.stdin if s.strip() for x in [json.loads(s)]))'
-          if ! docker compose exec -T web python manage.py check >/dev/null 2>&1; then
+          if ! docker compose exec -T web python manage.py check </dev/null >/dev/null 2>&1; then
             echo 'Publisher web not responding; starting the existing web service.'
             docker compose up -d web
           fi
           for attempt in $(seq 1 20); do
-            if docker compose exec -T web python manage.py check >/dev/null 2>&1; then break; fi
+            if docker compose exec -T web python manage.py check </dev/null >/dev/null 2>&1; then break; fi
             sleep 3
           done
-          docker compose exec -T web python manage.py check >/dev/null
+          docker compose exec -T web python manage.py check </dev/null >/dev/null
           docker compose exec -T web python manage.py shell <<'PY'
           from django.utils import timezone
           from apps.publisher.models import Release,Job,BuildAgent

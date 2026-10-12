@@ -1,0 +1,137 @@
+name: Restore Apple links for existing Publisher apps
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/restore-apple-app-links.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Verify existing Apple credentials and safely link matching apps
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/publisher-apple-link-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS_FILE="$RUNNER_TEMP/publisher-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+            chmod 700 "$ASKPASS_FILE"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+              setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from django.utils import timezone
+          from apps.publisher.models import MobileApp, StoreAccount, Release, Job, Submission
+          from apps.signing.models import AndroidSigningCredential, IOSDistributionCredential, IOSProvisioningProfile
+          from apps.integrations.apple_store import AppleStoreClient
+
+          accounts=[a for a in StoreAccount.objects.filter(provider='apple',enabled=True) if a.configured]
+          if len(accounts) != 1:
+              raise RuntimeError(f'Expected one configured Apple account, found {len(accounts)}')
+          account=accounts[0]
+          client=AppleStoreClient(account)
+          ping=client.test()
+          if not ping.ok:
+              raise RuntimeError('Apple App Store Connect API validation failed. Account left unchanged.')
+          details={}
+          matches=[]
+          for slug in ('a-plus-solution','a-esthetic'):
+              app=MobileApp.objects.get(slug=slug)
+              found=client.find_app(app.bundle_id)
+              apple_app_id=str(found['id'])
+              if not apple_app_id:
+                  raise RuntimeError(f'No Apple App Store ID for {slug}')
+              matches.append((app,apple_app_id))
+              latest_version=None
+              latest_build=None
+              versions_state=[]
+              bundle_capability='unknown'
+              try:
+                  versions=client.list_versions(apple_app_id,limit=50)
+                  versions_state=[{
+                      'version': (v.get('attributes') or {}).get('versionString'),
+                      'state': (v.get('attributes') or {}).get('appStoreState') or (v.get('attributes') or {}).get('appVersionState'),
+                  } for v in versions]
+                  if versions_state: latest_version=versions_state[0]['version']
+              except Exception as ex:
+                  versions_state=[{'query_error':type(ex).__name__}]
+              try:
+                  builds=client.list_builds(apple_app_id,limit=1)
+                  if builds: latest_build=(builds[0].get('attributes') or {}).get('version')
+              except Exception:
+                  pass
+              try:
+                  bundles=client.request('GET',f'/bundleIds?filter[identifier]={app.bundle_id}&limit=2').get('data',[])
+                  bundle_capability='found' if bundles else 'missing'
+              except Exception as ex:
+                  bundle_capability='query_unavailable_'+type(ex).__name__
+              android=AndroidSigningCredential.objects.filter(app=app).first()
+              details[slug]={
+                  'bundle_id':app.bundle_id,
+                  'apple_app_found':True,
+                  'apple_app_id':apple_app_id,
+                  'stored_version_count':len(versions_state),
+                  'listed_versions':versions_state[:6],
+                  'latest_build_number':latest_build,
+                  'developer_bundle_id':bundle_capability,
+                  'ios_profile_stored':IOSProvisioningProfile.objects.filter(app=app).exists(),
+                  'android_signing_stored':bool(android),
+                  'android_stored_upload_sha256':(android.certificate_sha256 if android else ''),
+                  'android_signing_generated_here':(android.generated_automatically if android else None),
+                  'draft_release_count':Release.objects.filter(app=app,status='draft').count()
+              }
+          for app,apple_app_id in matches:
+              app.apple_account=account
+              app.apple_app_id=apple_app_id
+              app.save(update_fields=['apple_account','apple_app_id','updated_at'])
+          signing=IOSDistributionCredential.objects.filter(store_account=account).first()
+          account.status='connected'
+          account.last_tested_at=timezone.now()
+          account.last_error=''
+          account.save(update_fields=['status','last_tested_at','last_error','updated_at'])
+          print('APPLE_LINK_RESULT='+json.dumps({
+              'connected':True,
+              'account_name':account.name,
+              'team_id_present':bool(account.apple_team_id),
+              'ios_distribution_cert_record':bool(signing),
+              'apps':details,
+              'current_submission_count':Submission.objects.count(),
+              'queued_or_running_submissions':Job.objects.filter(type__in=['upload_apple','submit_apple','submit_google','upload_google'],status__in=['queued','running']).count(),
+              'no_signing_cert_created':True,
+              'no_store_submission_sent':True,
+          },sort_keys=True))
+          PY
+          REMOTE

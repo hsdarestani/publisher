@@ -91,8 +91,8 @@ jobs:
           chmod 600 "$REMOTE_FILE"
           cd /opt/aplus-publisher
           trap 'docker compose exec -T web rm -f /tmp/google-play-restore.json >/dev/null 2>&1 || true; rm -f "$REMOTE_FILE"' EXIT
-          docker compose cp "$REMOTE_FILE" web:/tmp/google-play-restore.json >/dev/null
-          docker compose exec -T web chmod 600 /tmp/google-play-restore.json
+          docker compose cp "$REMOTE_FILE" web:/tmp/google-play-restore.json </dev/null >/dev/null
+          docker compose exec -T web chmod 600 /tmp/google-play-restore.json </dev/null
           docker compose exec -T web python manage.py shell <<'PY'
           import json
           from django.utils import timezone
@@ -131,4 +131,5 @@ jobs:
           account.save(update_fields=['status','last_tested_at','updated_at'])
           print(json.dumps({'google_api_checks':results,'account_status':account.status},indent=2))
           PY
+          echo 'GOOGLE_PLAY_RECOVERY_VERIFICATION_COMPLETE'
           REMOTE

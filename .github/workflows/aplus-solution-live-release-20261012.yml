@@ -1,0 +1,149 @@
+name: A+ Solution 1.0.27 live store release
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-live-release-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: aplus-solution-live-release-20261012
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 180
+    env:
+      SOURCE_SHA: '84b3e2d2f624cf0a0e64a14bb470cd5e2ef39e8e'
+      HOST: ${{ secrets.HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+      SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+    steps:
+      - name: Check exact current A+ GitHub source
+        run: |
+          set -euo pipefail
+          SHA="$(curl -fsSL https://api.github.com/repos/hsdarestani/aplussolution/branches/main | python3 -c 'import json,sys;print(json.load(sys.stdin)["commit"]["sha"])')"
+          test "$SHA" = "$SOURCE_SHA" || { echo "A+ source changed: refusing stale release"; exit 1; }
+          echo "A+ Solution source is current: $SHA"
+      - name: Prepare secure SSH key for restored Publisher
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-release.key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          echo "PUBLISHER_KEY_FILE=$KEY" >> "$GITHUB_ENV"
+          echo "PUBLISHER_SSH_PORT=$PORT" >> "$GITHUB_ENV"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/aplus-release-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+      - name: Recheck real stores, configure current source, and queue both signed builds
+        run: |
+          set -euo pipefail
+          ssh -i "$PUBLISHER_KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PUBLISHER_SSH_PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T -e SOURCE_SHA='84b3e2d2f624cf0a0e64a14bb470cd5e2ef39e8e' web python manage.py shell <<'PY'
+          import json, os, re
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.signing.models import AndroidSigningCredential, IOSDistributionCredential, IOSProvisioningProfile
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          assert app.repository_url.rstrip('/')=='https://github.com/hsdarestani/aplussolution'
+          assert app.package_name==app.bundle_id=='de.aplussolution.workforce'
+          assert app.google_account and app.google_account.configured
+          assert app.apple_account and app.apple_account.configured
+          assert AndroidSigningCredential.objects.filter(app=app).exists()
+          assert IOSDistributionCredential.objects.filter(store_account=app.apple_account).exists()
+          assert IOSProvisioningProfile.objects.filter(app=app).exists(), 'Missing valid iOS App Store profile'
+          apple=AppleStoreClient(app.apple_account)
+          aa=apple.find_app(app.bundle_id)
+          versions=apple.list_versions(aa['id'],limit=100)
+          def semver(x):
+              nums=list(map(int,re.findall(r'\d+',str(x))[:3]))
+              return tuple(nums+[0]*(3-len(nums)))
+          assert max((semver((v.get('attributes') or {}).get('versionString')) for v in versions),default=(0,0,0))==(1,0,26), 'Apple versions changed unexpectedly; stop and re-evaluate'
+          apple_builds=apple.list_builds(aa['id'],limit=100)
+          apple_max=max([int((x.get('attributes') or {}).get('version')) for x in apple_builds if str((x.get('attributes') or {}).get('version','')).isdigit()] or [0])
+          gp=GooglePlayClient(app.google_account)
+          ed=gp._open_edit(app.package_name)
+          try:
+              base=f'/applications/{gp._q(app.package_name)}/edits/{ed.edit_id}'
+              tracks=gp._edit_request(ed,'GET',base+'/tracks').get('tracks',[])
+              codes=[int(x) for t in tracks for r in t.get('releases',[]) for x in r.get('versionCodes',[])]
+              bundles=gp._edit_request(ed,'GET',base+'/bundles').get('bundles',[])
+              codes += [int(x['versionCode']) for x in bundles if x.get('versionCode') is not None]
+              google_max=max(codes or [0])
+          finally: gp._safe_delete_edit(ed)
+          db_max=max(Release.objects.filter(app=app).values_list('build_number',flat=True),default=0)
+          assert max(apple_max,google_max,db_max)<63, f'Build 63 already consumed by another release: {apple_max},{google_max},{db_max}'
+          cfg=dict(app.build_config or {})
+          cfg.update(android_command='bash frontend/scripts/build-publisher-android.sh',
+                     android_artifact='frontend/android/app/build/outputs/bundle/release/*.aab',
+                     ios_command='bash frontend/scripts/build-publisher-ios-opaque.sh',
+                     ios_artifact='frontend/ios/build/export/*.ipa')
+          env=dict(cfg.get('env') or {});env['VITE_API_URL']='https://app.aplus-solution.de/api';cfg['env']=env
+          app.build_config=cfg
+          app.requires_login=True
+          app.review_notes='A+ Solution is an internal employee scheduling, work time recording, and document app. No public sign-up. This update prevents unintended screen magnification in employee schedules on iOS and Android.'
+          app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
+          release,_=Release.objects.get_or_create(app=app,version_name='1.0.27',build_number=63)
+          release.source_branch='main'
+          release.source_commit=os.environ['SOURCE_SHA']
+          release.status='building'
+          release.android_track='production'
+          release.android_rollout=1
+          release.ios_release_type='manual'
+          release.auto_submit=False
+          release.release_notes='Stabilere Darstellung auf Mobilgeräten: unbeabsichtigtes Vergrößern im Dienstplan verhindert.'
+          release.save()
+          queued=[]
+          for platform,kind,runner in [('android','build_android','linux'),('ios','build_ios','macos')]:
+              build,_=Build.objects.get_or_create(release=release,platform=platform)
+              active=Job.objects.filter(build=build,type=kind,status__in=['queued','running','claimed','succeeded']).first()
+              if not active:
+                  assert not build.artifact,'Refusing to replace an existing signed artifact'
+                  build.status='queued';build.save(update_fields=['status','updated_at'])
+                  j=enqueue_job(kind,app=app,release=release,build=build,agent=True,platform=runner,payload={'source':'live-release-20261012'})
+                  queued.append([platform,j.id])
+          print('RELEASE_QUEUED='+json.dumps({'id':release.id,'version':release.version_name,'build':release.build_number,'source':release.source_commit,'google_max':google_max,'apple_max':apple_max,'queued':queued,'review_account_present':bool(app.review_username and app.get_review_password()),'store_localizations':app.localizations.count(),'store_assets':app.assets.count()}))
+          PY
+          REMOTE
+      - name: Wake both Publisher cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id,ref:'main'});
+            }
+      - name: Observe signed builds and report actual outcomes
+        run: |
+          set -euo pipefail
+          for index in $(seq 1 285); do
+            STATE="$(ssh -i "$PUBLISHER_KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PUBLISHER_SSH_PORT" root@"$HOST" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Release; r=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63); print('|'.join(p+':'+r.builds.get(platform=p).status+':'+str(bool(r.builds.get(platform=p).artifact)) for p in ('android','ios')))\" " | tail -n 1 | tr -d '\r')"
+            echo "Signed builder progress: $STATE"
+            if [[ "$STATE" == *"failed"* ]]; then echo "At least one signed build failed"; exit 1; fi
+            if [[ "$STATE" == *"android:succeeded:True|ios:succeeded:True"* ]]; then exit 0; fi
+            sleep 20
+          done
+          echo "Timed out waiting for signed AAB + IPA" >&2
+          exit 1

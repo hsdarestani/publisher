@@ -1,0 +1,82 @@
+name: A+ Solution Zoom Lock Publisher HTTPS Queue 2026-10-12
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-zoom-lock-api-queue-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: aplus-zoom-lock-20261012-api-queue
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      APLUS_COMMIT: '934755fe4c8c08ddd50adffb6b893afcfc280c46'
+      PUBLISHER_URL: 'https://publisher.smarbiz.sbs'
+      PUBLISHER_AUTOMATION_TOKEN: ${{ secrets.PUBLISHER_AUTOMATION_TOKEN }}
+    steps:
+      - name: Verify the requested source commit is the current A+ Solution main
+        run: |
+          set -euo pipefail
+          HEAD="$(curl -fsSL --retry 4 https://api.github.com/repos/hsdarestani/aplussolution/branches/main | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["sha"])')"
+          test "$HEAD" = "$APLUS_COMMIT"
+          echo "A+ Solution source commit verified: $HEAD"
+
+      - name: Request signed Android and iOS builds using Publisher HTTPS automation
+        id: queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PUBLISHER_AUTOMATION_TOKEN" || { echo 'Publisher HTTPS automation token is not configured.' >&2; exit 1; }
+          cat > /tmp/aplus-zoom-build-payload.json <<JSON
+          {
+            "app_identifier": "de.aplussolution.workforce",
+            "version_name": "1.0.27",
+            "build_number": 63,
+            "source_branch": "main",
+            "source_commit": "$APLUS_COMMIT",
+            "platforms": ["android", "ios"],
+            "android_track": "internal",
+            "auto_submit": false,
+            "release_notes": "Unbeabsichtigtes Vergrößern im Mitarbeiter Dienstplan und anderen App Ansichten auf iOS und Android verhindert. Scrollen und Wochenwechsel bleiben verwendbar."
+          }
+          JSON
+          CODE="$(curl -sS -o /tmp/publisher-zoom-response.json -w '%{http_code}' --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 5 \
+            -X POST "$PUBLISHER_URL/apps/automation/release/" \
+            -H "Authorization: Bearer $PUBLISHER_AUTOMATION_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/aplus-zoom-build-payload.json)"
+          echo "Publisher queue HTTP status: $CODE"
+          python3 - <<'PY'
+          import json
+          response=json.load(open('/tmp/publisher-zoom-response.json'))
+          print('Publisher queue response:',json.dumps({k:v for k,v in response.items() if k in ('ok','error','detail','release_id','version_name','build_number','queued','skipped','release_url')}, ensure_ascii=False))
+          assert response.get('ok') is True, 'Publisher did not accept the release'
+          platforms=set(x.get('platform') for x in response.get('queued',[])+response.get('skipped',[]))
+          assert platforms=={'ios','android'}, 'Publisher did not queue both platforms'
+          PY
+          test "$CODE" = 200
+
+      - name: Wake secure Publisher Cloud Android and iOS builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml', 'cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner, repo: context.repo.repo,
+                workflow_id, ref: 'main'
+              });
+            }
+
+      - name: Confirm queue accepted
+        run: echo 'Publisher accepted the A+ Solution zoom fix source and queued Android and iOS signed build jobs.'

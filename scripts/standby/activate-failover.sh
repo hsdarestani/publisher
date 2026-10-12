@@ -15,6 +15,8 @@ test -s "$D/recovery/app/frontend/Dockerfile"
 test -s /opt/aplus-publisher/Caddyfile
 test ! -e "$D/failover-active" || { echo 'Already promoted. Refusing second promotion.' >&2; exit 1; }
 test "$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "select pg_is_in_recovery()"' </dev/null | tr -d '[:space:]')" = t
+# Refresh application source from the latest safely transferred package.
+/usr/local/sbin/aplus-standby-prepare
 # Extra guard: if the original STRATO primary still serves requests directly,
 # do not trust a Cloudflare error as proof of a fenced origin.
 ORIGIN_STATUS="$(curl -k -sS --connect-timeout 4 --max-time 9 -o /dev/null -w '%{http_code}' \
@@ -28,7 +30,7 @@ echo "Original-primary direct HTTPS probe did not return 200."
 echo "Operator asserted all production writers and original PostgreSQL were independently fenced."
 # Preserve the last standby state before taking the one-way promotion action.
 /usr/local/sbin/aplus-standby-snapshot-history
-systemctl stop aplus-standby-file-sync.timer || true
+systemctl disable --now aplus-standby-file-sync.timer
 systemctl stop aplus-standby-file-sync.service || true
 systemctl disable --now aplus-standby-replication-tunnel.service
 docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "select pg_promote(wait_seconds => 60)"' </dev/null | grep -qx t

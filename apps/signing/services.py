@@ -198,28 +198,12 @@ def ensure_ios_app_store_profile(app) -> IOSProvisioningProfile:
     distribution = ensure_ios_distribution_signing(app.apple_account)
     client = AppleStoreClient(app.apple_account)
     bundle = _find_apple_bundle_id(client, app.bundle_id)
-    profile_name = f"A+ Publisher {app.bundle_id} App Store"
-    body = {
-        "data": {
-            "type": "profiles",
-            "attributes": {
-                "name": profile_name,
-                "profileType": "IOS_APP_STORE",
-            },
-            "relationships": {
-                "bundleId": {"data": {"type": "bundleIds", "id": bundle["id"]}},
-                "certificates": {
-                    "data": [
-                        {
-                            "type": "certificates",
-                            "id": distribution.apple_certificate_id,
-                        }
-                    ]
-                },
-            },
-        }
-    }
-    item = client.request("POST", "/profiles", data=json.dumps(body))["data"]
+    # Fresh Publisher installations must not recreate the old generic profile
+    # name: Apple may still retain multiple profiles with that exact name.
+    # Bind the deterministic name to the actual managed distribution certificate
+    # so a retry can retrieve its existing active profile without duplicates.
+    profile_name = f"A+ Publisher {app.slug} {distribution.apple_certificate_id[:12]} AppStore"
+    item = _ensure_named_app_store_profile(client, distribution, bundle, profile_name)
     attrs = item.get("attributes", {})
     profile_content = attrs.get("profileContent", "")
     if not profile_content:

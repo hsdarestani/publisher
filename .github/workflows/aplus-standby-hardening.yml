@@ -1,0 +1,51 @@
+name: Harden installed manual A+ emergency promotion
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths: ['.github/workflows/aplus-standby-hardening.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install reboot-safe data sync fence without restarting anything
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = 82.165.187.14 && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          K="$RUNNER_TEMP/standby-hardening-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/standby-hardening-askpass"
+            chmod 700 "$RUNNER_TEMP/standby-hardening-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/standby-hardening-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          scp -i "$K" -P "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes scripts/standby/activate-failover.sh root@"$HOST":/tmp/aplus-standby-activate-new
+          ssh -i "$K" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          test ! -e /opt/aplussolution-standby/failover-active
+          install -m 700 /tmp/aplus-standby-activate-new /usr/local/sbin/aplus-standby-activate
+          rm -f /tmp/aplus-standby-activate-new
+          grep -Fq 'systemctl disable --now aplus-standby-file-sync.timer' /usr/local/sbin/aplus-standby-activate
+          grep -Fq '/usr/local/sbin/aplus-standby-prepare' /usr/local/sbin/aplus-standby-activate
+          bash -n /usr/local/sbin/aplus-standby-activate
+          systemctl is-active --quiet aplus-standby-file-sync.timer
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo REBOOT_SAFE_FAILOVER_GUARDS_INSTALLED_NO_PROMOTION
+          REMOTE

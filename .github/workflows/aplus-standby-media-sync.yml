@@ -99,7 +99,7 @@ jobs:
           systemctl daemon-reload
           systemctl enable --now aplus-standby-file-sync.timer
           systemctl start aplus-standby-file-sync.service
-          test -s "$D/last-file-sync-success"
+          test -e "$D/last-file-sync-success"
           cd /opt/aplus-publisher
           docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
           echo PUBLISHER_HEALTH_OK

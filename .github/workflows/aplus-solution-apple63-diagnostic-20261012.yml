@@ -71,7 +71,7 @@ jobs:
           if ver:
               try:
                   loc=c.request('GET',f"/appStoreVersions/{ver['id']}/appStoreVersionLocalizations?limit=200").get('data',[])
-                  metadata['localizations']=[{'locale':(x.get('attributes') or {}).get('locale'),'whatsNew':bool((x.get('attributes') or {}).get('whatsNew'),'description':bool((x.get('attributes') or {}).get('description'),'keywords':bool((x.get('attributes') or {}).get('keywords'))} for x in loc]
+                  metadata['localizations']=[{'locale':(x.get('attributes') or {}).get('locale'),'whatsNew':bool((x.get('attributes') or {}).get('whatsNew')),'description':bool((x.get('attributes') or {}).get('description')),'keywords':bool((x.get('attributes') or {}).get('keywords'))} for x in loc]
                   metadata['screenshots']={}
                   for l in loc:
                       sets=c.request('GET',f"/appStoreVersionLocalizations/{l['id']}/appScreenshotSets?limit=200").get('data',[])

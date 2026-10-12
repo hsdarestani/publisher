@@ -172,11 +172,29 @@ jobs:
               /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env scripts/deploy.sh root@"$HOST":/tmp/
             ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" \
               'umask 077; chmod 700 /tmp/deploy.sh; chmod 600 /tmp/aplus-publisher-overrides.env; trap "rm -f /tmp/aplus-publisher-overrides.env /tmp/aplus-publisher.tar.gz /tmp/deploy.sh" EXIT; /tmp/deploy.sh /tmp/aplus-publisher.tar.gz /tmp/aplus-publisher-overrides.env'
-            echo "Verifying public DNS, TLS certificate and reverse proxy..."
-            curl --fail --silent --show-error \
-              --retry 12 --retry-all-errors --retry-delay 10 \
-              --connect-timeout 10 --max-time 20 \
-              https://publisher.smarbiz.sbs/healthz/
+            echo "Comparing STRATO origin and public Cloudflare health endpoints..."
+            ORIGIN_CODE="$(curl -ksS -L --connect-timeout 8 --max-time 20 \
+              --resolve "publisher.smarbiz.sbs:443:$HOST" \
+              -o /dev/null -w '%{http_code}' \
+              https://publisher.smarbiz.sbs/healthz/ || true)"
+            echo "STRATO origin /healthz/ HTTP $ORIGIN_CODE"
+            EDGE_CODE="$(curl -sS -L --connect-timeout 8 --max-time 20 \
+              -o /dev/null -w '%{http_code}' \
+              https://publisher.smarbiz.sbs/healthz/ || true)"
+            echo "Public Cloudflare /healthz/ HTTP $EDGE_CODE"
+            if [ "$ORIGIN_CODE" = 200 ] && [ "$EDGE_CODE" != 200 ]; then
+              echo "::error::STRATO origin is healthy but Cloudflare routing is not. Check the proxied publisher DNS A record and origin rules in Cloudflare."
+              exit 1
+            fi
+            if [ "$ORIGIN_CODE" != 200 ]; then
+              echo "::error::Direct STRATO HTTPS health check failed. Review Caddy TLS, host routing and app config."
+              exit 1
+            fi
+            if [ "$EDGE_CODE" != 200 ]; then
+              echo "::error::Public Publisher HTTPS health check failed with HTTP $EDGE_CODE."
+              exit 1
+            fi
+            echo "Publisher is healthy through both STRATO and Cloudflare."
           } 2>&1 | tee /tmp/deploy-ci.log
       - name: Report production result
         if: steps.production.outcome != 'skipped'

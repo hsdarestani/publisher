@@ -1,0 +1,103 @@
+name: Verify BE DIFFERENT iOS 1.2.0 review sign-in
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/bedifferent-1-2-0-review-account-verify.yml"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Test Apple-stored review login against real BE DIFFERENT production and sync verified Publisher details
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-review-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-ios-review-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,requests
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='be-different')
+          client=AppleStoreClient(app.apple_account)
+          record=client.find_app('com.smarbiz.bedifferent')
+          versions=[v for v in client.list_versions(record['id']) if (v.get('attributes') or {}).get('versionString')=='1.2.0']
+          assert len(versions)==1, 'Expected exactly one App Store version 1.2.0'
+          version=versions[0]
+          state=version.get('attributes',{}).get('appStoreState')
+          assert state in {'WAITING_FOR_REVIEW','IN_REVIEW','READY_FOR_REVIEW','PREPARE_FOR_SUBMISSION'}, 'Unexpected version state'
+          details=client.request('GET',f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data')
+          attrs=(details or {}).get('attributes') or {}
+          username=attrs.get('demoAccountName') or ''
+          password=attrs.get('demoAccountPassword') or ''
+          assert username.lower()=='appreview@bedifferent.smarbiz.sbs' and len(password)>=16, 'App Store credentials not available'
+          base='https://bedifferent.smarbiz.sbs'
+          session=requests.Session()
+          # One login attempt only: avoid triggering the application's throttling logic.
+          result=session.post(base+'/api/auth/login',
+              json={'email':username,'password':password},
+              headers={'Origin':base,'x-bd-client':'mobile','Content-Type':'application/json'},timeout=25)
+          print('APPLE_REVIEW_LOGIN_HTTP='+str(result.status_code))
+          if result.status_code!=200:
+              raise RuntimeError('Apple stored review credentials rejected by production BE DIFFERENT')
+          body=result.json()
+          token=body.get('sessionToken')
+          assert token, 'Mobile login did not return a session'
+          data=session.get(base+'/api/mobile/dashboard',
+              headers={'authorization':'Bearer '+token,'x-bd-client':'mobile'},timeout=25)
+          print('APPLE_REVIEW_DASHBOARD_HTTP='+str(data.status_code))
+          data.raise_for_status()
+          d=data.json()
+          user=d.get('user') or {}
+          check={
+              'onboarding_complete':bool(user.get('onboardingCompleted')),
+              'role':user.get('role'),
+              'tier':user.get('tier') or user.get('subscriptionTier'),
+          }
+          print('APPLE_REVIEW_ACCOUNT_STATE='+json.dumps(check,sort_keys=True))
+          assert check['onboarding_complete'] and check['role']=='ATHLETE', 'Reviewer lacks athlete access'
+          assert check['tier']=='ELITE', 'Reviewer lacks full entitlement'
+          # Sync the already Apple-verified credential into the newly reconstructed
+          # Publisher database without printing it or changing App Store submissions.
+          app.review_username=username
+          app.set_review_password(password)
+          app.requires_login=True
+          app.review_notes=attrs.get('notes') or 'Review athlete is prepared with ELITE access and completed onboarding. Use the provided account to explore START, TRAINING, ATHLET, progress, nutrition and recovery. Wearable pairing requires a user-owned external device and is optional.'
+          app.save(update_fields=['review_username','review_password_blob','requires_login','review_notes','updated_at'])
+          print('APPLE_REVIEW_LOGIN_VERIFIED_AND_PUBLISHER_SYNCED=YES')
+          try:
+              session.post(base+'/api/auth/logout',json={},headers={'authorization':'Bearer '+token,'Origin':base},timeout=10)
+          except Exception:
+              pass
+          PY
+          REMOTE

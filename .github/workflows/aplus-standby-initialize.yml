@@ -1,0 +1,172 @@
+name: Initialize A+ Solution PostgreSQL warm standby on isolated STRATO
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-initialize.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-standby-initialize
+  cancel-in-progress: false
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+    steps:
+      - name: Clone primary into protected standby without changing Publisher or primary
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          K="$RUNNER_TEMP/aplus-warm-standby-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/askpass-standby"
+            chmod 700 "$RUNNER_TEMP/askpass-standby"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/askpass-standby" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$K" -p "$PORT" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          PRIMARY_IPV6="2a01:239:44b:d900::1"
+          APP_DIR="/opt/aplussolution-standby"
+          test -s "$APP_DIR/compose.yaml"
+          test -s /root/.ssh/aplus_standby_to_primary
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+
+          # Dedicated bridge only. No published TCP ports and no common Publisher volumes.
+          docker network inspect aplus_standby_net >/dev/null 2>&1 || docker network create --driver bridge aplus_standby_net >/dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          f = Path("/opt/aplussolution-standby/compose.yaml")
+          s = f.read_text()
+          if "standby_net:" not in s:
+              s = s.replace("      healthcheck:\n", "      networks:\n        - standby_net\n      healthcheck:\n")
+              s += "\nnetworks:\n  standby_net:\n    external: true\n    name: aplus_standby_net\n"
+              f.write_text(s)
+          PY
+          cd "$APP_DIR"
+          docker compose config --quiet
+          GW="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' aplus_standby_net)"
+          test -n "$GW"
+
+          # The password is transferred only via already-authorized SSH, never via GitHub.
+          umask 077
+          ssh -6 -q -i /root/.ssh/aplus_standby_to_primary -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes aplusstandby@"$PRIMARY_IPV6" 'cat ~/replication_password' > "$APP_DIR/.replication_password"
+          test -s "$APP_DIR/.replication_password"
+          chmod 600 "$APP_DIR/.replication_password"
+
+          cat >/usr/local/sbin/aplus-standby-replication-tunnel <<'SCRIPT'
+          #!/bin/sh
+          set -eu
+          GW="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' aplus_standby_net)"
+          test -n "$GW"
+          exec /usr/bin/ssh -6 -N -T \
+            -i /root/.ssh/aplus_standby_to_primary \
+            -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -L "$GW:55432:127.0.0.1:55432" \
+            aplusstandby@2a01:239:44b:d900::1
+          SCRIPT
+          chmod 700 /usr/local/sbin/aplus-standby-replication-tunnel
+
+          cat >/etc/systemd/system/aplus-standby-replication-tunnel.service <<'UNIT'
+          [Unit]
+          Description=A+ Solution standby read-only PostgreSQL SSH tunnel
+          Requires=docker.service
+          After=docker.service network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/sbin/aplus-standby-replication-tunnel
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now aplus-standby-replication-tunnel.service
+          systemctl is-active --quiet aplus-standby-replication-tunnel.service
+
+          docker pull -q postgres:16-alpine >/dev/null
+          ready=0
+          for i in $(seq 1 30); do
+            if docker run --rm --network aplus_standby_net postgres:16-alpine pg_isready -h "$GW" -p 55432 -U replicator </dev/null >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" -eq 1
+          echo REPLICATION_TUNNEL_READY
+
+          # Fresh database volume only; refuse any existing initialized PGDATA.
+          docker volume create aplus_solution_standby_pgdata >/dev/null
+          if docker run --rm --entrypoint sh -v aplus_solution_standby_pgdata:/var/lib/postgresql/data postgres:16-alpine -c 'test -e /var/lib/postgresql/data/PG_VERSION' </dev/null; then
+            echo 'Database volume is already initialized; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          docker run --rm --entrypoint sh -v aplus_solution_standby_pgdata:/var/lib/postgresql/data postgres:16-alpine -c 'chown -R postgres:postgres /var/lib/postgresql/data' </dev/null
+
+          REPL_PASS="$(cat "$APP_DIR/.replication_password" | tr -d '\r\n')"
+          test -n "$REPL_PASS"
+          docker run --rm --user postgres \
+            --network aplus_standby_net \
+            -e PGPASSWORD="$REPL_PASS" -e REPL_HOST="$GW" \
+            -v aplus_solution_standby_pgdata:/var/lib/postgresql/data \
+            --entrypoint sh postgres:16-alpine -ceu \
+            'pg_basebackup -h "$REPL_HOST" -p 55432 -U replicator -D /var/lib/postgresql/data -Fp -Xs -R -S aplus_backup_slot -P' </dev/null
+
+          docker run --rm --user postgres \
+            -e REPL_PASS="$REPL_PASS" -e REPL_HOST="$GW" \
+            -v aplus_solution_standby_pgdata:/var/lib/postgresql/data \
+            --entrypoint sh postgres:16-alpine -ceu '
+              test -f /var/lib/postgresql/data/standby.signal
+              printf "\nprimary_conninfo = '\''host=%s port=55432 user=replicator password=%s application_name=backup_standby connect_timeout=10 keepalives_idle=30 keepalives_interval=10 keepalives_count=3'\''\n" "$REPL_HOST" "$REPL_PASS" >> /var/lib/postgresql/data/postgresql.auto.conf
+              chmod 600 /var/lib/postgresql/data/postgresql.auto.conf
+            ' </dev/null
+
+          # Database starts only in recovery mode; the compose entrypoint guards this.
+          docker compose up -d db </dev/null
+          ok=0
+          for i in $(seq 1 45); do
+            STATE="$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select pg_is_in_recovery()"' </dev/null 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ "$STATE" = t ]; then
+              ok=1
+              break
+            fi
+            sleep 3
+          done
+          test "$ok" -eq 1
+          echo STANDBY_DATABASE_RECOVERY_MODE_OK
+
+          sleep 5
+          STATE="$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select status from pg_stat_wal_receiver"' </dev/null 2>/dev/null | tr -d '[:space:]')"
+          test "$STATE" = streaming
+          echo STANDBY_WAL_RECEIVER_STREAMING
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_STILL_HEALTHY
+          REMOTE

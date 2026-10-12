@@ -1,5 +1,9 @@
 name: A+ Solution Build 63 submit to both stores
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-submit-build63-20261012.yml'
   workflow_run:
     workflows: ['A+ Solution 1.0.27 live store release']
     types: [completed]
@@ -50,6 +54,25 @@ jobs:
           publisher() {
             ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se'
           }
+
+          # Allow the original signed iOS build to complete; the Android bundle is already ready.
+          BUILD_READY=0
+          for n in $(seq 1 240); do
+            CURRENT="$(publisher <<'READY_REMOTE' 2>/dev/null | grep '^BUILD63_READY=' | tail -n 1 || true
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import Release
+          r=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          print('BUILD63_READY='+'|'.join(p+':'+r.builds.get(platform=p).status+':'+str(bool(r.builds.get(platform=p).artifact)) for p in ('android','ios')))
+          PY
+          READY_REMOTE
+            )"
+            if [ "$CURRENT" != "${PREV_READY:-}" ]; then echo "$CURRENT"; PREV_READY="$CURRENT";fi
+            if [[ "$CURRENT" == *"android:succeeded:True|ios:succeeded:True"* ]]; then BUILD_READY=1;break;fi
+            sleep 20
+          done
+          test "$BUILD_READY" = 1 || { echo 'Unsigned or interrupted iOS artifact; no store submission was attempted.' >&2; exit 1; }
 
           publisher <<'REMOTE'
           set -euo pipefail

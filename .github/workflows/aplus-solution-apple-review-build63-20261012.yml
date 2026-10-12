@@ -1,0 +1,111 @@
+name: A+ Solution 1.0.27 Build 63 Apple Review Submit
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-apple-review-build63-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-solution-apple-review-63
+  cancel-in-progress: false
+jobs:
+  apple-review:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - name: Verify live Apple Build 63 and submit review from Publisher
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-apple-review-63-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/aplus-apple-review-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,requests
+          from apps.publisher.models import Release,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+          release=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          assert release.source_commit=='84b3e2d2f624cf0a0e64a14bb470cd5e2ef39e8e', 'Unexpected release source'
+          app=release.app
+          ios=release.builds.get(platform='ios')
+          assert ios.status=='succeeded' and ios.artifact,'Signed IPA not available'
+          assert app.apple_account and app.apple_account.configured
+          assert app.requires_login and app.review_username and app.get_review_password(), 'Review login missing'
+          review_resp=requests.post('https://app.aplus-solution.de/api/auth/login/',json={'email':app.review_username,'password':app.get_review_password()},timeout=25)
+          assert review_resp.status_code==200 and review_resp.json().get('access'),'Review login is not valid on live production'
+          client=AppleStoreClient(app.apple_account)
+          apple_app=client.find_app(app.bundle_id)
+          candidates=client.list_builds(apple_app['id'],build_number=63,limit=50)
+          valid=[item for item in candidates if (item.get('attributes') or {}).get('processingState')=='VALID']
+          assert len(valid)==1,'Build 63 is not uniquely VALID in Apple App Store Connect'
+          apple_build=str(valid[0]['id'])
+          upload=Job.objects.filter(release=release,type='upload_apple').order_by('-created_at').first()
+          assert upload and upload.status=='succeeded','Signed IPA upload job has not completed'
+          assert str(ios.external_build_id)==apple_build,'Publisher build ID differs from live App Store Connect'
+          existing_submission=Submission.objects.filter(release=release,platform='ios',state__in=['in_review','approved','live']).first()
+          if existing_submission:
+              print('APPLE_REVIEW_ALREADY_SUBMITTED='+json.dumps({'build':63,'state':existing_submission.state,'external_id':existing_submission.external_id}))
+          else:
+              previous=next((x for x in client.list_versions(apple_app['id'],limit=100) if (x.get('attributes') or {}).get('versionString')=='1.0.26'),None)
+              assert previous, 'Published 1.0.26 record is missing'
+              old=client.request('GET',f"/appStoreVersions/{previous['id']}/appStoreReviewDetail").get('data') or {}
+              attrs=old.get('attributes') or {}
+              contact_fields=('contactFirstName','contactLastName','contactPhone','contactEmail')
+              contact={k:attrs[k] for k in contact_fields if attrs.get(k)}
+              assert len(contact)==4, 'Contact details for Apple review not recoverable from previous release'
+              version=client.ensure_version(apple_app['id'],'1.0.27')
+              # Existing published review contact is reused; no personal data in workflow logs.
+              client.set_review_details(str(version['id']),app,contact=contact)
+              pending=Job.objects.filter(release=release,type='submit_apple',status__in=['queued','running','succeeded']).first()
+              if pending:
+                  print('APPLE_REVIEW_ALREADY_QUEUED='+json.dumps({'job':pending.id,'status':pending.status,'build':63}))
+              else:
+                  job=enqueue_job('submit_apple',app=app,release=release,build=ios)
+                  print('APPLE_REVIEW_QUEUED='+json.dumps({'job':job.id,'build':63,'apple_processing':'VALID','review_account':'verified'}))
+          PY
+          REMOTE
+
+          for n in $(seq 1 42); do
+            STATE="$(ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Release,Job,Submission;r=Release.objects.get(app__slug='\''a-plus-solution'\'',version_name='\''1.0.27'\'',build_number=63);j=Job.objects.filter(release=r,type='\''submit_apple'\'').order_by('\''-created_at'\'').first();s=Submission.objects.filter(release=r,platform='\''ios'\'').first();print('\''APPLE_REVIEW_STATE='\''+(j.status if j else '\''missing'\'')+'\''|'\''+(s.state if s else '\''unrecorded'\''))"' | grep 'APPLE_REVIEW_STATE=' | tail -n 1)"
+            echo "$STATE"
+            if [[ "$STATE" == *'succeeded|in_review'* || "$STATE" == *'succeeded|approved'* || "$STATE" == *'succeeded|live'* ]]; then
+              echo 'APPLE_REVIEW_SUBMITTED_SUCCESSFULLY'
+              exit 0
+            fi
+            if [[ "$STATE" == *'failed'* ]]; then
+              echo 'Apple submit job failed, inspect Publisher job error.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo 'App Store review submission did not complete in the expected time.' >&2
+          exit 1

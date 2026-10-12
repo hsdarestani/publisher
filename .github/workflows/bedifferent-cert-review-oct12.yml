@@ -1,0 +1,137 @@
+name: BE DIFFERENT public certificate and Apple review login check
+
+on:
+  push:
+    branches: [diagnostic/bedifferent-review-certificate-oct12]
+    paths: ['.github/workflows/bedifferent-cert-review-oct12.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Inspect encrypted Publisher key, export public PEM, and test App Review login
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bedifferent-check-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          SSH_ARGS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import base64, hashlib, json, requests
+          from pathlib import Path
+          from cryptography import x509
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.serialization import pkcs12
+          from apps.publisher.models import MobileApp
+          from apps.signing.models import AndroidSigningCredential
+          from apps.integrations.apple_store import AppleStoreClient
+
+          a=MobileApp.objects.get(slug='be-different')
+          keyrec=AndroidSigningCredential.objects.get(app=a)
+          keydata=keyrec.get_credentials()
+          private_key,cert,_=pkcs12.load_key_and_certificates(
+              base64.b64decode(keydata['keystore_base64']),
+              keydata['store_password'].encode(),
+          )
+          if private_key is None or cert is None:
+              raise RuntimeError('Missing signing key/certificate')
+          sha1=':'.join(f'{x:02X}' for x in cert.fingerprint(hashes.SHA1()))
+          sha256=':'.join(f'{x:02X}' for x in cert.fingerprint(hashes.SHA256()))
+          if sha256 != keyrec.certificate_sha256.upper():
+              raise RuntimeError('Stored signing fingerprint mismatch')
+          Path('/tmp/bedifferent-public-upload-certificate.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+          print('UPLOAD_CERT_INFO='+json.dumps({
+              'public_sha1':sha1,'public_sha256':sha256,
+              'private_key_exported':False,'public_certificate_generated':True,
+          },sort_keys=True))
+
+          review={'publisher_account_present':bool(a.review_username and a.get_review_password())}
+          credentials=[]
+          try:
+              apple=AppleStoreClient(a.apple_account)
+              versions=apple.list_versions(a.apple_app_id,limit=30)
+              version=next((v for v in versions if (v.get('attributes') or {}).get('versionString')=='1.1.0'),None)
+              review['apple_version_found']=bool(version)
+              if version:
+                  review['apple_version_state']=(version.get('attributes') or {}).get('appStoreState')
+                  detail=apple.request('GET',f"/appStoreVersions/{version['id']}/appStoreReviewDetail").get('data') or {}
+                  attrs=detail.get('attributes') or {}
+                  apple_user=attrs.get('demoAccountName') or ''
+                  apple_pass=attrs.get('demoAccountPassword') or ''
+                  review['apple_demo_username_present']=bool(apple_user)
+                  review['apple_demo_password_present']=bool(apple_pass)
+                  review['apple_publisher_password_same']=bool(apple_pass and a.get_review_password() and apple_pass==a.get_review_password())
+                  if apple_user and apple_pass:
+                      credentials.append(('apple',apple_user,apple_pass))
+          except Exception as exc:
+              review['apple_detail_query_error']=type(exc).__name__
+          if a.review_username and a.get_review_password() and (
+              not credentials or credentials[0][1:]!=(a.review_username,a.get_review_password())
+          ):
+              credentials.append(('publisher',a.review_username,a.get_review_password()))
+          base='https://bedifferent.smarbiz.sbs'
+          session=requests.Session()
+          for source,email,password in credentials[:2]:
+              try:
+                  result=session.post(base+'/api/auth/login',json={'email':email,'password':password},
+                      headers={'Origin':base,'x-bd-client':'mobile'},timeout=25)
+                  row={'source':source,'status':result.status_code,'login_ok':result.status_code==200 and bool(result.json().get('sessionToken'))}
+                  if row['login_ok']:
+                      bearer=result.json()['sessionToken']
+                      dashboard=session.get(base+'/api/mobile/dashboard',
+                          headers={'Authorization':'Bearer '+bearer,'x-bd-client':'mobile'},timeout=25)
+                      data=dashboard.json() if dashboard.status_code==200 else {}
+                      row['dashboard_ok']=dashboard.status_code==200
+                      row['onboarding_complete']=bool((data.get('user') or {}).get('onboardingCompleted'))
+                      row['user_role']=(data.get('user') or {}).get('role')
+                  review.setdefault('login_checks',[]).append(row)
+              except Exception as exc:
+                  review.setdefault('login_checks',[]).append({'source':source,'error_type':type(exc).__name__})
+          print('APPLE_REVIEW_LOGIN_AUDIT='+json.dumps(review,sort_keys=True))
+          PY
+          docker compose cp web:/tmp/bedifferent-public-upload-certificate.pem /tmp/bedifferent-public-upload-certificate.pem </dev/null >/dev/null
+          docker compose exec -T web rm -f /tmp/bedifferent-public-upload-certificate.pem
+          REMOTE
+          scp "${SSH_ARGS[@]}" -P "$PORT" root@"$HOST":/tmp/bedifferent-public-upload-certificate.pem "$RUNNER_TEMP/bedifferent-upload-certificate.pem"
+          openssl x509 -in "$RUNNER_TEMP/bedifferent-upload-certificate.pem" -noout >/dev/null
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" 'rm -f /tmp/bedifferent-public-upload-certificate.pem'
+      - name: Upload public certificate for Play Console (never the keystore)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bedifferent-public-upload-certificate-for-google-reset
+          path: ${{ runner.temp }}/bedifferent-upload-certificate.pem
+          if-no-files-found: error
+          retention-days: 14

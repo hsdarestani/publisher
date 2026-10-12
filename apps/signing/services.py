@@ -357,7 +357,16 @@ def ensure_be_different_ios_signing_bundle(app):
             _ensure_bundle_capability(client, bundle, "HEALTHKIT")
             _ensure_bundle_capability(client, bundle, "PUSH_NOTIFICATIONS")
 
-        profile_name = f"A+ Publisher {identifier} Native Store 20261004"
+        # Bind each profile name to the active Distribution certificate. Reusing
+        # an older profile named only by the Bundle ID can return a still-active
+        # profile signed for a different certificate after a Publisher rebuild.
+        # Apple will accept that profile but Xcode then fails with error 65.
+        # A certificate-scoped name is idempotent across retries and leaves
+        # existing profiles and active App Store reviews untouched.
+        profile_name = (
+            f"A+ Publisher {identifier} Native Store "
+            f"{distribution.apple_certificate_id[:16]}"
+        )
         profile = _ensure_named_app_store_profile(
             client,
             distribution,

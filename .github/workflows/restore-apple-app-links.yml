@@ -122,6 +122,22 @@ jobs:
           account.last_tested_at=timezone.now()
           account.last_error=''
           account.save(update_fields=['status','last_tested_at','last_error','updated_at'])
+          try:
+              certs=client.request('GET','/certificates?limit=200').get('data',[])
+              cert_items=[{
+                  'type':(item.get('attributes') or {}).get('certificateType'),
+                  'display_name':(item.get('attributes') or {}).get('displayName'),
+                  'expiration':(item.get('attributes') or {}).get('expirationDate'),
+              } for item in certs]
+              cert_result={'api':'ok','count':len(certs),'certificates':cert_items}
+          except Exception as ex:
+              cert_result={'api':'failed','error_type':type(ex).__name__}
+          try:
+              profiles=client.request('GET','/profiles?limit=200').get('data',[])
+              profile_result={'api':'ok','count':len(profiles)}
+          except Exception as ex:
+              profile_result={'api':'failed','error_type':type(ex).__name__}
+          print('APPLE_SIGNING_PREFLIGHT='+json.dumps({'certificates':cert_result,'profiles':profile_result},sort_keys=True))
           print('APPLE_LINK_RESULT='+json.dumps({
               'connected':True,
               'account_name':account.name,

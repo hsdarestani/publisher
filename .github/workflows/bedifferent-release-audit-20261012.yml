@@ -1,0 +1,91 @@
+name: Read only BE DIFFERENT store release audit
+
+on:
+  push:
+    branches: [diagnostic/bedifferent-release-20261012]
+    paths:
+      - ".github/workflows/bedifferent-release-audit-20261012.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Inspect release job and store submission records without changing them
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/publisher-release-audit-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS_FILE="$RUNNER_TEMP/publisher-release-audit-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+            chmod 700 "$ASKPASS_FILE"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          from django.utils import timezone
+          app=MobileApp.objects.get(slug='be-different')
+          releases=list(Release.objects.filter(app=app).order_by('-created_at')[:3])
+          out={
+            'audit_at':timezone.now().isoformat(),
+            'app':'be-different',
+            'google_account_ready':bool(app.google_account and app.google_account.configured),
+            'apple_account_ready':bool(app.apple_account and app.apple_account.configured),
+            'releases':[]
+          }
+          for rel in releases:
+            out['releases'].append({
+              'release_id':rel.pk,
+              'version':rel.version_name,
+              'build_number':rel.build_number,
+              'status':rel.status,
+              'auto_submit':rel.auto_submit,
+              'android_track':rel.android_track,
+              'builds':[{
+                'platform':b.platform,'status':b.status,'has_artifact':bool(b.artifact),
+                'size_bytes':b.artifact_size,'external_build_id_present':bool(b.external_build_id)
+              } for b in Build.objects.filter(release=rel)],
+              'jobs':[{
+                'id':j.pk,'type':j.type,'status':j.status,
+                'error_tail':(j.error or '').strip()[-500:],
+                'result_keys':list((j.result or {}).keys())
+              } for j in Job.objects.filter(release=rel).order_by('created_at')],
+              'submissions':[{
+                'platform':s.platform,'state':s.state,
+                'external_id_present':bool(s.external_id),
+                'submitted_at':s.submitted_at.isoformat() if s.submitted_at else None,
+                'last_error_tail':(s.last_error or '').strip()[-250:]
+              } for s in Submission.objects.filter(release=rel)]
+            })
+          print('BEDIFFERENT_AUDIT_JSON='+json.dumps(out,sort_keys=True))
+          PY
+          REMOTE

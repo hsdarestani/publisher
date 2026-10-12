@@ -1,0 +1,80 @@
+name: A+ Solution build 63 Store Delivery Audit
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-build63-store-audit-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Read live Apple and Google state and Publisher submission jobs
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/audit-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/audit-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import Release,Job,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          r=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          a=r.app
+          report={'source':r.source_commit,'builds':{},'jobs':{},'submissions':{},'apple':{},'google':{}}
+          for p in ('android','ios'):
+              b=r.builds.get(platform=p)
+              report['builds'][p]={'status':b.status,'has_file':bool(b.artifact),'apple_build_id_exists':bool(b.external_build_id)}
+          for name in ('build_android','build_ios','submit_google','upload_google','upload_apple','submit_apple'):
+              j=Job.objects.filter(release=r,type=name).order_by('-created_at').first()
+              if j:
+                  report['jobs'][name]={'id':j.pk,'state':j.status,'error_excerpt':str(j.error or '')[:450]}
+          for s in Submission.objects.filter(release=r):
+              report['submissions'][s.platform]={'state':s.state,'submitted':bool(s.submitted_at)}
+          report['reviewer_ready']=bool(a.review_username and a.get_review_password())
+          try:
+              c=AppleStoreClient(a.apple_account); aa=c.find_app(a.bundle_id)
+              bs=c.list_builds(aa['id'],build_number=63,limit=50)
+              report['apple']={'build63':[{'id':b['id'],'processing':(b.get('attributes') or {}).get('processingState')} for b in bs]}
+          except Exception as e: report['apple']={'error_type':type(e).__name__}
+          try:
+              g=GooglePlayClient(a.google_account)
+              edit=g._open_edit(a.package_name)
+              try:
+                  base=f'/applications/{g._q(a.package_name)}/edits/{edit.edit_id}'
+                  t=g._edit_request(edit,'GET',base+'/tracks').get('tracks',[])
+                  report['google']['track_codes']=[{'track':x.get('track'),'codes':[code for y in x.get('releases',[]) for code in y.get('versionCodes',[])]} for x in t]
+                  bundles=g._edit_request(edit,'GET',base+'/bundles').get('bundles',[])
+                  report['google']['build63_uploaded']=any(str(b.get('versionCode'))=='63' for b in bundles)
+              finally:g._safe_delete_edit(edit)
+          except Exception as e:report['google']['error_type']=type(e).__name__
+          print('STORE63_AUDIT='+json.dumps(report,default=str,separators=(',',':')))
+          PY
+          REMOTE

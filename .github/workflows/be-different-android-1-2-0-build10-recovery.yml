@@ -41,8 +41,10 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Check preinstalled Android SDK
+        run: |
+          test -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "Using Android SDK from GitHub Ubuntu image"
 
       - name: Build signed Android AAB using Publisher signing credentials
         env:

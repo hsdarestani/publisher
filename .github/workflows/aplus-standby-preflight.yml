@@ -1,0 +1,102 @@
+name: Read-only A+ Solution standby capacity preflight
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-preflight.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Verify new STRATO server and existing Publisher (read only)
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          test "$HOST" = "82.165.187.14"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-standby-inspection-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/aplus-ssh-askpass"
+            chmod 700 "$RUNNER_TEMP/aplus-ssh-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/aplus-ssh-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -p "$PORT" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          echo "=== HOST ==="
+          hostname
+          uname -m
+          nproc
+          echo "=== MEMORY (MB) ==="
+          free -m
+          echo "=== STORAGE ==="
+          df -h / /var/lib/docker
+          echo "=== PUBLISHER ==="
+          test -f /opt/aplus-publisher/docker-compose.yml
+          cd /opt/aplus-publisher
+          docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null
+          echo PUBLISHER_HEALTHY
+          echo "=== PORT LISTENERS ==="
+          ss -ltn | grep -E ':(80|443|5432|55432|15432)[[:space:]]' || true
+          echo "=== EXISTING APLUS BACKUP DIRECTORIES ==="
+          for p in /opt/aplussolution-standby /opt/aplussolution /srv/aplus-backups; do
+            if [ -e "$p" ]; then echo "EXISTS: $p"; else echo "ABSENT: $p"; fi
+          done
+          echo "=== DOCKER DISK USE ==="
+          docker system df
+          echo "=== SNAPSHOT/REPLICATION SYSTEMD UNITS ==="
+          systemctl list-unit-files 'aplus*' --no-pager --no-legend || true
+          REMOTE
+
+      - name: Read-only test of credentials for A+ Solution primary
+        env:
+          PRIMARY_HOST: ${{ secrets.STRATO_HOST }}
+          PRIMARY_KEY: ${{ secrets.STRATO_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$PRIMARY_HOST" ] || [ -z "$PRIMARY_KEY" ]; then
+            echo "PRIMARY_SSH_ACCESS_NOT_CONFIGURED_IN_PUBLISHER_REPOSITORY"
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$PRIMARY_KEY" | tr -d '\r' > "$RUNNER_TEMP/aplus-primary-check-key"
+          chmod 600 "$RUNNER_TEMP/aplus-primary-check-key"
+          if timeout 20 ssh -i "$RUNNER_TEMP/aplus-primary-check-key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 root@"$PRIMARY_HOST" 'cd /opt/aplussolution && docker compose exec -T db sh -lc '"'"'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select pg_is_in_recovery()"'"'"''; then
+            echo "PRIMARY_SSH_OK"
+          else
+            echo "PRIMARY_SSH_UNAVAILABLE_OR_PG_QUERY_FAILED"
+          fi
+          rm -f "$RUNNER_TEMP/aplus-primary-check-key"
+
+      - name: Verify production public endpoint
+        shell: bash
+        run: |
+          curl -fsS --max-time 20 -D /tmp/aplus-health-headers -o /tmp/aplus-health-body https://app.aplus-solution.de/health/
+          grep -q '"status"' /tmp/aplus-health-body
+          grep -i '^x-aplus-origin:' /tmp/aplus-health-headers || true
+          echo PRODUCTION_PUBLIC_HEALTHY

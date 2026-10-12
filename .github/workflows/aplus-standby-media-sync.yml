@@ -1,0 +1,106 @@
+name: Install isolated A+ Solution media and runtime sync on standby
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-media-sync.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Install isolated read-only sync timers and validate Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14" && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          K="$RUNNER_TEMP/aplus-standby-media-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/askpass-media"
+            chmod 700 "$RUNNER_TEMP/askpass-media"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/askpass-media" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$K" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8 root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          D=/opt/aplussolution-standby
+          test -d "$D"
+          test ! -L "$D"
+          test -s /root/.ssh/aplus_standby_to_primary
+          if ! command -v rsync >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync
+          fi
+          install -d -m 700 "$D/media" "$D/recovery"
+          cat >"$D/ssh-config" <<'CONFIG'
+          Host aplus-primary-standby
+              HostName 2a01:239:44b:d900::1
+              User aplusstandby
+              AddressFamily inet6
+              IdentityFile /root/.ssh/aplus_standby_to_primary
+              IdentitiesOnly yes
+              BatchMode yes
+              StrictHostKeyChecking yes
+              ServerAliveInterval 15
+              ServerAliveCountMax 3
+          CONFIG
+          chmod 600 "$D/ssh-config"
+          cat >/usr/local/sbin/aplus-standby-file-sync <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          D=/opt/aplussolution-standby
+          test ! -L "$D" && test ! -L "$D/media" && test ! -L "$D/recovery"
+          SSH_CMD="ssh -F $D/ssh-config"
+          ionice -c3 nice -n 10 rsync -az --partial --timeout=90 --bwlimit=3072 \
+            -e "$SSH_CMD" aplus-primary-standby:/var/lib/docker/volumes/aplussolution_media_data/_data/ "$D/media/"
+          ionice -c3 nice -n 10 rsync -az --partial --timeout=90 --bwlimit=3072 \
+            -e "$SSH_CMD" aplus-primary-standby:/home/aplusstandby/recovery/ "$D/recovery/"
+          test -s "$D/recovery/aplussolution.env"
+          test -s "$D/recovery/app-source.tgz"
+          chmod -R go-rwx "$D/media" "$D/recovery"
+          touch "$D/last-file-sync-success"
+          echo STANDBY_MEDIA_AND_RUNTIME_SYNC_OK
+          SCRIPT
+          chmod 700 /usr/local/sbin/aplus-standby-file-sync
+          cat >/etc/systemd/system/aplus-standby-file-sync.service <<'UNIT'
+          [Unit]
+          Description=Synchronize A+ Solution media and runtime state to independent standby
+          Wants=network-online.target
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          TimeoutStartSec=20min
+          ExecStart=/usr/local/sbin/aplus-standby-file-sync
+          UNIT
+          cat >/etc/systemd/system/aplus-standby-file-sync.timer <<'UNIT'
+          [Unit]
+          Description=Refresh A+ Solution standby media every five minutes
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=5min
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now aplus-standby-file-sync.timer
+          systemctl start aplus-standby-file-sync.service
+          test -s "$D/last-file-sync-success"
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_HEALTH_OK
+          REMOTE

@@ -57,14 +57,14 @@ jobs:
           cd /opt/aplus-publisher
           docker compose logs --since 20m --tail=250 caddy 2>&1 | grep -iE 'reimflow|tls|acme|certificate|challenge|error' | tail -n 100 || true
           echo '=== certificate storage ==='
-          docker compose exec -T caddy sh -c 'find /data/caddy/certificates -maxdepth 5 -type f 2>/dev/null | sed -n "1,30p"' || true
+          docker compose exec -T caddy sh -c 'find /data/caddy/certificates -maxdepth 5 -type f 2>/dev/null | sed -n "1,30p"' </dev/null || true
           echo '=== last 350 Caddy logs ==='
           docker compose logs --tail=350 caddy || true
           echo '=== active Caddy TLS config ==='
-          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/tls 2>&1 | head -c 8000 || true
+          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/tls </dev/null 2>&1 | head -c 8000 || true
           echo
           echo '=== active Caddy HTTP routes ==='
-          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/http/servers 2>&1 | head -c 10000 || true
+          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/http/servers </dev/null 2>&1 | head -c 10000 || true
           echo
           echo '=== container logging drivers ==='
           docker inspect "$(docker compose ps -q caddy)" --format '{{json .HostConfig.LogConfig}}' || true

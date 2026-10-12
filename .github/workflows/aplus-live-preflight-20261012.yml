@@ -1,0 +1,94 @@
+name: A+ Solution Live Store Preflight
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-live-preflight-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect remote Publisher and both live stores
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/publisher-preflight.key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/preflight-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp, Release, Job
+          from apps.signing.models import AndroidSigningCredential, IOSDistributionCredential, IOSProvisioningProfile
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          cert=AndroidSigningCredential.objects.filter(app=app).first()
+          report={'app':{'slug':app.slug,'package':app.package_name,'bundle':app.bundle_id,'repository':app.repository_url,
+                         'review_login_ready':bool(app.review_username and app.get_review_password()),
+                         'config':{k:v for k,v in app.build_config.items() if k in ('android_command','ios_command','android_artifact','ios_artifact','env')}},
+                  'signing':{'android_local_sha256':cert.certificate_sha256 if cert else None,'android_newly_generated':cert.generated_automatically if cert else None,
+                             'ios_distribution_exists':IOSDistributionCredential.objects.filter(store_account=app.apple_account).exists() if app.apple_account_id else False,
+                             'ios_profile_exists':IOSProvisioningProfile.objects.filter(app=app).exists()},
+                  'publisher':{'recent':list(Release.objects.filter(app=app).order_by('-created_at').values('version_name','build_number','source_commit','status','auto_submit')[:10]),
+                               'active_jobs':list(Job.objects.filter(app=app,status__in=['queued','running','claimed']).values('id','type','status')[:10])},
+                  'google':{},'apple':{}}
+          try:
+            gp=GooglePlayClient(app.google_account)
+            edit=gp._open_edit(app.package_name)
+            try:
+              base=f'/applications/{gp._q(app.package_name)}/edits/{edit.edit_id}'
+              tracks=gp._edit_request(edit,'GET',base+'/tracks').get('tracks',[])
+              report['google']['tracks']=[{'track':t.get('track'),'releases':[{'status':r.get('status'),'versionCodes':r.get('versionCodes')} for r in t.get('releases',[])]} for t in tracks]
+              for ep in ('bundles','apks'):
+                try:
+                  items=gp._edit_request(edit,'GET',base+'/'+ep).get(ep,[])
+                  report['google'][ep+'_recent']=[{k:x.get(k) for k in ('versionCode','certificateSha256Hash','certificateSha1Hash') if x.get(k) is not None} for x in sorted(items,key=lambda x:int(x.get('versionCode') or 0),reverse=True)[:5]]
+                  report['google'][ep+'_count']=len(items)
+                except Exception as e:
+                  report['google'][ep+'_error']=type(e).__name__+': '+str(e)[:140]
+            finally: gp._safe_delete_edit(edit)
+            report['google']['ok']=True
+          except Exception as e: report['google'].update(ok=False,error=type(e).__name__+': '+str(e)[:180])
+          try:
+            ac=AppleStoreClient(app.apple_account); aa=ac.find_app(app.bundle_id)
+            report['apple']['app_id']=str(aa['id'])
+            versions=ac.list_versions(aa['id'],limit=80)
+            report['apple']['versions']=[{'version':(x.get('attributes') or {}).get('versionString'),'state':(x.get('attributes') or {}).get('appStoreState') or (x.get('attributes') or {}).get('appVersionState')} for x in versions[:30]]
+            builds=ac.list_builds(aa['id'],limit=100)
+            report['apple']['builds']=[{'build':(x.get('attributes') or {}).get('version'),'state':(x.get('attributes') or {}).get('processingState')} for x in builds[:15]]
+            report['apple']['ok']=True
+          except Exception as e: report['apple'].update(ok=False,error=type(e).__name__+': '+str(e)[:180])
+          print('LIVE_PREFLIGHT='+json.dumps(report,default=str,separators=(',',':')))
+          PY
+          REMOTE

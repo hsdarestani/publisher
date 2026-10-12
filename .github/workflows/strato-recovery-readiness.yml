@@ -1,0 +1,92 @@
+name: Publisher STRATO recovery readiness diagnostic
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/strato-recovery-readiness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Inspect new Publisher installation (read-only)
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/publisher-recovery-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS_FILE="$RUNNER_TEMP/publisher-recovery-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+            chmod 700 "$ASKPASS_FILE"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+              setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          echo "=== Containers ==="
+          docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
+          echo "=== Store and signing readiness (no secrets printed) ==="
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from django.conf import settings
+          from apps.publisher.models import MobileApp, StoreAccount, Release, Job, BuildAgent, Submission
+          from apps.signing.models import AndroidSigningCredential, IOSDistributionCredential, IOSProvisioningProfile
+          apps = list(MobileApp.objects.all().order_by('slug'))
+          accounts = list(StoreAccount.objects.all().order_by('provider','name'))
+          result = {
+              "apps": [
+                  {
+                      "slug": a.slug, "name": a.name,
+                      "google_linked": bool(a.google_account_id),
+                      "apple_linked": bool(a.apple_account_id),
+                      "google_configured": bool(a.google_account and a.google_account.configured),
+                      "apple_configured": bool(a.apple_account and a.apple_account.configured),
+                      "android_signing_record": AndroidSigningCredential.objects.filter(app=a).exists(),
+                      "ios_profile_record": IOSProvisioningProfile.objects.filter(app=a).exists(),
+                      "releases": Release.objects.filter(app=a).count(),
+                  }
+                  for a in apps
+              ],
+              "store_accounts": [
+                  {"provider": a.provider, "name": a.name, "enabled": a.enabled, "status": a.status, "configured": bool(a.configured)}
+                  for a in accounts
+              ],
+              "signing_record_counts": {
+                  "android": AndroidSigningCredential.objects.count(),
+                  "ios_distribution": IOSDistributionCredential.objects.count(),
+                  "ios_profiles": IOSProvisioningProfile.objects.count(),
+              },
+              "agents": list(BuildAgent.objects.values('name','platform','enabled')),
+              "jobs": list(Job.objects.order_by('-created_at').values('id','type','status','required_platform','app__slug')[:16]),
+              "job_count": Job.objects.count(),
+              "submissions": Submission.objects.count(),
+              "github_dispatch_configured": bool(settings.PUBLISHER_GITHUB_TOKEN),
+          }
+          print(json.dumps(result, indent=2))
+          PY
+          REMOTE

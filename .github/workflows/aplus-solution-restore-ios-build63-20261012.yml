@@ -1,0 +1,101 @@
+name: Recover A+ Solution iOS build 63 after interrupted Publisher
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-restore-ios-build63-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Restore Publisher web and safely requeue only interrupted iOS build
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-ios-recovery-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/aplus-ios-recovery-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          echo '=== Publisher containers before recovery ==='
+          docker compose ps --format json | python3 -c 'import json,sys; print("\n".join(str(x.get("Service"))+"="+str(x.get("State")) for s in sys.stdin if s.strip() for x in [json.loads(s)]))'
+          if ! docker compose exec -T web python manage.py check >/dev/null 2>&1; then
+            echo 'Publisher web not responding; starting the existing web service.'
+            docker compose up -d web
+          fi
+          for attempt in $(seq 1 20); do
+            if docker compose exec -T web python manage.py check >/dev/null 2>&1; then break; fi
+            sleep 3
+          done
+          docker compose exec -T web python manage.py check >/dev/null
+          docker compose exec -T web python manage.py shell <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import Release,Job,BuildAgent
+          from apps.publisher.tasks import enqueue_job
+          r=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          assert r.source_commit=='84b3e2d2f624cf0a0e64a14bb470cd5e2ef39e8e'
+          a=r.builds.get(platform='android')
+          i=r.builds.get(platform='ios')
+          print('PRESERVED_ANDROID='+a.status+':'+str(bool(a.artifact)))
+          assert a.status=='succeeded' and a.artifact,'Never lose the successful Android bundle'
+          active=list(Job.objects.filter(release=r,type='build_ios',status__in=['queued','running','claimed']).order_by('-created_at'))
+          print('PREVIOUS_IOS='+i.status+':'+str(bool(i.artifact))+' active='+str([(x.pk,x.status) for x in active]))
+          if i.status=='succeeded' and i.artifact:
+              print('IOS_BUILD_ALREADY_COMPLETE')
+          else:
+              for j in active:
+                  if j.status=='running':
+                      for agent in BuildAgent.objects.filter(current_job=j):
+                          agent.current_job=None
+                          agent.save(update_fields=['current_job','updated_at'])
+                      j.status='failed'
+                      j.error='Cloud macOS runner stopped during transient Publisher 502; preserving failed attempt for audit.'
+                      j.finished_at=timezone.now()
+                      j.available_to_agents=False
+                      j.save(update_fields=['status','error','finished_at','available_to_agents','updated_at'])
+                  elif j.status=='queued' or j.status=='claimed':
+                      j.status='cancelled'
+                      j.available_to_agents=False
+                      j.save(update_fields=['status','available_to_agents','updated_at'])
+              i.status='queued'
+              i.save(update_fields=['status','updated_at'])
+              j=enqueue_job('build_ios',app=r.app,release=r,build=i,agent=True,platform='macos',payload={'source':'ios-recovery-after-502'})
+              print('IOS_REQUEUED_JOB='+str(j.id))
+          PY
+          REMOTE
+      - name: Reawaken authenticated Cloud Mac
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner:context.repo.owner,repo:context.repo.repo,workflow_id:'cloud-macos.yml',ref:'main'
+            });

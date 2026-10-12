@@ -60,6 +60,14 @@ jobs:
           docker compose exec -T caddy sh -c 'find /data/caddy/certificates -maxdepth 5 -type f 2>/dev/null | sed -n "1,30p"' || true
           echo '=== last 350 Caddy logs ==='
           docker compose logs --tail=350 caddy || true
+          echo '=== active Caddy TLS config ==='
+          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/tls 2>&1 | head -c 8000 || true
+          echo
+          echo '=== active Caddy HTTP routes ==='
+          docker compose exec -T caddy wget -qO- http://localhost:2019/config/apps/http/servers 2>&1 | head -c 10000 || true
+          echo
+          echo '=== container logging drivers ==='
+          docker inspect "$(docker compose ps -q caddy)" --format '{{json .HostConfig.LogConfig}}' || true
           echo '=== local firewall ==='
           ufw status 2>/dev/null || true
           REMOTE

@@ -14,7 +14,12 @@ mkdir -p -m 700 "$OUT"
 chmod 700 "$OUT"
 cd "$D"
 RECOVERY="$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "select pg_is_in_recovery()"' </dev/null | tr -d '[:space:]')"
-test "$RECOVERY" = t || { echo "Refusing backup: PostgreSQL no longer a read-only standby"; exit 1; }
+if [ "$RECOVERY" != t ]; then
+  test "$RECOVERY" = f && test -f "$D/failover-active" || {
+    echo "Refusing backup: unexpected database role without confirmed failover" >&2
+    exit 1
+  }
+fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 TMP="$(mktemp -d "$OUT/.snapshot-XXXXXXXX")"
 trap 'rm -rf -- "$TMP"' EXIT

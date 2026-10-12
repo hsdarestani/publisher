@@ -1,0 +1,75 @@
+name: BE DIFFERENT Android 1.2.0 Build 10 Signed Bundle
+
+on:
+  push:
+    branches:
+      - release/bedifferent-android-1-2-0
+    paths:
+      - .github/workflows/be-different-android-1-2-0-build10-recovery.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: be-different-android-build10-recovery
+  cancel-in-progress: false
+
+jobs:
+  signed-aab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout BE DIFFERENT exact release source
+        uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/aymantraining
+          ref: 514de66cb7b21e7966fba42bc03d67fd8c3af4cc
+
+      - name: Verify Android only build 10
+        run: |
+          node -e 'const e=require("./mobile/app.json").expo; if(e.version!=="1.2.0" || e.android.versionCode!==10 || e.android.package!=="com.smarbiz.bedifferent") process.exit(2)'
+          node -e 'const r=require("./release-request.json"); if(JSON.stringify(r.platforms)!=="[\\"android\\"]" || r.build_number!==10 || !r.auto_submit) process.exit(3)'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build signed Android AAB using Publisher signing credentials
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.BEDIFFERENT_ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.BEDIFFERENT_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.BEDIFFERENT_ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.BEDIFFERENT_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_B64" || { echo 'Publisher Android signing secret is not configured'; exit 1; }
+          test -n "$ANDROID_KEYSTORE_PASSWORD" || exit 1
+          test -n "$ANDROID_KEY_ALIAS" || exit 1
+          test -n "$ANDROID_KEY_PASSWORD" || exit 1
+          bash mobile/scripts/build-android.sh
+          test -n "$(find mobile/android/app/build/outputs/bundle/release -name '*.aab' -print -quit)"
+
+      - name: Preserve signed Android app bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: be-different-1.2.0-build10-signed-aab
+          path: mobile/android/app/build/outputs/bundle/release/*.aab
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Release handoff
+        if: success()
+        run: |
+          echo "Signed AAB built from Android versionCode 10."
+          echo "This workflow creates an artifact only. Store upload is managed by the separate Publisher HTTPS release pipeline."

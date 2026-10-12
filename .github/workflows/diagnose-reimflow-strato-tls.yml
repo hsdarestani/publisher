@@ -1,0 +1,68 @@
+name: Diagnose Reimflow STRATO TLS routing
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-reimflow-strato-tls.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Inspect Caddy and Reimflow on STRATO (read-only)
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14"
+          umask 077
+          KEY="$RUNNER_TEMP/diag-reimflow-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/diag-reimflow-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          PORT="$SSH_PORT"
+          if [ -z "$PORT" ]; then PORT=22; fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -uo pipefail
+          echo '=== listening ports ==='
+          ss -lntp | grep -E ':(80|443|8787) ' || true
+          echo '=== publisher caddy configuration ==='
+          grep -n -A 9 -B 2 'reimflow.smarbiz.sbs' /opt/aplus-publisher/Caddyfile || true
+          echo '=== container status ==='
+          cd /opt/aplus-publisher
+          docker compose ps caddy || true
+          cd /opt/reimflow
+          docker compose ps || true
+          echo '=== HTTP direct to localhost ==='
+          curl -sS -I --connect-timeout 3 --max-time 8 -H 'Host: reimflow.smarbiz.sbs' http://127.0.0.1/ || true
+          echo '=== HTTPS direct to localhost with SNI ==='
+          curl -sSkI --connect-timeout 3 --max-time 8 --resolve reimflow.smarbiz.sbs:443:127.0.0.1 https://reimflow.smarbiz.sbs/ || true
+          echo '=== TLS cert logs ==='
+          cd /opt/aplus-publisher
+          docker compose logs --since 20m --tail=250 caddy 2>&1 | grep -iE 'reimflow|tls|acme|certificate|challenge|error' | tail -n 100 || true
+          echo '=== local firewall ==='
+          ufw status 2>/dev/null || true
+          REMOTE
+      - name: Test origin versus DNS from runner
+        shell: bash
+        run: |
+          echo 'Direct HTTPS to origin:'
+          curl -ksSIL --max-time 10 --resolve reimflow.smarbiz.sbs:443:82.165.187.14 https://reimflow.smarbiz.sbs/ || true
+          echo 'Public HTTPS:'
+          curl -sSIL --max-time 10 https://reimflow.smarbiz.sbs/ || true

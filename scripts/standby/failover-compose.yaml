@@ -1,0 +1,112 @@
+name: aplussolution-standby
+# EMERGENCY ONLY: Never invoke `up` on this Compose file before fencing the
+# old writable primary and explicitly promoting the standby.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: "0.60"
+    shm_size: 128m
+    environment:
+      POSTGRES_DB: aplussolution
+      POSTGRES_USER: aplussolution
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - standby_net
+      - failover_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aplussolution -d aplussolution"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    mem_limit: 200m
+    cpus: "0.20"
+    volumes: [redis_data:/data]
+    networks: [failover_net]
+  backend:
+    build:
+      context: ./recovery/app/backend
+    image: aplussolution-failover-backend:local
+    command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120
+    restart: unless-stopped
+    mem_limit: 1100m
+    cpus: "0.75"
+    env_file: ./recovery/aplussolution.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RUN_MIGRATIONS: "0"
+    volumes:
+      - ./media:/app/media
+      - static_data:/app/staticfiles
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    networks: [failover_net]
+  frontend:
+    build:
+      context: ./recovery/app/frontend
+      args:
+        VITE_API_URL: "${API_URL:-https://app.aplus-solution.de/api}"
+    image: aplussolution-failover-frontend:local
+    restart: unless-stopped
+    mem_limit: 200m
+    cpus: "0.25"
+    networks: [failover_net]
+  edge:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: "0.15"
+    volumes:
+      - ./failover-edge.Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./media:/srv/media:ro
+      - static_data:/srv/static:ro
+    depends_on: [frontend, backend]
+    networks: [failover_net]
+  celery:
+    image: aplussolution-failover-backend:local
+    command: celery -A config worker -l info --concurrency=1
+    restart: unless-stopped
+    mem_limit: 500m
+    cpus: "0.40"
+    env_file: ./recovery/aplussolution.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./media:/app/media
+    depends_on: [backend, redis]
+    networks: [failover_net]
+    profiles: [workers]
+  celery-beat:
+    image: aplussolution-failover-backend:local
+    command: celery -A config beat -l info
+    restart: unless-stopped
+    mem_limit: 200m
+    cpus: "0.15"
+    env_file: ./recovery/aplussolution.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [backend, redis]
+    networks: [failover_net]
+    profiles: [workers]
+volumes:
+  pg_data:
+    name: aplus_solution_standby_pgdata
+    external: true
+  redis_data:
+    name: aplus_failover_redis_data
+  static_data:
+    name: aplus_failover_static_data
+networks:
+  standby_net:
+    external: true
+    name: aplus_standby_net
+  failover_net:
+    external: true
+    name: aplus_failover_net

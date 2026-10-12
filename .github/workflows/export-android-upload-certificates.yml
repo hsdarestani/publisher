@@ -1,0 +1,91 @@
+name: Export public Android upload certificates for Google Play recovery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/export-android-upload-certificates.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Export only public X509 upload certificates from Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/publisher-cert-export-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASK="$RUNNER_TEMP/ssh-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASK"
+            chmod 700 "$ASK"
+            DISPLAY=:0 SSH_ASKPASS="$ASK" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
+          SSH_ARGS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json, base64
+          from pathlib import Path
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.serialization import pkcs12
+          from apps.publisher.models import MobileApp
+          from apps.signing.models import AndroidSigningCredential
+          report={}
+          for slug in ('a-plus-solution','a-esthetic'):
+              app=MobileApp.objects.get(slug=slug)
+              stored=AndroidSigningCredential.objects.get(app=app)
+              material=stored.get_credentials()
+              raw=base64.b64decode(material['keystore_base64'])
+              key,cert,other=pkcs12.load_key_and_certificates(raw,material['store_password'].encode())
+              if key is None or cert is None:
+                  raise RuntimeError('Stored PKCS12 key or certificate invalid for '+slug)
+              public_fingerprint=':'.join(f'{b:02X}' for b in cert.fingerprint(hashes.SHA256()))
+              if public_fingerprint != stored.certificate_sha256.upper():
+                  raise RuntimeError('Certificate fingerprint mismatch inside Publisher for '+slug)
+              filename=f'/tmp/{slug}-upload-certificate.pem'
+              Path(filename).write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+              report[slug]={'certificate_sha256':public_fingerprint,'file':slug+'-upload-certificate.pem','private_key_exported':False}
+          print('PUBLIC_ANDROID_CERT_EXPORT='+json.dumps(report,sort_keys=True))
+          PY
+          for name in a-plus-solution a-esthetic; do
+            docker compose cp "web:/tmp/$name-upload-certificate.pem" "/tmp/$name-upload-certificate.pem" </dev/null >/dev/null
+            docker compose exec -T web rm -f "/tmp/$name-upload-certificate.pem" </dev/null
+          done
+          REMOTE
+          mkdir -p "$RUNNER_TEMP/android-public-certificates"
+          for name in a-plus-solution a-esthetic; do
+            scp "${SSH_ARGS[@]}" -P "$PORT" root@"$HOST":"/tmp/$name-upload-certificate.pem" "$RUNNER_TEMP/android-public-certificates/$name-upload-certificate.pem"
+            openssl x509 -in "$RUNNER_TEMP/android-public-certificates/$name-upload-certificate.pem" -noout >/dev/null
+          done
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" \
+            'rm -f /tmp/a-plus-solution-upload-certificate.pem /tmp/a-esthetic-upload-certificate.pem'
+          echo "PUBLIC_ANDROID_CERT_EXPORT_VALIDATED=1"
+      - name: Upload PUBLIC certificates only (never private upload keys)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-upload-certificates-for-play-key-reset-public-only
+          path: ${{ runner.temp }}/android-public-certificates/*.pem
+          if-no-files-found: error
+          retention-days: 30

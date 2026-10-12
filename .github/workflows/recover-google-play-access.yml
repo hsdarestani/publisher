@@ -1,0 +1,134 @@
+name: Recover Publisher Google Play access safely
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/recover-google-play-access.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Freeze first-boot releases and restore encrypted Google service account
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/publisher-recovery-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS_FILE="$RUNNER_TEMP/publisher-recovery-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS_FILE"
+            chmod 700 "$ASKPASS_FILE"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS_FILE" SSH_ASKPASS_REQUIRE=force \
+              setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
+          SSH_ARGS=(-i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          echo "=== Freeze stale initial 1.0.0 build jobs before reconnecting store credentials ==="
+          docker compose exec -T web python manage.py shell <<'PY'
+          from django.utils import timezone
+          from apps.publisher.models import Build, Job, Release
+          releases = Release.objects.filter(version_name='1.0.0', build_number=1, app__slug__in=['a-esthetic','a-plus-solution'])
+          changed = []
+          for release in releases:
+              release.auto_submit = False
+              release.status = 'draft'
+              release.save(update_fields=['auto_submit','status','updated_at'])
+              jobs = Job.objects.filter(release=release, type='build_android', status__in=['queued','running'])
+              ids = list(jobs.values_list('id', flat=True))
+              jobs.update(status='cancelled', available_to_agents=False, finished_at=timezone.now(), error='Archived first-boot placeholder build; recreate only after store credentials and signing fingerprints are verified.')
+              Build.objects.filter(release=release, platform='android').exclude(status='succeeded').update(status='failed')
+              changed.append({'app':release.app.slug,'cancelled_legacy_job_ids':ids})
+          print({'safe_placeholder_release_cleanup':changed})
+          PY
+          REMOTE
+
+          if [ -z "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::warning::GOOGLE_PLAY_SERVICE_ACCOUNT_JSON missing; Google account was not restored."
+            exit 0
+          fi
+
+          CRED_FILE="$RUNNER_TEMP/google-play-recovery.json"
+          printf '%s' "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" > "$CRED_FILE"
+          chmod 600 "$CRED_FILE"
+          python3 - "$CRED_FILE" <<'PY'
+          import json, sys
+          x=json.load(open(sys.argv[1],encoding='utf-8'))
+          if not x.get('private_key') or not x.get('client_email'):
+              raise ValueError('Service account JSON lacks a private_key or client_email')
+          print('Google service account JSON format validated.')
+          PY
+
+          REMOTE_FILE="/tmp/aplus-google-play-recovery-${GITHUB_RUN_ID}.json"
+          scp "${SSH_ARGS[@]}" -P "$PORT" "$CRED_FILE" root@"$HOST":"$REMOTE_FILE"
+          rm -f "$CRED_FILE"
+          ssh "${SSH_ARGS[@]}" -p "$PORT" root@"$HOST" bash -se -- "$REMOTE_FILE" <<'REMOTE'
+          set -euo pipefail
+          REMOTE_FILE="$1"
+          chmod 600 "$REMOTE_FILE"
+          cd /opt/aplus-publisher
+          trap 'docker compose exec -T web rm -f /tmp/google-play-restore.json >/dev/null 2>&1 || true; rm -f "$REMOTE_FILE"' EXIT
+          docker compose cp "$REMOTE_FILE" web:/tmp/google-play-restore.json >/dev/null
+          docker compose exec -T web chmod 600 /tmp/google-play-restore.json
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from django.utils import timezone
+          from apps.publisher.models import MobileApp, StoreAccount
+          from apps.integrations.google_play import GooglePlayClient
+          info=json.load(open('/tmp/google-play-restore.json',encoding='utf-8'))
+          account,_=StoreAccount.objects.get_or_create(provider='google',name='A+ Publisher Google Play')
+          account.set_credentials(info)
+          account.enabled=True
+          account.status='not_configured'
+          account.last_error=''
+          account.save()
+          print('Google account stored encrypted: yes; private key not logged.')
+          client=GooglePlayClient(account)
+          results={}
+          for slug in ['a-esthetic','a-plus-solution']:
+              app=MobileApp.objects.get(slug=slug)
+              try:
+                  result=client.test(app.package_name)
+                  ok=bool(result.ok)
+                  category='connected' if ok else 'test_failed'
+              except Exception as ex:
+                  ok=False
+                  category=type(ex).__name__
+              if ok:
+                  app.google_account=account
+                  app.save(update_fields=['google_account','updated_at'])
+              results[slug]={'package':app.package_name,'api_access':ok,'outcome':category,'linked':ok}
+          if all(i['api_access'] for i in results.values()):
+              account.status='connected'
+          elif any(i['api_access'] for i in results.values()):
+              account.status='partial'
+          else:
+              account.status='error'
+          account.last_tested_at=timezone.now()
+          account.save(update_fields=['status','last_tested_at','updated_at'])
+          print(json.dumps({'google_api_checks':results,'account_status':account.status},indent=2))
+          PY
+          REMOTE

@@ -17,3 +17,10 @@
     Permissions-Policy "camera=(), microphone=(), geolocation=()"
   }
 }
+
+# Reimflow test app; routed to its own limited containers on the Publisher Docker network.
+reimflow.smarbiz.sbs {
+  encode zstd gzip
+  reverse_proxy reimflow-web:80
+  header X-Content-Type-Options nosniff
+}

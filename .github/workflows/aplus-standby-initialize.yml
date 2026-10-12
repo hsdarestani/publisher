@@ -72,7 +72,7 @@ jobs:
 
           # The password is transferred only via already-authorized SSH, never via GitHub.
           umask 077
-          ssh -6 -q -i /root/.ssh/aplus_standby_to_primary -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes aplusstandby@"$PRIMARY_IPV6" 'cat ~/replication_password' > "$APP_DIR/.replication_password"
+          ssh -6 -q -i /root/.ssh/aplus_standby_to_primary -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes aplusstandby@"$PRIMARY_IPV6" 'cat ~/replication_password' </dev/null > "$APP_DIR/.replication_password"
           test -s "$APP_DIR/.replication_password"
           chmod 600 "$APP_DIR/.replication_password"
 

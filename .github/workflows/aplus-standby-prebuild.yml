@@ -1,0 +1,64 @@
+name: Prebuild emergency A+ Solution images without starting duplicate writers
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-prebuild.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-failover-prebuild
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 55
+    steps:
+      - name: Compile emergency app images on reserve capacity and verify Publisher
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test "$HOST" = 82.165.187.14 && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          K="$RUNNER_TEMP/aplus-prebuild-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/prebuild-askpass"
+            chmod 700 "$RUNNER_TEMP/prebuild-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/prebuild-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$K" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          D=/opt/aplussolution-standby
+          test ! -e "$D/failover-active"
+          test -s "$D/recovery/app/backend/Dockerfile"
+          test -s "$D/recovery/app/frontend/Dockerfile"
+          AVAIL="$(awk '/MemAvailable:/ {print int($2/1024)}' /proc/meminfo)"
+          FREE="$(df -Pm "$D" | awk 'NR==2 {print $4}')"
+          echo "Prebuild memory available: ${AVAIL} MB; disk available: ${FREE} MB"
+          test "$AVAIL" -ge 1200 && test "$FREE" -ge 18000
+          cd "$D"
+          test "$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "select pg_is_in_recovery()"' </dev/null | tr -d '[:space:]')" = t
+          C=(docker compose --env-file "$D/recovery/aplussolution.env" -f "$D/failover-compose.yaml")
+          timeout 30m nice -n 15 ionice -c3 "${C[@]}" build backend
+          echo FAILOVER_BACKEND_IMAGE_READY
+          timeout 20m nice -n 15 ionice -c3 "${C[@]}" build frontend
+          echo FAILOVER_FRONTEND_IMAGE_READY
+          docker image inspect aplussolution-failover-backend:local aplussolution-failover-frontend:local --format '{{.RepoTags}} {{.Size}}'
+          test "$(docker ps --format '{{.Names}}' | grep -c '^aplussolution-standby-' || true)" -eq 1
+          test ! -e "$D/failover-active"
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_STILL_HEALTHY_NO_APP_WRITERS_STARTED
+          REMOTE

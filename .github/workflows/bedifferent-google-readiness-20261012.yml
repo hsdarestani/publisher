@@ -1,0 +1,48 @@
+name: BE DIFFERENT Google Play live readiness Oct 12
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-google-readiness-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    env:
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - name: Install SSH helper
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Read live Publisher Android release state without changing it
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          PORT="${SSH_PORT:-22}"
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=20 root@"$HOST" 'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.publisher.readiness import evaluate_release
+          app=MobileApp.objects.filter(slug="be-different").first()
+          if not app:
+              print("STATE="+json.dumps({"error":"be-different app not found"})); raise SystemExit(2)
+          r=Release.objects.filter(app=app,version_name="1.2.0",build_number=10).first()
+          state={"app":{"id":app.pk,"slug":app.slug,"package":app.package_name,"google_linked":bool(app.google_account_id),"google_configured":bool(app.google_account and app.google_account.configured)},"release":None}
+          if r:
+              state["release"]={"id":r.pk,"version":r.version_name,"number":r.build_number,"status":r.status,"track":r.android_track,"auto_submit":r.auto_submit,"source_commit":r.source_commit,"builds":[{"id":b.pk,"platform":b.platform,"status":b.status,"artifact":bool(b.artifact),"commit":b.commit_sha} for b in r.builds.all()],"submissions":[{"platform":s.platform,"state":s.state,"external_id":s.external_id,"error":(s.last_error or "")[-350:]} for s in r.submissions.all()],"jobs":[{"id":j.pk,"type":j.type,"status":j.status,"error":(j.error or "")[-400:],"log_tail":(j.logs or "")[-350:] if j.status=="failed" else ""} for j in r.jobs.order_by("-created_at")[:20]]}
+              try:
+                  snap=evaluate_release(r)
+                  state["readiness"]=snap if isinstance(snap,(dict,list,str,bool)) else str(snap)
+              except Exception as e:
+                  state["readiness_error"]=str(e)[:350]
+          state["other_releases"]=[{"id":x.pk,"version":x.version_name,"number":x.build_number,"track":x.android_track} for x in Release.objects.filter(app=app).order_by("-created_at")[:8]]
+          print("STATE="+json.dumps(state,default=str,ensure_ascii=False))
+          PY

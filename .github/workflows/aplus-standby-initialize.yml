@@ -81,7 +81,7 @@ jobs:
           set -eu
           GW="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' aplus_standby_net)"
           test -n "$GW"
-          exec /usr/bin/ssh -6 -N -T \
+          exec /usr/bin/ssh -N -T \
             -i /root/.ssh/aplus_standby_to_primary \
             -o IdentitiesOnly=yes -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
@@ -108,6 +108,7 @@ jobs:
           UNIT
           systemctl daemon-reload
           systemctl enable --now aplus-standby-replication-tunnel.service
+          systemctl restart aplus-standby-replication-tunnel.service
           systemctl is-active --quiet aplus-standby-replication-tunnel.service
 
           docker pull -q postgres:16-alpine >/dev/null

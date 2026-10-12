@@ -1,0 +1,81 @@
+name: Install safe A+ Solution historical standby snapshots
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-snapshots.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-standby-snapshot-install
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install independent daily restore points and take the first snapshot
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test "$HOST" = 82.165.187.14 && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-snapshot-install-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/aplus-askpass"
+            chmod 700 "$RUNNER_TEMP/aplus-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/aplus-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          SCP=(scp -i "$KEY" -P "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          SSH=(ssh -i "$KEY" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          "${SCP[@]}" scripts/standby/snapshot-history.sh root@"$HOST":/tmp/aplus-standby-snapshot-history.sh
+          "${SSH[@]}" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          install -m 700 /tmp/aplus-standby-snapshot-history.sh /usr/local/sbin/aplus-standby-snapshot-history
+          rm -f /tmp/aplus-standby-snapshot-history.sh
+          cat >/etc/systemd/system/aplus-standby-snapshot.service <<'UNIT'
+          [Unit]
+          Description=Create verified historical snapshot of A+ Solution hot standby
+          Requires=docker.service
+          After=docker.service
+          [Service]
+          Type=oneshot
+          TimeoutStartSec=30min
+          ExecStart=/usr/local/sbin/aplus-standby-snapshot-history
+          UNIT
+          cat >/etc/systemd/system/aplus-standby-snapshot.timer <<'UNIT'
+          [Unit]
+          Description=Daily A+ Solution historical backup, keep 14 days
+          [Timer]
+          OnCalendar=*-*-* 03:20:00
+          RandomizedDelaySec=10min
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now aplus-standby-snapshot.timer
+          systemctl start aplus-standby-snapshot.service
+          systemctl is-active --quiet aplus-standby-snapshot.timer
+          test "$(find /opt/aplussolution-standby/snapshots -maxdepth 1 -type d -name 'backup-*' | wc -l)" -gt 0
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_HEALTHY_AFTER_HISTORICAL_BACKUP
+          REMOTE

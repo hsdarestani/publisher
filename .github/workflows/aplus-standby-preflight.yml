@@ -58,7 +58,7 @@ jobs:
           test -f /opt/aplus-publisher/docker-compose.yml
           cd /opt/aplus-publisher
           docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
-          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
           echo PUBLISHER_HEALTHY
           echo "=== PORT LISTENERS ==="
           ss -ltn | grep -E ':(80|443|5432|55432|15432)[[:space:]]' || true

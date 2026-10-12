@@ -211,6 +211,13 @@ jobs:
             if echo "$SITE" | grep -q 'Reimflow' && echo "$HEALTH" | grep -q '"ok": true'; then
               echo "Reimflow site: OK"
               echo "API status: $HEALTH"
+              # Verify the source deployed with the themed dark search skeleton.
+              LOADING_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/sonic-atelier.css?v=20261013-dark-loader')"
+              if [[ "$LOADING_CSS" != *'saSkeletonShimmer'* ]] || [[ "$SITE" != *'20261013-dark-loader'* ]]; then
+                echo "::error::Reimflow site is up but dark skeleton stylesheet is stale."
+                exit 1
+              fi
+              echo "Dark skeleton CSS: verified"
               exit 0
             fi
             sleep 4

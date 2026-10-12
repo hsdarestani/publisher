@@ -169,7 +169,7 @@ jobs:
           docker compose config --quiet
           docker compose up -d --pull always --remove-orphans
           for i in $(seq 1 20); do
-            if docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8787/api/health',timeout=3).read().decode())"; then
+            if docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8787/api/health',timeout=3).read().decode())" </dev/null; then
               break
             fi
             if [ "$i" -eq 20 ]; then docker compose logs --tail=50 api web; exit 1; fi
@@ -187,8 +187,8 @@ jobs:
           CADDY
           fi
           cd /opt/aplus-publisher
-          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
-          docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
+          docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
           docker exec "$CADDY_ID" wget -qO- http://reimflow-web/ | grep -q Reimflow
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."

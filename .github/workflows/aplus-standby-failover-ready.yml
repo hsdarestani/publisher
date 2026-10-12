@@ -1,0 +1,97 @@
+name: Install and rehearse A+ Solution one-way disaster failover
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-failover-ready.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-failover-preparation
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install manual-only cutover toolkit and rehearse historical restore
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test "$HOST" = 82.165.187.14 && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-failover-ready-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/askpass-failover"
+            chmod 700 "$RUNNER_TEMP/askpass-failover"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/askpass-failover" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          SCP=(scp -i "$KEY" -P "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          SSH=(ssh -i "$KEY" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          "${SCP[@]}" -r scripts/standby root@"$HOST":/tmp/aplus-standby-ops-new
+          "${SSH[@]}" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          D=/opt/aplussolution-standby
+          S=/tmp/aplus-standby-ops-new
+          test -s "$S/failover-compose.yaml"
+          test -s "$S/failover-edge.Caddyfile"
+          test -s "$S/restore-test.sh"
+          install -m 600 "$S/failover-compose.yaml" "$D/failover-compose.yaml"
+          install -m 600 "$S/failover-edge.Caddyfile" "$D/failover-edge.Caddyfile"
+          install -m 700 "$S/snapshot-history.sh" /usr/local/sbin/aplus-standby-snapshot-history
+          install -m 700 "$S/restore-test.sh" /usr/local/sbin/aplus-standby-restore-test
+          install -m 700 "$S/prepare-failover.sh" /usr/local/sbin/aplus-standby-prepare
+          install -m 700 "$S/activate-failover.sh" /usr/local/sbin/aplus-standby-activate
+          install -m 700 "$S/start-failover-workers.sh" /usr/local/sbin/aplus-standby-start-workers
+          install -m 700 "$S/maintain-ingress.sh" /usr/local/sbin/aplus-standby-maintain-ingress
+          rm -rf "$S"
+          cat >/etc/systemd/system/aplus-failover-ingress-guard.service <<'UNIT'
+          [Unit]
+          Description=Preserve explicit A+ DR ingress across Publisher redeploys
+          ConditionPathExists=/opt/aplussolution-standby/failover-active
+          Requires=docker.service
+          After=docker.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/aplus-standby-maintain-ingress
+          UNIT
+          cat >/etc/systemd/system/aplus-failover-ingress-guard.timer <<'UNIT'
+          [Unit]
+          Description=Reattach manually activated A+ failover ingress if needed
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=2min
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now aplus-failover-ingress-guard.timer
+          /usr/local/sbin/aplus-standby-prepare
+          /usr/local/sbin/aplus-standby-restore-test
+          test ! -e "$D/failover-active"
+          systemctl is-active --quiet aplus-standby-snapshot.timer
+          systemctl is-active --quiet aplus-standby-file-sync.timer
+          systemctl is-active --quiet aplus-standby-replication-tunnel.service
+          echo FAILOVER_SCRIPTS_INSTALLED_BUT_NOT_ACTIVATED
+          echo READ_ONLY_STREAMING_REMAINS_ENABLED
+          REMOTE
+          curl -fsS --max-time 15 -D /tmp/aplus-primary-headers -o /tmp/aplus-primary-body https://app.aplus-solution.de/health/
+          grep -qi '^x-aplus-origin: strato-primary' /tmp/aplus-primary-headers
+          echo ORIGINAL_PRODUCTION_STILL_ON_PRIMARY

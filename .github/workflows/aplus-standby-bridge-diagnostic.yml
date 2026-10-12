@@ -1,0 +1,56 @@
+name: Diagnose A+ standby SSH bridge on new STRATO
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-bridge-diagnostic.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Diagnose standby bridge without mutation
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY" && test "$HOST" = "82.165.187.14"
+          K="$RUNNER_TEMP/standby-diag-key"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/ssh-askpass"
+            chmod 700 "$RUNNER_TEMP/ssh-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/ssh-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$K" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          echo "=== Tunnel systemd ==="
+          systemctl is-active aplus-standby-replication-tunnel.service || true
+          journalctl -u aplus-standby-replication-tunnel.service --no-pager -n 22 || true
+          echo "=== Network ==="
+          docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' aplus_standby_net || true
+          ip -4 address show | grep -E 'inet |aplus' || true
+          echo "=== Port 55432 listener ==="
+          ss -lntp | grep 55432 || true
+          echo "=== Postgres image ==="
+          docker images --format '{{.Repository}}:{{.Tag}}' | grep postgres || true
+          echo "=== pg_isready network test ==="
+          GW="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' aplus_standby_net)"
+          timeout 18 docker run --rm --network aplus_standby_net postgres:16-alpine pg_isready -h "$GW" -p 55432 -U replicator </dev/null || true
+          echo "=== Publisher ==="
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          echo PUBLISHER_HEALTHY
+          REMOTE

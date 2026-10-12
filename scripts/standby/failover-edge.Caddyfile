@@ -1,0 +1,28 @@
+:80 {
+    encode zstd gzip
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+    handle /admin/* {
+        reverse_proxy backend:8000
+    }
+    handle_path /static/* {
+        root * /srv/static
+        file_server
+    }
+    handle_path /media/* {
+        root * /srv/media
+        file_server
+    }
+    handle /health/ {
+        reverse_proxy backend:8000
+    }
+    handle {
+        reverse_proxy frontend:80
+    }
+    header {
+        X-Aplus-Origin "strato-publisher-failover"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+    }
+}

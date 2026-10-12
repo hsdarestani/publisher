@@ -1,0 +1,44 @@
+name: Verify standby SSH tunnel to primary
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-tunnel-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Check new STRATO to old STRATO restricted SSH over IPv6
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14" && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          K="$RUNNER_TEMP/standby-probe-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/ssh-askpass"
+            chmod 700 "$RUNNER_TEMP/ssh-askpass"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/ssh-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -p "${SSH_PORT:-22}" -i "$K" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          echo "=== IPv6 route ==="
+          ip -6 route show default || true
+          echo "=== Restricted standby access ==="
+          timeout 24 ssh -6 -i /root/.ssh/aplus_standby_to_primary -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 aplusstandby@2a01:239:44b:d900::1 'test -s ~/replication_password && echo STANDBY_PRIMARY_REPLICATION_SECRET_ACCESS_OK'
+          REMOTE

@@ -56,6 +56,10 @@ jobs:
           echo '=== TLS cert logs ==='
           cd /opt/aplus-publisher
           docker compose logs --since 20m --tail=250 caddy 2>&1 | grep -iE 'reimflow|tls|acme|certificate|challenge|error' | tail -n 100 || true
+          echo '=== certificate storage ==='
+          docker compose exec -T caddy sh -c 'find /data/caddy/certificates -maxdepth 5 -type f 2>/dev/null | sed -n "1,30p"' || true
+          echo '=== last 350 Caddy logs ==='
+          docker compose logs --tail=350 caddy || true
           echo '=== local firewall ==='
           ufw status 2>/dev/null || true
           REMOTE
@@ -64,5 +68,9 @@ jobs:
         run: |
           echo 'Direct HTTPS to origin:'
           curl -ksSIL --max-time 10 --resolve reimflow.smarbiz.sbs:443:82.165.187.14 https://reimflow.smarbiz.sbs/ || true
+          echo 'Direct origin HTTP:'
+          curl -sSI --connect-timeout 4 --max-time 9 --resolve reimflow.smarbiz.sbs:80:82.165.187.14 http://reimflow.smarbiz.sbs/ || true
+          echo 'Publisher public HTTPS:'
+          curl -sSIL --max-time 10 https://publisher.smarbiz.sbs/healthz/ || true
           echo 'Public HTTPS:'
           curl -sSIL --max-time 10 https://reimflow.smarbiz.sbs/ || true

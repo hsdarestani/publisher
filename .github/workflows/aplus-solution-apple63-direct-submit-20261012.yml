@@ -1,0 +1,107 @@
+name: A+ Solution Apple 63 Direct Review Retry
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-solution-apple63-direct-submit-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-solution-apple-review-63
+  cancel-in-progress: false
+jobs:
+  apple-review:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - name: Verify live Apple Build 63 and submit review from Publisher
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-apple-review-63-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/aplus-apple-review-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json, time
+          from django.utils import timezone
+          from apps.publisher.models import Release, Job, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.base import IntegrationError
+          release=Release.objects.get(app__slug='a-plus-solution',version_name='1.0.27',build_number=63)
+          assert release.source_commit=='84b3e2d2f624cf0a0e64a14bb470cd5e2ef39e8e'
+          ios=release.builds.get(platform='ios')
+          assert ios.status=='succeeded' and bool(ios.artifact) and bool(ios.external_build_id)
+          app=release.app
+          assert app.review_username and app.get_review_password()
+          c=AppleStoreClient(app.apple_account); aa=c.find_app(app.bundle_id)
+          versions=c.list_versions(aa['id'],limit=100)
+          vv=next((v for v in versions if (v.get('attributes') or {}).get('versionString')=='1.0.27'),None)
+          assert vv is not None and (vv.get('attributes') or {}).get('appStoreState') in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW')
+          builds=c.list_builds(aa['id'],build_number=63,limit=50)
+          assert any(str(x['id'])==str(ios.external_build_id) and (x.get('attributes') or {}).get('processingState')=='VALID' for x in builds)
+          before={}
+          for state in ('READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES'):
+              before[state]=[]
+              for submission in c.list_review_submissions(aa['id'],state):
+                  item,items=c._review_submission_matches(submission,vv['id'])
+                  if item or (not items and state=='READY_FOR_REVIEW'):
+                      before[state].append({'submission_id':submission['id'],'item_id':item['id'] if item else None,'item_state':(item.get('attributes') or {}).get('state') if item else None,'item_count':len(items)})
+          print('APPLE63_RETRY_PREFLIGHT='+json.dumps(before,separators=(',',':')))
+          previous=Submission.objects.filter(release=release,platform='ios',state__in=['in_review','approved','live']).first()
+          if previous:
+              print('APPLE63_ALREADY_RECORDED='+json.dumps({'state':previous.state,'submission':previous.external_id}))
+          else:
+              for attempt in range(1,4):
+                  try:
+                      result=c.submit_version(aa['id'],vv['id'])
+                      state=(result['submission'].get('attributes') or {}).get('state')
+                      if state=='READY_FOR_REVIEW' and not result.get('already_submitted'):
+                          raise RuntimeError('Apple did not transition review submission out of READY_FOR_REVIEW')
+                      s,_=Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':result['submission']['id'],'submitted_at':timezone.now(),'raw':result})
+                      release.status='in_review';release.save(update_fields=['status','updated_at'])
+                      print('APPLE63_SUBMITTED='+json.dumps({'id':s.external_id,'state':state,'reused':result.get('reused',False),'already_submitted':result.get('already_submitted',False),'attempt':attempt}))
+                      break
+                  except Exception as ex:
+                      print('APPLE63_RETRY_ERROR='+json.dumps({'attempt':attempt,'type':type(ex).__name__,'error':str(ex)[:1000]}))
+                      submitted=[]
+                      for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                          for sub in c.list_review_submissions(aa['id'],state):
+                              item,_=c._review_submission_matches(sub,vv['id'])
+                              if item: submitted.append({'id':sub['id'],'state':state})
+                      if submitted:
+                          result={'submission':{'id':submitted[0]['id'],'attributes':{'state':submitted[0]['state']}}}
+                          Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':submitted[0]['id'],'submitted_at':timezone.now(),'raw':result})
+                          release.status='in_review';release.save(update_fields=['status','updated_at'])
+                          print('APPLE63_SUBMITTED_AFTER_SERVER_ERROR='+json.dumps(submitted))
+                          break
+                      if attempt==3:raise
+                      time.sleep(12*attempt)
+          PY
+          REMOTE

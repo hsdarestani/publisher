@@ -28,7 +28,7 @@ jobs:
       - name: Verify Android only build 10
         run: |
           node -e 'const e=require("./mobile/app.json").expo; if(e.version!=="1.2.0" || e.android.versionCode!==10 || e.android.package!=="com.smarbiz.bedifferent") process.exit(2)'
-          node -e 'const r=require("./release-request.json"); if(JSON.stringify(r.platforms)!=="[\\"android\\"]" || r.build_number!==10 || !r.auto_submit) process.exit(3)'
+          node -e 'const r=require("./release-request.json"); if(r.platforms.length!==1 || r.platforms[0]!=="android" || r.build_number!==10 || !r.auto_submit) process.exit(3)'
 
       - name: Set up Node
         uses: actions/setup-node@v4

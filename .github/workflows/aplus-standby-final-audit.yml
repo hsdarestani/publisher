@@ -1,0 +1,82 @@
+name: Final audit of A+ Solution standby and Publisher isolation
+on:
+  push:
+    branches: [ops/aplus-standby-20261012]
+    paths:
+      - '.github/workflows/aplus-standby-final-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Verify standby is streaming read-only and Publisher healthy
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$HOST" = "82.165.187.14" && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          K="$RUNNER_TEMP/aplus-audit-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$K"
+          chmod 600 "$K"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$RUNNER_TEMP/askpass-audit"
+            chmod 700 "$RUNNER_TEMP/askpass-audit"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/askpass-audit" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$K" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$K" -p "${SSH_PORT:-22}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplussolution-standby
+          echo "=== Replica status ==="
+          docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
+          RECOVERY="$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select pg_is_in_recovery()"' </dev/null | tr -d '[:space:]')"
+          RECEIVER="$(docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select status from pg_stat_wal_receiver"' </dev/null | tr -d '[:space:]')"
+          test "$RECOVERY" = t && test "$RECEIVER" = streaming
+          echo REPLICA_READ_ONLY_AND_STREAMING_OK
+          echo "=== WAL positions ==="
+          docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select coalesce(pg_last_wal_receive_lsn()::text,chr(45)),coalesce(pg_last_wal_replay_lsn()::text,chr(45))"' </dev/null
+          echo "=== No app writers ==="
+          test "$(docker ps --format '{{.Names}}' | grep -c '^aplussolution-standby-' || true)" -eq 1
+          C="$(docker compose ps -q db)"
+          test -n "$C"
+          PORTS="$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$C")"
+          echo "Database container ports: $PORTS"
+          ! docker port "$C" 5432 >/dev/null 2>&1
+          echo STANDBY_NO_PUBLIC_DB_PORT_NO_WORKERS
+          echo "=== Sync timers and source packages ==="
+          systemctl is-active --quiet aplus-standby-replication-tunnel.service
+          systemctl is-active --quiet aplus-standby-file-sync.timer
+          systemctl is-failed --quiet aplus-standby-file-sync.service && exit 1 || true
+          test -f /opt/aplussolution-standby/last-file-sync-success
+          test -s /opt/aplussolution-standby/recovery/aplussolution.env
+          test -s /opt/aplussolution-standby/recovery/app-source.tgz
+          echo MEDIA_RECOVERY_SOURCE_PRESENT
+          du -sh /opt/aplussolution-standby/media /opt/aplussolution-standby/recovery
+          stat -c 'Last successful file sync %y' /opt/aplussolution-standby/last-file-sync-success
+          echo "=== Host resources ==="
+          free -m
+          df -h /
+          echo "=== Publisher health ==="
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
+          echo PUBLISHER_HEALTHY_AFTER_STANDBY
+          REMOTE
+      - name: Confirm original A+ Solution production still routes to primary
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 15 -D /tmp/headers -o /tmp/health https://app.aplus-solution.de/health/
+          grep -q '"status"' /tmp/health
+          grep -qi '^x-aplus-origin: strato-primary' /tmp/headers
+          echo ORIGINAL_STRATO_PRIMARY_SERVING_OK

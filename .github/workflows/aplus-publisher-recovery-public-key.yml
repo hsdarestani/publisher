@@ -1,0 +1,41 @@
+name: Publisher access recovery public key
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-publisher-recovery-public-key.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  show_public_key:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 4
+    env:
+      HOST: ${{ secrets.HOST }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+    steps:
+      - name: Print only the existing public SSH key, never the private key
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          KEY="$RUNNER_TEMP/aplus-existing-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            PUB="$(ssh-keygen -y -P "$SSH_KEY_PASSPHRASE" -f "$KEY")"
+          else
+            PUB="$(ssh-keygen -y -P '' -f "$KEY")"
+          fi
+          case "$PUB" in ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *) ;; *) echo "Unexpected key type"; exit 1;; esac
+          echo "PUBLISHER_EXISTING_PUBLIC_SSH_KEY=$PUB"
+          echo "PUBLISHER_PUBLIC_KEY_FINGERPRINT=$(printf '%s\n' "$PUB" | ssh-keygen -lf -)"
+          if [ "$HOST" = "82.165.187.14" ]; then
+            echo "PUBLISHER_TARGET_MATCHES_KNOWN_STRATO_IP=yes"
+          else
+            echo "PUBLISHER_TARGET_MATCHES_KNOWN_STRATO_IP=no"
+          fi
+          rm -f "$KEY"

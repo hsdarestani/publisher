@@ -1,0 +1,30 @@
+name: A+ Solution Publisher release API auth preflight
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-calendar-automation-api-preflight.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    env:
+      TOKEN: ${{ secrets.PUBLISHER_AUTOMATION_TOKEN }}
+    steps:
+      - name: Validate release API authorization with intentionally invalid non-mutating payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TOKEN" || { echo 'PUBLISHER_AUTOMATION_TOKEN_MISSING'; exit 1; }
+          code=$(curl --retry 2 --retry-all-errors --retry-delay 3 --max-time 30 -sS -o /tmp/aplus-api-probe.json -w '%{http_code}' -X POST 'https://publisher.smarbiz.sbs/apps/automation/release/' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" --data '{}')
+          echo "PUBLISHER_AUTOMATION_AUTH_HTTP=$code"
+          if [ "$code" = 422 ]; then
+            echo 'PUBLISHER_AUTOMATION_AUTHORIZED_READY'
+          else
+            echo 'PUBLISHER_AUTOMATION_AUTH_UNAVAILABLE'
+            exit 1
+          fi
+          rm -f /tmp/aplus-api-probe.json

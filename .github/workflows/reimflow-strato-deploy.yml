@@ -32,9 +32,10 @@ jobs:
           python3 -m py_compile reimflow-src/api.py reimflow-src/rap-flow-analysis.py
           cd reimflow-src
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
+          python3 -m unittest discover -s tests -p "test_rhyme_api.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js rhyme-fallback.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -69,7 +70,7 @@ jobs:
             ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
           fi
           ENVFILE="$RUNNER_TEMP/reimflow-strato.env"
-          printf 'OPENAI_MODEL=gpt-5-mini\n' > "$ENVFILE"
+          printf 'OPENAI_MODEL=gpt-4o-mini\n' > "$ENVFILE"
           if [ -n "$OPENAI_API_KEY" ]; then
             printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$ENVFILE"
           fi
@@ -185,6 +186,10 @@ jobs:
           cd /opt/reimflow
           docker compose config --quiet
           docker compose up -d --pull always --remove-orphans
+          # api.py uses bind mounts and replacement inodes: recreate just API to
+          # guarantee current code and model settings are running.
+          docker compose up -d --no-deps --force-recreate api
+          echo "Reimflow rhyme API restarted with updated configuration."
           # Mount content is updated without guaranteeing container recreation;
           # always load the new nginx location/body-size configuration safely.
           docker compose exec -T web nginx -t </dev/null
@@ -245,6 +250,27 @@ jobs:
               },ensure_ascii=False))
           except Exception as exc: print("Rhyme response was not JSON:",type(exc).__name__)
           PY
+      - name: Require real rhyme AI results for Blue Talisman
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS="$(curl -sS --max-time 58 -o "$RUNNER_TEMP/blue-search-response" -w '%{http_code}' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json' \
+            -d '{"query":"Blue Talisman","category":"Alle","syllables":"Alle"}' \
+            https://reimflow.smarbiz.sbs/api/rhymes || true)"
+          echo "Blue Talisman live search HTTP: $STATUS"
+          if [[ "$STATUS" != "200" ]]; then
+            echo "::error::Actual AI rhyme engine still failed for Blue Talisman (HTTP $STATUS)."
+            exit 1
+          fi
+          python3 - "$RUNNER_TEMP/blue-search-response" <<'PY'
+          import json,sys
+          with open(sys.argv[1],encoding="utf8") as f: data=json.load(f)
+          count=len(data.get("rhymes") or [])
+          print("Real AI rhymes returned:",count,"engine:",data.get("engine"),"model:",data.get("model"))
+          if not data.get("ok") or data.get("engine")!="ai_phonetic" or count<4:
+              raise SystemExit("Rhyme service must produce at least four actual AI matches")
+          PY
       - name: Verify public domain and AI health
         shell: bash
         run: |
@@ -293,8 +319,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261014-de1')"
-              if [[ "$SITE" != *'app.js?v=20261014-de1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-rhyme1')"
+              if [[ "$SITE" != *'app.js?v=20261015-rhyme1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi
@@ -333,6 +359,12 @@ jobs:
                 exit 1
               fi
               echo "Recording WAV duration and robust HTTP analysis errors: verified"
+              OFFLINE_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-fallback.js?v=20261015-rhyme1')"
+              if [[ "$SITE" != *'rhyme-fallback.js?v=20261015-rhyme1'* ]] || [[ "$APP_JS" != *'Vorschläge ohne KI-Prüfung'* ]] || [[ "$OFFLINE_JS" != *'ReimflowOfflineRhymes'* ]]; then
+                echo "::error::Rhyme search offline recovery is not deployed."
+                exit 1
+              fi
+              echo "Rhyme search offline recovery: verified"
 
               # One-time synthetic local audio probe: no user audio ever involved.
               if [[ "${{ github.event.head_commit.message }}" == *"[rap-api-smoke]"* ]]; then

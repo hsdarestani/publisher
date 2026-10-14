@@ -34,7 +34,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -282,9 +282,9 @@ jobs:
                 exit 1
               fi
               echo "German Flow Challenge interface and scoring: verified"
-              RAP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.js?v=20261014-rap2')"
-              RAP_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.css?v=20261014-rap2')"
-              if [[ "$SITE" != *'id="rapPanel"'* ]] || [[ "$SITE" != *'rap-flow.js?v=20261014-rap2'* ]] || [[ "$RAP_JS" != *'Reimflow Rap Flow Analyse Beta'* ]] || [[ "$RAP_CSS" != *'Reimflow Rap Flow Analysis'* ]]; then
+              RAP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.js?v=20261015-wav1')"
+              RAP_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.css?v=20261015-wav1')"
+              if [[ "$SITE" != *'id="rapPanel"'* ]] || [[ "$SITE" != *'rap-flow.js?v=20261015-wav1'* ]] || [[ "$RAP_JS" != *'Reimflow Rap Flow Analyse Beta'* ]] || [[ "$RAP_CSS" != *'Reimflow Rap Flow Analysis'* ]]; then
                 echo "::error::Rap Flow recording studio is not available in production."
                 exit 1
               fi
@@ -300,6 +300,42 @@ jobs:
                 exit 1
               fi
               echo "Rap analysis result and error feedback: verified"
+              WAV_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-audio.js?v=20261015-wav1')"
+              if [[ "$SITE" != *'rap-audio.js?v=20261015-wav1'* ]] || [[ "$SITE" != *'id="rapRecordingDuration"'* ]] || [[ "$WAV_JS" != *'ReimflowRapAudio'* ]] || [[ "$RAP_JS" != *'Tatsächliche Aufnahmelänge'* ]]; then
+                echo "::error::Reimflow real WAV duration metadata patch is missing on the site."
+                exit 1
+              fi
+              echo "Recording WAV duration and robust HTTP analysis errors: verified"
+
+              # One-time synthetic local audio probe: no user audio ever involved.
+              if [[ "${{ github.event.head_commit.message }}" == *"[rap-api-smoke]"* ]]; then
+                python3 - <<'PY'
+import math, struct, wave
+with wave.open("/tmp/reimflow-probe.wav","wb") as w:
+    w.setnchannels(1);w.setsampwidth(2);w.setframerate(16000)
+    w.writeframes(b"".join(struct.pack("<h",int(1500*math.sin(2*math.pi*220*i/16000))) for i in range(32000)))
+PY
+                RESP_HEADERS="$(mktemp)"
+                RESP_BODY="$(mktemp)"
+                RAP_PROBE_STATUS="$(curl -sS -o "$RESP_BODY" -D "$RESP_HEADERS" --max-time 95 -w '%{http_code}' -X POST \
+                  'https://reimflow.smarbiz.sbs/api/flow/analyze' \
+                  -F 'audio=@/tmp/reimflow-probe.wav;type=audio/wav' -F 'bpm=92' \
+                  -F 'bars=4' -F 'beat_offset=0.5' || true)"
+                echo "Synthetic audio transcription end-to-end HTTP: $RAP_PROBE_STATUS"
+                grep -iE '^content-type:|^server:' "$RESP_HEADERS" | head -n 4 || true
+                python3 - "$RESP_BODY" <<'PY'
+import json,sys
+data=open(sys.argv[1],"rb").read(1400)
+try:
+  j=json.loads(data)
+  print("Synthetic voice probe JSON:",json.dumps({"ok":j.get("ok"),"status":j.get("status"),"error":j.get("error"),"message":j.get("message")},ensure_ascii=False))
+except Exception:
+  print("Synthetic voice probe content (first 250 characters):",data[:250].decode("utf8","replace"))
+PY
+                test "$RAP_PROBE_STATUS" = "200" || { echo "::error::Synthetic end-to-end transcription failed"; exit 1; }
+                rm -f /tmp/reimflow-probe.wav "$RESP_HEADERS" "$RESP_BODY"
+              fi
+
               exit 0
             fi
             sleep 4

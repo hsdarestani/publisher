@@ -249,6 +249,13 @@ jobs:
                 exit 1
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
+              # Regression guard: navigation must iterate across all page sections.
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261014-navfix1')"
+              if [[ "$SITE" != *'app.js?v=20261014-navfix1'* ]] || [[ "$APP_JS" != *'$(".page").forEach'* ]]; then
+                echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
+                exit 1
+              fi
+              echo "Navigation repair: live JavaScript verified"
               exit 0
             fi
             sleep 4

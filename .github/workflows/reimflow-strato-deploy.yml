@@ -310,11 +310,11 @@ jobs:
               # One-time synthetic local audio probe: no user audio ever involved.
               if [[ "${{ github.event.head_commit.message }}" == *"[rap-api-smoke]"* ]]; then
                 python3 - <<'PY'
-import math, struct, wave
-with wave.open("/tmp/reimflow-probe.wav","wb") as w:
-    w.setnchannels(1);w.setsampwidth(2);w.setframerate(16000)
-    w.writeframes(b"".join(struct.pack("<h",int(1500*math.sin(2*math.pi*220*i/16000))) for i in range(32000)))
-PY
+          import math, struct, wave
+          with wave.open("/tmp/reimflow-probe.wav","wb") as w:
+              w.setnchannels(1);w.setsampwidth(2);w.setframerate(16000)
+              w.writeframes(b"".join(struct.pack("<h",int(1500*math.sin(2*math.pi*220*i/16000))) for i in range(32000)))
+          PY
                 RESP_HEADERS="$(mktemp)"
                 RESP_BODY="$(mktemp)"
                 RAP_PROBE_STATUS="$(curl -sS -o "$RESP_BODY" -D "$RESP_HEADERS" --max-time 95 -w '%{http_code}' -X POST \
@@ -324,14 +324,14 @@ PY
                 echo "Synthetic audio transcription end-to-end HTTP: $RAP_PROBE_STATUS"
                 grep -iE '^content-type:|^server:' "$RESP_HEADERS" | head -n 4 || true
                 python3 - "$RESP_BODY" <<'PY'
-import json,sys
-data=open(sys.argv[1],"rb").read(1400)
-try:
-  j=json.loads(data)
-  print("Synthetic voice probe JSON:",json.dumps({"ok":j.get("ok"),"status":j.get("status"),"error":j.get("error"),"message":j.get("message")},ensure_ascii=False))
-except Exception:
-  print("Synthetic voice probe content (first 250 characters):",data[:250].decode("utf8","replace"))
-PY
+          import json,sys
+          data=open(sys.argv[1],"rb").read(1400)
+          try:
+            j=json.loads(data)
+            print("Synthetic voice probe JSON:",json.dumps({"ok":j.get("ok"),"status":j.get("status"),"error":j.get("error"),"message":j.get("message")},ensure_ascii=False))
+          except Exception:
+            print("Synthetic voice probe content (first 250 characters):",data[:250].decode("utf8","replace"))
+          PY
                 test "$RAP_PROBE_STATUS" = "200" || { echo "::error::Synthetic end-to-end transcription failed"; exit 1; }
                 rm -f /tmp/reimflow-probe.wav "$RESP_HEADERS" "$RESP_BODY"
               fi

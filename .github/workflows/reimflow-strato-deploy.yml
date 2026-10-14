@@ -29,14 +29,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile reimflow-src/api.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py
+          python3 -m py_compile reimflow-src/api.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py
           cd reimflow-src
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           python3 -m unittest discover -s tests -p "test_rhyme_api.py"
           python3 -m unittest discover -s tests -p "test_rhyme_quality.py"
+          python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js rhyme-fallback.js api.py rhyme-quality.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js rhyme-fallback.js rhyme-previews.js api.py rhyme-quality.py rhyme-intent.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -96,7 +97,8 @@ jobs:
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
           mv /opt/reimflow/site/rap-flow-analysis.py /opt/reimflow/rap-flow-analysis.py
           mv /opt/reimflow/site/rhyme-quality.py /opt/reimflow/rhyme-quality.py
-          chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py
+          mv /opt/reimflow/site/rhyme-intent.py /opt/reimflow/rhyme-intent.py
+          chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py /opt/reimflow/rhyme-intent.py
           cp /tmp/reimflow-strato.env /opt/reimflow/.env
           chmod 600 /opt/reimflow/.env
           printf 'PUBLISHER_NETWORK=%s\n' "$PUBLISHER_NETWORK" >> /opt/reimflow/.env
@@ -182,6 +184,7 @@ jobs:
                 - ./api.py:/app/api.py:ro
                 - ./rap-flow-analysis.py:/app/rap-flow-analysis.py:ro
                 - ./rhyme-quality.py:/app/rhyme-quality.py:ro
+                - ./rhyme-intent.py:/app/rhyme-intent.py:ro
                 - ./data:/var/lib/reimflow
               read_only: true
               tmpfs:
@@ -267,7 +270,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for QUERY in "Blue Ferrari" "Blue Talisman"; do
+          for QUERY in "Blue Ferrari" "Blue Talisman" "Blue paper"; do
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
@@ -289,6 +292,10 @@ jobs:
           assert data.get("review_model"),"Second model must judge every result"
           assert all(x.get("strength") in ("stark","brauchbar") for x in items)
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
+          if query=="Blue paper":
+              assert len(items)>=2,"Expected multiple quality-reviewed paper rhymes, not an empty result"
+              assert any(x.get("scope")=="end_word" for x in items),"Expected final word rhymes"
+              assert any(x.get("scope") in ("full_phrase","phrase_variation") for x in items),"Expected meaningful multiword lyric matches"
           if query=="Blue Ferrari":
               rejected={"toyota","karaoke","marinade","batterie","fabriki"}
               assert not rejected.intersection(str(x.get("word","")).casefold() for x in items),"Phonetically weak Ferrari matches passed"
@@ -342,8 +349,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-quality1')"
-              if [[ "$SITE" != *'app.js?v=20261015-quality1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-phrase2')"
+              if [[ "$SITE" != *'app.js?v=20261015-phrase2'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi
@@ -388,6 +395,12 @@ jobs:
                 exit 1
               fi
               echo "Rhyme search offline recovery: verified"
+              PREVIEW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-previews.js?v=20261015-phrase2')"
+              if [[ "$SITE" != *'rhyme-previews.js?v=20261015-phrase2'* ]] || [[ "$PREVIEW_JS" != *'ReimflowRhymePreviews'* ]] || [[ "$APP_JS" != *'Sofort-Ideen fürs Endwort'* ]]; then
+                echo "::error::Immediate phrase and anchor rhyme previews are not deployed."
+                exit 1
+              fi
+              echo "Fast paper phrase anchor suggestions: verified"
 
               # One-time synthetic local audio probe: no user audio ever involved.
               if [[ "${{ github.event.head_commit.message }}" == *"[rap-api-smoke]"* ]]; then

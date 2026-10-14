@@ -1,0 +1,91 @@
+name: A+ Solution 1.0.28 Apple submission follow-through
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-ios-calendar-128-finalize.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: aplus-ios-calendar-128-finalize
+  cancel-in-progress: false
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 85
+    env:
+      PUB_USER: ${{ secrets.ADMIN_EMAIL }}
+      PUB_PASS: ${{ secrets.ADMIN_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Observe latest iOS build, wake upload agent, and confirm real Apple submission
+        run: |
+          pip -q install requests beautifulsoup4
+          python3 -u - <<'PY'
+          import os, time, requests
+          from bs4 import BeautifulSoup
+          root='https://publisher.smarbiz.sbs'
+          path='/apps/releases/6/'
+          s=requests.Session()
+          def csrf(html):
+              f=BeautifulSoup(html,'html.parser').select_one('input[name=csrfmiddlewaretoken]')
+              assert f, 'Publisher CSRF field missing'
+              return f.get('value')
+          login=s.get(root+'/accounts/login/',timeout=30)
+          login.raise_for_status()
+          signin=s.post(root+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':csrf(login.text)},headers={'Referer':root+'/accounts/login/'},timeout=30)
+          assert signin.status_code==200,'Publisher login failed'
+          def detail():
+              r=s.get(root+path,timeout=30);r.raise_for_status()
+              assert '/accounts/login/' not in r.url,'Publisher login expired'
+              assert '1.0.28' in r.text and '64' in r.text,'Incorrect release'
+              return BeautifulSoup(r.text,'html.parser')
+          def do(action, doc):
+              response=s.post(root+path+'action/'+action+'/',data={'csrfmiddlewaretoken':csrf(str(doc))},headers={'Referer':root+path},timeout=40)
+              response.raise_for_status()
+              assert '/accounts/login/' not in response.url,'Publisher session lost during action'
+          def wake():
+              url='https://api.github.com/repos/hsdarestani/publisher/actions/workflows/cloud-macos.yml/dispatches'
+              response=requests.post(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'},json={'ref':'main'},timeout=30)
+              assert response.status_code==204,'Unable to wake cloud Mac: HTTP '+str(response.status_code)
+              print('WOKE_CLOUD_MAC',flush=True)
+          last='';wakes=0;last_wake=time.monotonic()
+          for i in range(150):
+              try:
+                  doc=detail()
+                  rows={}
+                  for a in doc.select('a.compact-row'):
+                      title=a.select_one('strong')
+                      status=a.select_one('span.status')
+                      if title and status: rows.setdefault(title.get_text(' ',strip=True).lower(),[]).append(status.get_text(' ',strip=True).lower())
+                  cards={}
+                  for a in doc.select('.build-card'):
+                      p=a.select_one('strong');v=a.select_one('span.status')
+                      if p and v:cards[p.get_text(' ',strip=True).lower()]=v.get_text(' ',strip=True).lower()
+                  def first(key): return (rows.get(key) or ['none'])[0]
+                  b,u,a=first('build ios'),first('upload app store'),first('submit apple review')
+                  state=f'iOS:{b}, artifact:{cards.get("ios")}, AppleUpload:{u}, AppleSubmission:{a}'
+                  if last!=state:print('RELEASE_STATUS '+state,flush=True);last=state
+                  if a=='succeeded':
+                      print('APPLE_SUBMISSION_CONFIRMED https://publisher.smarbiz.sbs/apps/releases/6/',flush=True)
+                      break
+                  if a=='failed':
+                      raise RuntimeError('APPLE_SUBMISSION_FAILED '+state)
+                  if b=='failed' or u=='failed':
+                      raise RuntimeError('APPLE_BUILD_OR_UPLOAD_FAILED '+state)
+                  if u=='succeeded' and a=='none':
+                      do('submit_apple',doc)
+                      print('QUEUED_FINAL_APPLE_SUBMISSION',flush=True)
+                  if b=='succeeded' and u=='none':
+                      do('upload_apple',doc)
+                      print('QUEUED_APPLE_UPLOAD',flush=True)
+                  if (b in ('queued','running') or u in ('queued','running')) and time.monotonic()-last_wake>900 and wakes<3:
+                      wake();wakes+=1;last_wake=time.monotonic()
+              except requests.RequestException as e:
+                  print('TRANSIENT_PUBLISHER_READ_FAILURE '+type(e).__name__,flush=True)
+              time.sleep(30)
+          else:raise RuntimeError('APPLE_SUBMISSION_NOT_CONFIRMED_IN_MONITOR_WINDOW '+last)
+          PY

@@ -245,27 +245,6 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
-      - name: Diagnose rhyme search with a synthetic query
-        shell: bash
-        run: |
-          set -euo pipefail
-          STATUS="$(curl -sS --max-time 60 -D "$RUNNER_TEMP/rhyme-headers" -o "$RUNNER_TEMP/rhyme-response" -w '%{http_code}' \
-            -H 'Content-Type: application/json' \
-            -d '{"query":"Blue Talisman","category":"Alle","syllables":"Alle"}' \
-            https://reimflow.smarbiz.sbs/api/rhymes || true)"
-          echo "Blue Talisman search HTTP: $STATUS"
-          python3 - "$RUNNER_TEMP/rhyme-response" <<'PY'
-          import json,sys
-          try:
-              with open(sys.argv[1],encoding="utf8") as f: data=json.load(f)
-              print("Rhyme diagnostic:",json.dumps({
-                  "ok":data.get("ok"),"engine":data.get("engine"),
-                  "error":data.get("error"),
-                  "count":len(data.get("rhymes") or []),
-                  "model":data.get("model"),
-              },ensure_ascii=False))
-          except Exception as exc: print("Rhyme response was not JSON:",type(exc).__name__)
-          PY
       - name: Require independently reviewed quality for two real searches
         shell: bash
         run: |
@@ -349,8 +328,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-phrase2')"
-              if [[ "$SITE" != *'app.js?v=20261015-phrase2'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-phrase3')"
+              if [[ "$SITE" != *'app.js?v=20261015-phrase3'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi
@@ -401,6 +380,11 @@ jobs:
                 exit 1
               fi
               echo "Fast paper phrase anchor suggestions: verified"
+              if [[ "$APP_JS" != *'onlyRhymeAnchor'* ]] || [[ "$APP_JS" != *'rhyme-anchor-chooser'* ]]; then
+                echo "::error::One-click paper anchor search isn't deployed."
+                exit 1
+              fi
+              echo "One-click end-word search: verified"
 
               # One-time synthetic local audio probe: no user audio ever involved.
               if [[ "${{ github.event.head_commit.message }}" == *"[rap-api-smoke]"* ]]; then

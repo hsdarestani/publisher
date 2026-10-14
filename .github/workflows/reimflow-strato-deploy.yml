@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           python3 -m py_compile reimflow-src/api.py
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -236,6 +236,19 @@ jobs:
                 exit 1
               fi
               echo "Four comic editions and switcher: verified"
+              # Validate the new self-contained rhythm challenge assets after publishing.
+              FLOW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-challenge.js?v=20261014-flow1')"
+              FLOW_SCORE="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-scoring.js?v=20261014-flow1')"
+              FLOW_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-challenge.css?v=20261014-flow1')"
+              if [[ "$SITE" != *'data-page="flow"'* ]] || [[ "$SITE" != *'flow-challenge.js?v=20261014-flow1'* ]] || [[ "$FLOW_JS" != *'REIMFLOW'* && "$FLOW_JS" != *'Reimflow Arcade'* ]]; then
+                echo "::error::Flow Challenge game page or runtime is missing."
+                exit 1
+              fi
+              if [[ "$FLOW_SCORE" != *'ReimflowTiming'* ]] || [[ "$FLOW_CSS" != *'FLOW CHALLENGE ARCADE'* ]]; then
+                echo "::error::Flow Challenge assets did not reach STRATO."
+                exit 1
+              fi
+              echo "Flow Challenge: game, scoring and responsive CSS verified"
               exit 0
             fi
             sleep 4

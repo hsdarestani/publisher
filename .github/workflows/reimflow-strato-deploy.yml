@@ -220,27 +220,27 @@ jobs:
               fi
               echo "Dark skeleton CSS: verified"
               # Comic Flow CSS is a separate theme layer and must be shipped with the source.
-              COMIC_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-flow.css?v=20261014-comic1')"
-              if [[ "$COMIC_CSS" != *'REIMFLOW / COMIC FLOW'* ]] || [[ "$SITE" != *'20261014-comic1'* ]]; then
+              COMIC_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-flow.css?v=20261014-de1')"
+              if [[ "$COMIC_CSS" != *'REIMFLOW / COMIC FLOW'* ]] || [[ "$SITE" != *'20261014-de1'* ]]; then
                 echo "::error::Comic Flow stylesheet was not deployed or the page still references an old version."
                 exit 1
               fi
               echo "Comic Flow CSS: verified"
-              VARIANTS_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-variants.css?v=20261014-styles4')"
+              VARIANTS_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-variants.css?v=20261014-de1')"
               if [[ "$VARIANTS_CSS" != *'FOUR COMIC EDITIONS'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="graffiti"'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="novel"'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="clean"'* ]]; then
                 echo "::error::One or more comic variants are missing from deployed CSS."
                 exit 1
               fi
-              if [[ "$SITE" != *'comic-variants.css?v=20261014-styles4'* ]] || [[ "$SITE" != *'data-theme-option="comic-clean"'* ]]; then
+              if [[ "$SITE" != *'comic-variants.css?v=20261014-de1'* ]] || [[ "$SITE" != *'data-theme-option="comic-clean"'* ]]; then
                 echo "::error::Deployed HTML is missing the four-edition theme switcher."
                 exit 1
               fi
               echo "Four comic editions and switcher: verified"
               # Validate the new self-contained rhythm challenge assets after publishing.
-              FLOW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-challenge.js?v=20261014-flow1')"
-              FLOW_SCORE="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-scoring.js?v=20261014-flow1')"
+              FLOW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-challenge.js?v=20261014-de1')"
+              FLOW_SCORE="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-scoring.js?v=20261014-de1')"
               FLOW_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/flow-challenge.css?v=20261014-flow1')"
-              if [[ "$SITE" != *'data-page="flow"'* ]] || [[ "$SITE" != *'flow-challenge.js?v=20261014-flow1'* ]] || [[ "$FLOW_JS" != *'REIMFLOW'* && "$FLOW_JS" != *'Reimflow Arcade'* ]]; then
+              if [[ "$SITE" != *'data-page="flow"'* ]] || [[ "$SITE" != *'flow-challenge.js?v=20261014-de1'* ]] || [[ "$FLOW_JS" != *'REIMFLOW'* && "$FLOW_JS" != *'Reimflow Arcade'* ]]; then
                 echo "::error::Flow Challenge game page or runtime is missing."
                 exit 1
               fi
@@ -250,12 +250,22 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261014-navfix1')"
-              if [[ "$SITE" != *'app.js?v=20261014-navfix1'* ]] || [[ "$APP_JS" != *'$(".page").forEach'* ]]; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261014-de1')"
+              if [[ "$SITE" != *'app.js?v=20261014-de1'* ]] || [[ "$APP_JS" != *'$(".page").forEach'* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi
               echo "Navigation repair: live JavaScript verified"
+              # Full German gameplay localization; no stale English state screens.
+              if [[ "$SITE" != *'IM TAKT TIPPEN'* ]] || [[ "$SITE" != *'DEINE TAKTGENAUIGKEIT'* ]]; then
+                echo "::error::German game interface missing on live site."
+                exit 1
+              fi
+              if [[ "$FLOW_JS" != *'RUNDE BEENDET'* ]] || [[ "$FLOW_JS" != *' BESTE SERIE'* ]] || [[ "$FLOW_SCORE" != *'TAKTMEISTER'* ]]; then
+                echo "::error::Translated German runtime messages are missing."
+                exit 1
+              fi
+              echo "German Flow Challenge interface and scoring: verified"
               exit 0
             fi
             sleep 4

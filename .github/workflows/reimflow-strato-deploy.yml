@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           python3 -m py_compile reimflow-src/api.py
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css theme-engine.js sonic-atelier.js
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css theme-engine.js sonic-atelier.js
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -218,6 +218,13 @@ jobs:
                 exit 1
               fi
               echo "Dark skeleton CSS: verified"
+              # Comic Flow CSS is a separate theme layer and must be shipped with the source.
+              COMIC_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-flow.css?v=20261014-comic1')"
+              if [[ "$COMIC_CSS" != *'REIMFLOW / COMIC FLOW'* ]] || [[ "$SITE" != *'20261014-comic1'* ]]; then
+                echo "::error::Comic Flow stylesheet was not deployed or the page still references an old version."
+                exit 1
+              fi
+              echo "Comic Flow CSS: verified"
               exit 0
             fi
             sleep 4

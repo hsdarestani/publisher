@@ -1,0 +1,65 @@
+name: A+ Solution Publisher authenticated release preflight
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-calendar-web-release-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    env:
+      PUBLISHER_ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+      PUBLISHER_ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+    steps:
+      - name: Check authenticated Publisher web access without queueing jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install -q requests beautifulsoup4
+          python3 - <<'PY'
+          import os, re, requests
+          from bs4 import BeautifulSoup
+          base = 'https://publisher.smarbiz.sbs'
+          username = os.environ.get('PUBLISHER_ADMIN_EMAIL', '')
+          password = os.environ.get('PUBLISHER_ADMIN_PASSWORD', '')
+          assert username and password, 'PUBLISHER_ADMIN_CREDENTIALS_NOT_CONFIGURED'
+          session = requests.Session()
+          session.headers['User-Agent'] = 'APlus-Release-Preflight/1.0'
+          login = session.get(base + '/accounts/login/', timeout=30)
+          login.raise_for_status()
+          token_input = BeautifulSoup(login.text, 'html.parser').select_one('input[name="csrfmiddlewaretoken"]')
+          assert token_input, 'PUBLISHER_LOGIN_CSRF_MISSING'
+          auth = session.post(base + '/accounts/login/', data={
+              'username': username, 'password': password,
+              'csrfmiddlewaretoken': token_input.get('value', ''),
+              'next': '/apps/',
+          }, headers={'Referer': base + '/accounts/login/'}, timeout=30)
+          auth.raise_for_status()
+          catalog = session.get(base + '/apps/', timeout=30)
+          catalog.raise_for_status()
+          assert '/accounts/login/' not in catalog.url, 'PUBLISHER_AUTH_REJECTED'
+          soup = BeautifulSoup(catalog.text, 'html.parser')
+          matches = []
+          for a in soup.select('a[href]'):
+              href = a.get('href') or ''
+              if re.fullmatch(r'/apps/\d+/', href) and 'solution' in a.get_text(' ', strip=True).lower():
+                  matches.append((href, a.get_text(' ', strip=True)))
+          print('PUBLISHER_WEB_ADMIN_LOGIN_OK')
+          print('MATCHED_APLUS_APP_LINKS=' + repr(matches[:10]))
+          if not matches:
+              print('CATALOG_TEXT_SAMPLE=' + soup.get_text(' ', strip=True)[:700])
+              raise SystemExit('A_PLUS_APP_NOT_FOUND_IN_CATALOG')
+          app_path = next((p for p, label in matches if 'a+ solution' in label.lower()), matches[0][0])
+          app = session.get(base + app_path, timeout=30)
+          app.raise_for_status()
+          assert '/accounts/login/' not in app.url, 'PUBLISHER_APP_ACCESS_REJECTED'
+          page = BeautifulSoup(app.text, 'html.parser')
+          print('PUBLISHER_APP_PATH=' + app_path)
+          print('EXISTING_RELEASE_LINKS=' + repr([(a.get('href'), a.get_text(' ', strip=True)[:75]) for a in page.select('a[href]') if re.search(r'/apps/releases/\d+/', a.get('href') or '')][:20]))
+          print('APP_PAGE_TEXT=' + page.get_text(' ', strip=True)[:1100])
+          PY

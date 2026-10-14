@@ -1,0 +1,79 @@
+name: A+ Solution iOS Calendar 1.0.28 release
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-ios-calendar-128-release.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: aplus-ios-calendar-128
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    env:
+      PUB_USER: ${{ secrets.ADMIN_EMAIL }}
+      PUB_PASS: ${{ secrets.ADMIN_PASSWORD }}
+    steps:
+      - name: Authenticate with Publisher and queue version 1.0.28 build 64 for iOS
+        run: |
+          pip -q install requests beautifulsoup4
+          python3 - <<'PY'
+          import os, re, requests
+          from bs4 import BeautifulSoup
+          host='https://publisher.smarbiz.sbs'
+          app='/apps/2/'
+          source='80f109af4bcc7ddfd3bf7f040c1bd42b190edefb'
+          session=requests.Session()
+          login=session.get(host+'/accounts/login/',timeout=25)
+          login.raise_for_status()
+          def csrf(html):
+              node=BeautifulSoup(html,'html.parser').select_one('input[name="csrfmiddlewaretoken"]')
+              assert node,'Missing CSRF'
+              return node['value']
+          response=session.post(host+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':csrf(login.text)},headers={'Referer':host+'/accounts/login/'},timeout=25)
+          page=session.get(host+app,timeout=25)
+          assert page.status_code==200 and 'A+ Solution' in page.text and 'aplussolution' in page.text,'Publisher session/app unavailable'
+          soup=BeautifulSoup(page.text,'html.parser')
+          releases={x.get('href',''):x.get_text(' ',strip=True) for x in soup.select('a[href]') if re.fullmatch(r'/apps/releases/\d+/',x.get('href',''))}
+          assert any('1.0.27' in x and '63' in x for x in releases.values()),'Existing build 63 not confirmed'
+          target=next((p for p,t in releases.items() if '1.0.28' in t and '64' in t),None)
+          if not target:
+              path=app+'releases/new/'
+              form=session.get(host+path,timeout=25)
+              form.raise_for_status()
+              data={'csrfmiddlewaretoken':csrf(form.text),'version_name':'1.0.28','build_number':'64','source_branch':'main','source_commit':source,'android_track':'internal','android_rollout':'1.0000','ios_release_type':'manual','auto_submit':'on','release_notes':'Apple Kalender direkt in der Kalender App öffnen; vereinfachter Ablauf und verbesserte PDF Ansicht.'}
+              created=session.post(host+path,data=data,headers={'Referer':host+path},allow_redirects=True,timeout=30)
+              match=re.search(r'/apps/releases/\d+/',created.url)
+              assert match,'Release creation failed: '+created.url+' '+BeautifulSoup(created.text,'html.parser').get_text(' ',strip=True)[:300]
+              target=match.group(0)
+              print('CREATED_RELEASE='+target)
+          else: print('EXISTING_RELEASE='+target)
+          detail=session.get(host+target,timeout=25)
+          assert detail.status_code==200 and '1.0.28' in detail.text and '64' in detail.text,'Wrong release'
+          doc=BeautifulSoup(detail.text,'html.parser')
+          rows=[(r.select_one('strong').get_text(' ',strip=True),r.select_one('span.status').get_text(' ',strip=True)) for r in doc.select('.build-card') if r.select_one('strong') and r.select_one('span.status')]
+          ios=next((status.lower() for platform,status in rows if platform.lower()=='ios'),None)
+          assert ios is not None,'No iOS build record'
+          active=[r.get_text(' ',strip=True).lower() for r in doc.select('a.compact-row') if 'build ios' in r.get_text(' ',strip=True).lower()]
+          if ios!='succeeded' and not any('queued' in row or 'running' in row for row in active):
+              action=target+'action/build_ios/'
+              done=session.post(host+action,data={'csrfmiddlewaretoken':csrf(detail.text)},headers={'Referer':host+target},timeout=25)
+              assert done.status_code==200 and '/accounts/login/' not in done.url,'Failed to queue iOS build'
+              print('IOS_BUILD_QUEUED')
+          else: print('IOS_BUILD_EXISTING='+ios)
+          print('RELEASE_URL='+host+target)
+          PY
+      - name: Wake the existing official Publisher Cloud Mac agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml', ref: 'main'
+            });

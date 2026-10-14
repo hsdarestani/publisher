@@ -29,9 +29,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile reimflow-src/api.py
+          python3 -m py_compile reimflow-src/api.py reimflow-src/rap-flow-analysis.py
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css
+          python3 -m unittest discover -s tests -p "test_rap_flow.py"
+          cd ..
+          cd reimflow-src
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -89,7 +92,8 @@ jobs:
           rm -f /opt/reimflow/site/*.js /opt/reimflow/site/*.css /opt/reimflow/site/*.html
           tar -xzf /tmp/reimflow-strato.tar.gz -C /opt/reimflow/site
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
-          chmod 644 /opt/reimflow/api.py
+          mv /opt/reimflow/site/rap-flow-analysis.py /opt/reimflow/rap-flow-analysis.py
+          chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py
           cp /tmp/reimflow-strato.env /opt/reimflow/.env
           chmod 600 /opt/reimflow/.env
           printf 'PUBLISHER_NETWORK=%s\n' "$PUBLISHER_NETWORK" >> /opt/reimflow/.env
@@ -99,6 +103,17 @@ jobs:
               server_name _;
               root /usr/share/nginx/html;
               index index.html;
+              location = /api/flow/analyze {
+                  proxy_pass http://127.0.0.1:8787;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $http_x_forwarded_for;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_connect_timeout 5s;
+                  proxy_read_timeout 95s;
+                  proxy_send_timeout 40s;
+                  client_max_body_size 5m;
+                  client_body_timeout 35s;
+              }
               location /api/ {
                   proxy_pass http://127.0.0.1:8787;
                   proxy_set_header Host $host;
@@ -151,6 +166,7 @@ jobs:
                 REIMFLOW_DB: /var/lib/reimflow/reimflow.sqlite3
               volumes:
                 - ./api.py:/app/api.py:ro
+                - ./rap-flow-analysis.py:/app/rap-flow-analysis.py:ro
                 - ./data:/var/lib/reimflow
               read_only: true
               tmpfs:
@@ -266,6 +282,19 @@ jobs:
                 exit 1
               fi
               echo "German Flow Challenge interface and scoring: verified"
+              RAP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.js?v=20261014-rap1')"
+              RAP_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.css?v=20261014-rap1')"
+              if [[ "$SITE" != *'id="rapPanel"'* ]] || [[ "$SITE" != *'rap-flow.js?v=20261014-rap1'* ]] || [[ "$RAP_JS" != *'Reimflow Rap Flow Analyse Beta'* ]] || [[ "$RAP_CSS" != *'Reimflow Rap Flow Analysis'* ]]; then
+                echo "::error::Rap Flow recording studio is not available in production."
+                exit 1
+              fi
+              # Invalid upload must return 400, confirming the protected backend endpoint is mounted.
+              RAP_HTTP="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST 'https://reimflow.smarbiz.sbs/api/flow/analyze' -H 'Content-Type: multipart/form-data; boundary=invalid' -d '')"
+              if [[ "$RAP_HTTP" != "400" && "$RAP_HTTP" != "429" ]]; then
+                echo "::error::Rap Flow transcription API is missing or unhealthy (HTTP $RAP_HTTP)."
+                exit 1
+              fi
+              echo "Rap Flow Studio and privacy-aware analysis API: verified"
               exit 0
             fi
             sleep 4

@@ -282,9 +282,9 @@ jobs:
                 exit 1
               fi
               echo "German Flow Challenge interface and scoring: verified"
-              RAP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.js?v=20261014-rap1')"
-              RAP_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.css?v=20261014-rap1')"
-              if [[ "$SITE" != *'id="rapPanel"'* ]] || [[ "$SITE" != *'rap-flow.js?v=20261014-rap1'* ]] || [[ "$RAP_JS" != *'Reimflow Rap Flow Analyse Beta'* ]] || [[ "$RAP_CSS" != *'Reimflow Rap Flow Analysis'* ]]; then
+              RAP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.js?v=20261014-rap2')"
+              RAP_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rap-flow.css?v=20261014-rap2')"
+              if [[ "$SITE" != *'id="rapPanel"'* ]] || [[ "$SITE" != *'rap-flow.js?v=20261014-rap2'* ]] || [[ "$RAP_JS" != *'Reimflow Rap Flow Analyse Beta'* ]] || [[ "$RAP_CSS" != *'Reimflow Rap Flow Analysis'* ]]; then
                 echo "::error::Rap Flow recording studio is not available in production."
                 exit 1
               fi
@@ -295,6 +295,11 @@ jobs:
                 exit 1
               fi
               echo "Rap Flow Studio and privacy-aware analysis API: verified"
+              if [[ "$SITE" != *'id="rapAnalysisState"'* ]] || [[ "$RAP_JS" != *'Analyse fehlgeschlagen:'* ]] || [[ "$RAP_JS" != *'Analyse erneut versuchen'* ]] || [[ "$RAP_CSS" != *'rap-analysis-state.error'* ]]; then
+                echo "::error::Rap Flow diagnostic and result UI are missing from live deployment."
+                exit 1
+              fi
+              echo "Rap analysis result and error feedback: verified"
               exit 0
             fi
             sleep 4

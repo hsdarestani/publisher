@@ -197,7 +197,8 @@ jobs:
           docker compose exec -T caddy grep -qF 'reimflow.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null
           docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
           docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
-          docker exec "$CADDY_ID" wget -qO- http://reimflow-web/ | grep -q Reimflow
+          INTERNAL_SITE="$(docker exec "$CADDY_ID" wget -qO- http://reimflow-web/)"
+          [[ "$INTERNAL_SITE" == *"Reimflow"* ]]
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
@@ -208,7 +209,7 @@ jobs:
           for i in $(seq 1 15); do
             SITE="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/ || true)"
             HEALTH="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/api/health || true)"
-            if echo "$SITE" | grep -q 'Reimflow' && echo "$HEALTH" | grep -q '"ok": true'; then
+            if [[ "$SITE" == *"Reimflow"* ]] && [[ "$HEALTH" == *'"ok": true'* ]]; then
               echo "Reimflow site: OK"
               echo "API status: $HEALTH"
               # Verify the source deployed with the themed dark search skeleton.

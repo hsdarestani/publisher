@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           python3 -m py_compile reimflow-src/api.py
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css theme-engine.js sonic-atelier.js
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js api.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -226,6 +226,16 @@ jobs:
                 exit 1
               fi
               echo "Comic Flow CSS: verified"
+              VARIANTS_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/comic-variants.css?v=20261014-styles4')"
+              if [[ "$VARIANTS_CSS" != *'FOUR COMIC EDITIONS'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="graffiti"'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="novel"'* ]] || [[ "$VARIANTS_CSS" != *'data-comic-style="clean"'* ]]; then
+                echo "::error::One or more comic variants are missing from deployed CSS."
+                exit 1
+              fi
+              if [[ "$SITE" != *'comic-variants.css?v=20261014-styles4'* ]] || [[ "$SITE" != *'data-theme-option="comic-clean"'* ]]; then
+                echo "::error::Deployed HTML is missing the four-edition theme switcher."
+                exit 1
+              fi
+              echo "Four comic editions and switcher: verified"
               exit 0
             fi
             sleep 4

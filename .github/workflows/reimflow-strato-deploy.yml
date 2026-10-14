@@ -224,6 +224,27 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
+      - name: Diagnose rhyme search with a synthetic query
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATUS="$(curl -sS --max-time 60 -D "$RUNNER_TEMP/rhyme-headers" -o "$RUNNER_TEMP/rhyme-response" -w '%{http_code}' \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"Blue Talisman","category":"Alle","syllables":"Alle"}' \
+            https://reimflow.smarbiz.sbs/api/rhymes || true)"
+          echo "Blue Talisman search HTTP: $STATUS"
+          python3 - "$RUNNER_TEMP/rhyme-response" <<'PY'
+          import json,sys
+          try:
+              with open(sys.argv[1],encoding="utf8") as f: data=json.load(f)
+              print("Rhyme diagnostic:",json.dumps({
+                  "ok":data.get("ok"),"engine":data.get("engine"),
+                  "error":data.get("error"),
+                  "count":len(data.get("rhymes") or []),
+                  "model":data.get("model"),
+              },ensure_ascii=False))
+          except Exception as exc: print("Rhyme response was not JSON:",type(exc).__name__)
+          PY
       - name: Verify public domain and AI health
         shell: bash
         run: |

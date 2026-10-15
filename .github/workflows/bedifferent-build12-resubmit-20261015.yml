@@ -1,0 +1,139 @@
+name: BE DIFFERENT 1.2.0 build 12 Apple resubmit
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-build12-resubmit-20261015.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 28
+    steps:
+      - name: Resubmit uploaded build 12 after reviewer login verification
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-12-submit-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-submit-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,time,requests
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+          from django.utils import timezone
+          a=MobileApp.objects.get(slug='be-different')
+          r=Release.objects.get(pk=7,app=a,version_name='1.2.0',build_number=12)
+          assert r.source_commit.startswith('c58964c02bd4'),'Wrong source commit'
+          b=r.builds.get(platform='ios')
+          assert b.status=='succeeded' and b.external_build_id and b.artifact,'Build 12 IPA not uploaded'
+          assert Job.objects.filter(release=r,build=b,type='upload_apple',status='succeeded').exists(),'Upload job not successful'
+          c=AppleStoreClient(a.apple_account)
+          app_record=c.find_app(a.bundle_id)
+          app_id=app_record['id']
+          versions=[v for v in c.list_versions(app_id) if (v.get('attributes') or {}).get('versionString')=='1.2.0']
+          assert len(versions)==1,'Ambiguous App Store version'
+          v=versions[0];version_id=v['id']
+          state=(v.get('attributes') or {}).get('appStoreState')
+          print('PREFLIGHT_VERSION='+str(state))
+          assert state in ('REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED'),'Version not editable'
+          built=c.request('GET','/builds/'+str(b.external_build_id)).get('data') or {}
+          attrs=built.get('attributes') or {}
+          print('PREFLIGHT_APPLE_BUILD='+json.dumps({'version':attrs.get('version'),'processingState':attrs.get('processingState'),'uploadedDate':attrs.get('uploadedDate')}))
+          assert str(attrs.get('version'))=='12' and attrs.get('processingState')=='VALID','Apple build 12 not processed as valid'
+          detail=c.request('GET','/appStoreVersions/'+version_id+'/appStoreReviewDetail').get('data') or {}
+          creds=(detail.get('attributes') or {})
+          username=creds.get('demoAccountName') or ''
+          password=creds.get('demoAccountPassword') or ''
+          print('REVIEW_ACCOUNT='+json.dumps({'username_set':bool(username),'password_set':bool(password),'login_required':creds.get('demoAccountRequired')}))
+          assert username and password and len(password)>=8,'Apple has no review demo credentials'
+          # Test only once; do not log credentials or authorization tokens.
+          sess=requests.Session()
+          base='https://bedifferent.smarbiz.sbs'
+          reply=sess.post(base+'/api/auth/login',json={'email':username,'password':password},headers={'Origin':base,'x-bd-client':'mobile','Content-Type':'application/json'},timeout=25)
+          print('REVIEW_LOGIN_HTTP='+str(reply.status_code))
+          assert reply.status_code==200,'Apple review account cannot log in'
+          token=(reply.json() or {}).get('sessionToken')
+          assert token,'Missing reviewer session'
+          dashboard=sess.get(base+'/api/mobile/dashboard',headers={'authorization':'Bearer '+token,'x-bd-client':'mobile'},timeout=25)
+          print('REVIEW_DASHBOARD_HTTP='+str(dashboard.status_code))
+          assert dashboard.status_code==200,'Review account cannot access dashboard'
+          user=(dashboard.json() or {}).get('user') or {}
+          print('REVIEW_ACCOUNT_ROLE='+str(user.get('role')))
+          assert user.get('role')=='ATHLETE' and user.get('onboardingCompleted'),'Review account not an onboarded athlete'
+          try:
+            sess.post(base+'/api/auth/logout',headers={'authorization':'Bearer '+token,'Origin':base},timeout=8)
+          except Exception:
+            pass
+          # Explicit Apple reviewer credentials were already saved in ASC; sync them
+          # back into the rebuilt Publisher database without ever printing secrets.
+          a.review_username=username
+          a.set_review_password(password)
+          a.requires_login=True
+          a.review_notes=('Be Different iOS 1.2.0 (12) fixes Guideline 2.1(b): nonfunctional Pro freischalten buttons have been removed from Coach, Different AI, BE RESTED and performance screens. No paid in-app purchases or subscriptions are offered in this release. Locked functionality is now explained without a purchase call to action. The supplied ATHLETE review login has completed onboarding. HealthKit permissions and purpose are explained under Settings > Apple Health and ATHLET > APPLE HEALTH & GADGETS. A physical smartwatch is optional, not required to review the app.')
+          a.save(update_fields=['review_username','review_password_blob','requires_login','review_notes','updated_at'])
+          print('PUBLISHER_REVIEW_CREDENTIALS_SYNCED=true')
+          # Apple's existing rejected submission contains only the app version.
+          for sub in c.list_review_submissions(app_id,'UNRESOLVED_ISSUES'):
+            items=c.list_review_submission_items(sub['id'])
+            target=[i for i in items if (i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')==version_id]
+            if target:
+              assert len(items)==1,'Unrelated items present in rejected submission'
+              print('TARGET_EXISTING_REVIEW='+sub['id'])
+          existing=Job.objects.filter(release=r,build=b,type='submit_apple').order_by('-id').first()
+          if existing and existing.status in ('queued','running','succeeded'):
+            job=existing
+            print('REUSING_SUBMIT_JOB='+str(job.id))
+          else:
+            job=enqueue_job('submit_apple',app=a,release=r,build=b)
+            print('QUEUED_SUBMIT_JOB='+str(job.id))
+          deadline=time.monotonic()+650
+          while time.monotonic()<deadline:
+            job.refresh_from_db()
+            if job.status in ('succeeded','failed'):
+              break
+            time.sleep(8)
+          job.refresh_from_db()
+          print('PUBLISHER_SUBMIT_JOB='+json.dumps({'job':job.pk,'status':job.status,'progress':job.progress,'error_type':(job.error or '')[:140] if job.status=='failed' else ''}))
+          if job.status!='succeeded':
+            raise RuntimeError('Publisher submit_apple did not succeed')
+          found=[]
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW','READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+            for sub in c.list_review_submissions(app_id,state):
+              items=c.list_review_submission_items(sub['id'])
+              if any((i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')==version_id for i in items):
+                found.append({'id':sub['id'],'state':state,'items':len(items)})
+          print('APPLE_FINAL_REVIEW='+json.dumps(found))
+          assert any(x['state'] in ('WAITING_FOR_REVIEW','IN_REVIEW') for x in found),'Apple review submission not confirmed active'
+          print('BE_DIFFERENT_BUILD12_SUBMITTED_TO_APPLE=true')
+          PY
+          REMOTE

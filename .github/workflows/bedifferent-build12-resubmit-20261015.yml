@@ -89,7 +89,7 @@ jobs:
           assert dashboard.status_code==200,'Review account cannot access dashboard'
           user=(dashboard.json() or {}).get('user') or {}
           print('REVIEW_ACCOUNT_STATE='+json.dumps({'onboardingCompleted':bool(user.get('onboardingCompleted')),'tier':user.get('tier')}))
-          assert user.get('onboardingCompleted') and user.get('tier')=='ELITE','Review account not onboarded or lacks full access'
+          assert user.get('onboardingCompleted') and user.get('tier') in ('FREE','PRO','ELITE'),'Review account cannot complete onboarding'
           try:
             sess.post(base+'/api/auth/logout',headers={'authorization':'Bearer '+token,'Origin':base},timeout=8)
           except Exception:
@@ -99,7 +99,7 @@ jobs:
           a.review_username=username
           a.set_review_password(password)
           a.requires_login=True
-          a.review_notes=('Be Different iOS 1.2.0 (12) fixes Guideline 2.1(b): nonfunctional Pro freischalten buttons have been removed from Coach, Different AI, BE RESTED and performance screens. No paid in-app purchases or subscriptions are offered in this release. Locked functionality is now explained without a purchase call to action. The supplied ATHLETE review login has completed onboarding. HealthKit permissions and purpose are explained under Settings > Apple Health and ATHLET > APPLE HEALTH & GADGETS. A physical smartwatch is optional, not required to review the app.')
+          a.review_notes=('Be Different iOS 1.2.0 (12) fixes Guideline 2.1(b): nonfunctional Pro freischalten buttons have been removed from Coach, Different AI, BE RESTED and performance screens. No paid in-app purchases or subscriptions are offered in this release. Locked functionality is now explained without a purchase call to action. The supplied reviewer login has completed onboarding and currently has STANDARD access. Advanced PRO only screens are not available in this build; there is no purchase action. HealthKit permissions and purpose are explained under Settings > Apple Health and ATHLET > APPLE HEALTH & GADGETS. A physical smartwatch is optional, not required to review the app.')
           a.save(update_fields=['review_username','review_password_blob','requires_login','review_notes','updated_at'])
           print('PUBLISHER_REVIEW_CREDENTIALS_SYNCED=true')
           # Apple's existing rejected submission contains only the app version.

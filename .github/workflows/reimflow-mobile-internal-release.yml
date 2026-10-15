@@ -62,3 +62,5 @@ jobs:
           gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main
           gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main
           echo "Internal builds queued; no public submission."
+
+# Reimflow main source merged; prepare beta 1.0.0 build 1.

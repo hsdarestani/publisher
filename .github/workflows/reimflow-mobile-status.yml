@@ -61,3 +61,5 @@ jobs:
             print("REIMFLOW_APPLE_LISTING",type(exc).__name__,str(exc)[:200])
           PY
           REMOTE
+
+# Snapshot after cloud builders started 2026-10-15.

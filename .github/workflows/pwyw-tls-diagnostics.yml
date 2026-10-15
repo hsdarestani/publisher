@@ -37,7 +37,7 @@ jobs:
           curl -sSI --max-time 12 --resolve pwyw.smarbiz.sbs:443:82.165.187.14 -o /dev/null -w "ORIGIN_STRICT http=%{http_code} ssl_verify=%{ssl_verify_result}\n" https://pwyw.smarbiz.sbs/api/health
           curl -ksSI --max-time 12 --resolve pwyw.smarbiz.sbs:443:82.165.187.14 -o /dev/null -w "ORIGIN_INSECURE http=%{http_code} ssl_verify=%{ssl_verify_result}\n" https://pwyw.smarbiz.sbs/api/health
           echo '--- Public origins certificate metadata, if any ---'
-          echo | timeout 12 openssl s_client -connect 82.165.187.14:443 -servername pwyw.smarbiz.sbs -showcerts 2>&1 | grep -E 'subject=|issuer=|Verify return code:|alert|handshake failure|no peer certificate|Protocol |Cipher ' | head -24
+          echo | timeout 12 openssl s_client -connect 82.165.187.14:443 -servername pwyw.smarbiz.sbs -showcerts 2>&1 | grep -E 'subject=|issuer=|Verify return code:|alert|handshake failure|no peer certificate|Protocol |Cipher ' | head -24 || true
 
       - name: Inspect STRATO TLS service and Caddy with read-only commands
         shell: bash

@@ -88,8 +88,8 @@ jobs:
           print('REVIEW_DASHBOARD_HTTP='+str(dashboard.status_code))
           assert dashboard.status_code==200,'Review account cannot access dashboard'
           user=(dashboard.json() or {}).get('user') or {}
-          print('REVIEW_ACCOUNT_ROLE='+str(user.get('role')))
-          assert user.get('role')=='ATHLETE' and user.get('onboardingCompleted'),'Review account not an onboarded athlete'
+          print('REVIEW_ACCOUNT_STATE='+json.dumps({'onboardingCompleted':bool(user.get('onboardingCompleted')),'tier':user.get('tier')}))
+          assert user.get('onboardingCompleted') and user.get('tier')=='ELITE','Review account not onboarded or lacks full access'
           try:
             sess.post(base+'/api/auth/logout',headers={'authorization':'Bearer '+token,'Origin':base},timeout=8)
           except Exception:

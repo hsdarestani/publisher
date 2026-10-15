@@ -24,3 +24,10 @@ reimflow.smarbiz.sbs {
   reverse_proxy reimflow-web:80
   header X-Content-Type-Options nosniff
 }
+
+# PWYW game lounge — isolated on the shared Publisher network.
+pwyw.smarbiz.sbs {
+  encode zstd gzip
+  reverse_proxy pwyw-web:8080
+  header X-Content-Type-Options nosniff
+}

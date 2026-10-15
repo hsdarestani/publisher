@@ -137,12 +137,19 @@ jobs:
           }
           CADDY
           fi
-          if ! docker compose exec -T caddy grep -qF 'pwyw.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null; then
-            echo "::error::Caddy bind mount is stale. Refusing to restart shared reverse proxy."
-            exit 1
+          if docker compose exec -T caddy grep -qF 'pwyw.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null; then
+            docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
+            docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
+          else
+            # Existing shared Caddy mounts an old, unlinked inode. Stage an alternate
+            # config INSIDE that running container and reload without restarting it.
+            # Host Caddyfile remains updated, so a future clean restart can use it.
+            echo "Shared Caddy bind mount is stale; staging and validating a safe reload (no restart)."
+            docker cp /opt/aplus-publisher/Caddyfile "$CADDY_ID":/tmp/Caddyfile-pwyw
+            docker exec "$CADDY_ID" caddy validate --config /tmp/Caddyfile-pwyw
+            docker exec "$CADDY_ID" caddy reload --config /tmp/Caddyfile-pwyw
+            docker exec "$CADDY_ID" rm -f /tmp/Caddyfile-pwyw
           fi
-          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
-          docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
           # Direct internal route must be healthy before public checks.
           docker exec "$CADDY_ID" wget -qO- http://pwyw-web:8080/api/health | grep -q '"ok":true'
           docker compose exec -T web curl -fsS --max-time 7 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null

@@ -46,6 +46,9 @@ jobs:
             test "${#EXPECTED}" -eq 64
             read -r -d '' CODE <<'PY' || true
           import os,sys
+          os.environ.setdefault("DJANGO_SETTINGS_MODULE","config.settings")
+          import django
+          django.setup()
           from pathlib import Path
           from apps.publisher.models import Build
           platform=os.environ['PLATFORM']
@@ -54,7 +57,7 @@ jobs:
           sys.stdout.buffer.write(Path(b.artifact.path).read_bytes())
           PY
             DATA=$(printf %s "$CODE" | base64 -w0)
-            "${SSH[@]}" "cd /opt/aplus-publisher && printf '%s' '$DATA' | base64 -d | docker compose exec -T -e PLATFORM='$PLATFORM' web python manage.py shell -c 'exec(__import__(\"sys\").stdin.read())'" > "$TARGET"
+            "${SSH[@]}" "cd /opt/aplus-publisher && printf '%s' '$DATA' | base64 -d | docker compose exec -T -e PLATFORM='$PLATFORM' web python -c 'exec(__import__(\"sys\").stdin.read())'" > "$TARGET"
             test -s "$TARGET"
             GOT=$(sha256sum "$TARGET" | awk '{print $1}')
             test "$GOT" = "$EXPECTED" || { echo "::error::Checksum mismatch for $PLATFORM"; exit 1; }

@@ -1,0 +1,57 @@
+name: Reimflow Publisher and stores readiness
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/reimflow-mobile-readiness.yml']
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect connected store/signing state without exposing credentials
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"; umask 077
+          KEY="$RUNNER_TEMP/reimflow-readiness-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"; chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/reimflow-readiness-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"; chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"; chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,StoreAccount,Release,BuildAgent
+          from apps.signing.models import AndroidSigningCredential, IOSDistributionCredential, IOSProvisioningProfile
+          apps=MobileApp.objects.filter(slug__icontains='reimflow')
+          print('REIMFLOW_APPS='+json.dumps([{'id':a.id,'slug':a.slug,'bundle_id':a.bundle_id,'package_name':a.package_name,'status':a.status,'framework':a.framework,'google_linked':bool(a.google_account_id),'apple_linked':bool(a.apple_account_id),'privacy':bool(a.privacy_policy_url),'support':bool(a.support_url),'icon_count':a.assets.filter(kind='icon').count(),'screenshots':a.assets.filter(kind='screenshot').count(),'android_signing':AndroidSigningCredential.objects.filter(app=a).exists(),'ios_profiles':IOSProvisioningProfile.objects.filter(app=a).count()} for a in apps]))
+          print('STORE_ACCOUNTS='+json.dumps([{'id':a.id,'provider':a.provider,'enabled':a.enabled,'configured':a.configured,'display':a.name[:50]} for a in StoreAccount.objects.all()]))
+          print('IOS_DISTRIBUTION_COUNT='+str(IOSDistributionCredential.objects.count()))
+          print('BUILD_AGENTS='+json.dumps([{'name':a.name,'platform':a.platform,'enabled':a.enabled} for a in BuildAgent.objects.all()]))
+          for a in apps:
+            print('RELEASES '+a.slug+' '+json.dumps([{'version':r.version_name,'number':r.build_number,'status':r.status,'android':list(r.builds.filter(platform='android').values_list('status',flat=True)),'ios':list(r.builds.filter(platform='ios').values_list('status',flat=True))} for r in Release.objects.filter(app=a).order_by('-id')[:5]]))
+          PY
+          REMOTE

@@ -1,0 +1,79 @@
+name: BE DIFFERENT build 12 publisher and Apple readiness
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-build12-readiness-20261015.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect Publisher release 7 and Apple state without mutations
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-12-inspect-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission,BuildAgent
+          from apps.integrations.apple_store import AppleStoreClient
+          a=MobileApp.objects.get(slug='be-different')
+          print('APP='+json.dumps({'slug':a.slug,'bundle':a.bundle_id,'apple_account':bool(a.apple_account_id),'review_user_set':bool(a.review_username),'review_password_set':bool(a.get_review_password())}))
+          rs=Release.objects.filter(app=a,version_name='1.2.0').order_by('-id')[:8]
+          for r in rs:
+            print('RELEASE='+json.dumps({'id':r.id,'build_number':r.build_number,'status':r.status,'source_commit':r.source_commit[:12],'auto_submit':r.auto_submit,'created':r.created_at.isoformat()}))
+            for b in r.builds.filter(platform='ios'):
+              print('BUILD='+json.dumps({'id':b.id,'release':r.id,'status':b.status,'commit':b.commit_sha[:12],'external_build_id':b.external_build_id,'has_artifact':bool(b.artifact),'updated':b.updated_at.isoformat()}))
+              for j in Job.objects.filter(release=r,build=b).order_by('-id')[:12]:
+                print('BUILD_JOB='+json.dumps({'id':j.id,'type':j.type,'status':j.status,'progress':j.progress,'error_tail':(j.error or '')[-350:],'updated':j.updated_at.isoformat()}))
+            for s in Submission.objects.filter(release=r,platform='ios'):
+              print('SUBMISSION='+json.dumps({'release':r.id,'state':s.state,'external_id':s.external_id,'last_error_tail':(s.last_error or '')[-300:]}))
+          for agent in BuildAgent.objects.filter(platform__in=['macos','universal']).order_by('id'):
+            print('MAC_AGENT='+json.dumps({'id':agent.id,'name':agent.name,'enabled':agent.enabled,'last_seen':str(getattr(agent,'last_seen_at',None))}))
+          try:
+            c=AppleStoreClient(a.apple_account)
+            record=c.find_app(a.bundle_id)
+            versions=c.list_versions(record['id'])
+            for v in versions:
+              if (v.get('attributes') or {}).get('versionString')=='1.2.0':
+                print('APPLE_VERSION='+json.dumps({'id':v['id'],'state':v.get('attributes',{}).get('appStoreState')}))
+            for state in ['UNRESOLVED_ISSUES','READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW']:
+              for sub in c.list_review_submissions(record['id'],state):
+                items=c.list_review_submission_items(sub['id'])
+                print('APPLE_SUBMISSION='+json.dumps({'id':sub['id'],'state':state,'items':[{'id':i['id'],'state':i.get('attributes',{}).get('state'),'version_id':(i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')} for i in items]}))
+          except Exception as e:
+            print('APPLE_ERROR='+json.dumps({'type':type(e).__name__,'short':str(e)[:240]}))
+          PY
+          REMOTE

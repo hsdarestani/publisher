@@ -1,0 +1,63 @@
+name: Reimflow private Android and iOS builds
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/reimflow-mobile-internal-release.yml', 'scripts/reimflow/bootstrap_mobile.py']
+permissions: {contents: read, actions: write}
+concurrency: {group: reimflow-private-beta-1, cancel-in-progress: false}
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: {repository: hsdarestani/Reimflow, ref: main, path: reimflow-src}
+      - name: Check native release source
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/reimflow/bootstrap_mobile.py reimflow-src/scripts/prepare-android.py reimflow-src/scripts/prepare-ios-export.py
+          test -s reimflow-src/assets/logo.svg
+          python3 - <<'PY'
+          import json
+          d=json.load(open('reimflow-src/capacitor.config.json'))
+          assert d['appId']=='sbs.smarbiz.reimflow'
+          assert d['server']['url']=='https://reimflow.smarbiz.sbs'
+          PY
+          echo "REIMFLOW_SHA=$(git -C reimflow-src rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Register app and queue dedicated signed test builds
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"; umask 077
+          KEY="$RUNNER_TEMP/reimflow-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"; chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/reimflow-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"; chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e REIMFLOW_SOURCE_COMMIT='$REIMFLOW_SHA' -e REIMFLOW_QUEUE_BUILDS=1 web python manage.py shell" < scripts/reimflow/bootstrap_mobile.py
+      - name: Wake cloud builders
+        env: {GH_TOKEN: ${{ github.token }}}
+        run: |
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Internal builds queued; no public submission."

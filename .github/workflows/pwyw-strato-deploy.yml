@@ -102,7 +102,7 @@ jobs:
           chown 10061:10061 /opt/pwyw/data
           chmod 750 /opt/pwyw/data
           if [ -f /opt/pwyw/app.py ]; then
-            tar -czf "/opt/pwyw/backups/release-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /opt/pwyw app.py requirements.txt Dockerfile compose.yaml static || true
+            tar -czf "/opt/pwyw/backups/release-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /opt/pwyw app.py campaigns.py brandpack.py requirements.txt Dockerfile compose.yaml static || true
           fi
           tar -xzf /tmp/pwyw-pilot.tar.gz -C /opt/pwyw --strip-components=1
           cat > /opt/pwyw/.env <<EOF

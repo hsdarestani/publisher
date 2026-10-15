@@ -1,0 +1,95 @@
+name: PWYW TLS diagnostics (read only)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pwyw-tls-diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Check live DNS and edge TLS without changing anything
+        shell: bash
+        run: |
+          set +e
+          echo '--- Time UTC ---'
+          date -u
+          echo '--- DNS, using public resolvers ---'
+          for type in A AAAA CNAME; do
+            echo "DNS $type"
+            dig +time=3 +tries=1 +short @1.1.1.1 pwyw.smarbiz.sbs "$type"
+            dig +time=3 +tries=1 +short @8.8.8.8 pwyw.smarbiz.sbs "$type"
+          done
+          echo '--- Public Cloudflare response, repeated ---'
+          for n in 1 2 3; do
+            curl -sSI --max-time 10 -o /dev/null -w "EDGE_CHECK_$n http=%{http_code} remote=%{remote_ip} ssl=%{ssl_verify_result}\n" https://pwyw.smarbiz.sbs/api/health
+            sleep 2
+          done
+          echo '--- Direct origin SSL verification with correct hostname/SNI ---'
+          curl -sSI --max-time 12 --resolve pwyw.smarbiz.sbs:443:82.165.187.14 -o /dev/null -w "ORIGIN_STRICT http=%{http_code} ssl_verify=%{ssl_verify_result}\n" https://pwyw.smarbiz.sbs/api/health
+          curl -ksSI --max-time 12 --resolve pwyw.smarbiz.sbs:443:82.165.187.14 -o /dev/null -w "ORIGIN_INSECURE http=%{http_code} ssl_verify=%{ssl_verify_result}\n" https://pwyw.smarbiz.sbs/api/health
+          echo '--- Public origins certificate metadata, if any ---'
+          echo | timeout 12 openssl s_client -connect 82.165.187.14:443 -servername pwyw.smarbiz.sbs -showcerts 2>&1 | grep -E 'subject=|issuer=|Verify return code:|alert|handshake failure|no peer certificate|Protocol |Cipher ' | head -24
+
+      - name: Inspect STRATO TLS service and Caddy with read-only commands
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_HOST" = "82.165.187.14"
+          test -n "$DEPLOY_KEY"
+          PORT="${DEPLOY_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/diag-pwyw-key"
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$DEPLOY_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/pwyw-diag-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$DEPLOY_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$DEPLOY_HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$EXPECTED_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
+          fi
+          SSH=(ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          "${SSH[@]}" root@"$DEPLOY_HOST" 'bash -se' <<'READ_ONLY_ORIGIN'
+          set -u
+          echo '--- Origin clock and port listeners ---'
+          date -u
+          ss -ltn '( sport = :443 or sport = :80 )' | head -15 || true
+          echo '--- Running Publisher Caddy and PWYW container ---'
+          cd /opt/aplus-publisher
+          CADDY_ID="$(docker compose ps -q caddy)"
+          echo "CADDY_PRESENT=$([ -n "$CADDY_ID" ] && echo yes || echo no)"
+          docker compose ps caddy --format 'table {{.Name}}\t{{.State}}\t{{.Status}}' || true
+          if [ -n "$CADDY_ID" ]; then
+            docker exec "$CADDY_ID" caddy validate --config /etc/caddy/Caddyfile 2>&1 | tail -12 || true
+            echo '--- Relevant Caddy TLS log messages, last 300 messages ---'
+            docker logs --since 2h --tail 300 "$CADDY_ID" 2>&1 | grep -iE 'pwyw|tls|handshake|acme|certificate|challenge|issuer|rate.?limit|error' | tail -55 | cut -c1-360 || true
+          fi
+          echo '--- Local loopback origin TLS (hostname SNI) ---'
+          echo | timeout 10 openssl s_client -connect 127.0.0.1:443 -servername pwyw.smarbiz.sbs 2>&1 | grep -E 'subject=|issuer=|Verify return code:|alert|handshake failure|no peer certificate|Protocol |Cipher ' | head -20 || true
+          echo '--- Application health on isolated docker network ---'
+          if [ -n "$CADDY_ID" ]; then
+            docker exec "$CADDY_ID" wget -T 6 -qO- http://pwyw-web:8080/api/health | head -c 170 || true
+          fi
+          echo
+          READ_ONLY_ORIGIN

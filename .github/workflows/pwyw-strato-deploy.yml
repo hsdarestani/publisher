@@ -156,9 +156,22 @@ jobs:
           echo "PWYW isolated container and new Caddy route healthy; Publisher unchanged."
           REMOTE
           # Direct origin check does not depend on public DNS. Public HTTPS is required for done.
-          ORIGIN="$(curl -k -sS --connect-timeout 8 --max-time 18 --resolve "pwyw.smarbiz.sbs:443:$DEPLOY_HOST" -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
+          echo "PWYW DNS IPv4 addresses (public):"
+          getent ahostsv4 pwyw.smarbiz.sbs | awk '{print $1}' | sort -u || true
+          ORIGIN="000"
+          for attempt in $(seq 1 10); do
+            ORIGIN="$(curl -k -sS --connect-timeout 8 --max-time 18 --resolve "pwyw.smarbiz.sbs:443:$DEPLOY_HOST" -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health 2>/dev/null || true)"
+            [ "$ORIGIN" = 200 ] && break
+            echo "TLS warm-up attempt $attempt: origin HTTP $ORIGIN"
+            sleep 4
+          done
           echo "STRATO origin PWYW /api/health HTTP $ORIGIN"
-          test "$ORIGIN" = 200 || { echo "::error::PWYW route is not healthy from runner"; exit 1; }
+          if [ "$ORIGIN" != 200 ]; then
+            echo "Recent Caddy certificate diagnostics (sanitized):"
+            "${SSH[@]}" root@"$DEPLOY_HOST" 'cd /opt/aplus-publisher && docker logs --since 4m "$(docker compose ps -q caddy)" 2>&1 | grep -Ei "pwyw|certificate|acme|challenge|tls" | tail -28' || true
+            echo "::error::PWYW direct HTTPS is not ready; leave adjacent services untouched."
+            exit 1
+          fi
           PUBLIC="$(curl -sS --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 8 --max-time 20 -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
           echo "Public PWYW HTTPS /api/health HTTP $PUBLIC"
           test "$PUBLIC" = 200 || { echo "::error::Check PWYW DNS/Cloudflare TLS; origin route is healthy."; exit 1; }

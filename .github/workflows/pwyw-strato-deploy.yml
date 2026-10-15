@@ -49,6 +49,8 @@ jobs:
           DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
           EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
           AI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ADMIN_EMAIL: ${{ secrets.PWYW_ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.PWYW_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
           test "$DEPLOY_HOST" = "82.165.187.14" || { echo "::error::Publisher production secrets do not point to the expected STRATO host. Nothing changed."; exit 1; }
@@ -175,4 +177,13 @@ jobs:
           PUBLIC="$(curl -sS --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 8 --max-time 20 -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
           echo "Public PWYW HTTPS /api/health HTTP $PUBLIC"
           test "$PUBLIC" = 200 || { echo "::error::Check PWYW DNS/Cloudflare TLS; origin route is healthy."; exit 1; }
+          # Optional secure admin provisioning, never ship passwords in git or logs.
+          # Supply PWYW_ADMIN_EMAIL and PWYW_ADMIN_PASSWORD as Actions secrets.
+          if [ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+            printf '%s\\n%s\\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" |
+              "${SSH[@]}" root@"$DEPLOY_HOST" 'cd /opt/pwyw && docker compose exec -T web python admin_bootstrap.py'
+            echo "PWYW operator account provisioned from Actions secrets"
+          else
+            echo "PWYW operator not provisioned: Actions secret(s) missing"
+          fi
           echo "PWYW deployed successfully without restarting any neighbor service."

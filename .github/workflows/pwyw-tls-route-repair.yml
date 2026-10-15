@@ -1,0 +1,112 @@
+name: Repair PWYW TLS route without restarting shared services
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pwyw-tls-route-repair.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 14
+    steps:
+      - name: Safely restore missing hostname in live Caddy config
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_HOST" = "82.165.187.14"
+          test -n "$DEPLOY_KEY"
+          PORT="${DEPLOY_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/pwyw-tls-repair-key"
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$DEPLOY_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/pwyw-tls-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$DEPLOY_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$DEPLOY_HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$EXPECTED_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
+          fi
+          SSH=(ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          "${SSH[@]}" root@"$DEPLOY_HOST" 'bash -se' <<'REPAIR_CADDY'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          ID="$(docker compose ps -q caddy)"
+          test -n "$ID"
+          test "$(docker inspect -f '{{.State.Running}}' "$ID")" = true
+          test -f Caddyfile
+          grep -qF 'reimflow.smarbiz.sbs {' Caddyfile
+          grep -qF 'publisher.smarbiz.sbs' Caddyfile
+          docker exec "$ID" wget -T 6 -qO- http://pwyw-web:8080/api/health | grep -q '"ok":true'
+          mkdir -p /opt/pwyw/backups
+          cp -p Caddyfile "/opt/pwyw/backups/Caddyfile-before-525-$(date -u +%Y%m%dT%H%M%SZ)"
+          if ! grep -qF 'pwyw.smarbiz.sbs {' Caddyfile; then
+            cat >> Caddyfile <<'CADDY'
+          
+          # PWYW isolated games; preserved with publisher and reimflow routes.
+          pwyw.smarbiz.sbs {
+            encode zstd gzip
+            reverse_proxy pwyw-web:8080
+            header X-Content-Type-Options nosniff
+          }
+          CADDY
+            echo 'Appended missing PWYW block to host Caddyfile'
+          else
+            echo 'PWYW block already in host Caddyfile'
+          fi
+          grep -qF 'reimflow.smarbiz.sbs {' Caddyfile
+          grep -qF 'pwyw.smarbiz.sbs {' Caddyfile
+          # Shared Caddy container bind-mount may point to an old Caddyfile inode.
+          # Stage a copy inside it and hot-reload validated configuration,
+          # NEVER restart/recreate Caddy, Publisher or Reimflow.
+          docker cp Caddyfile "$ID":/tmp/Caddyfile-pwyw-525-repair
+          docker exec "$ID" caddy validate --config /tmp/Caddyfile-pwyw-525-repair
+          docker exec "$ID" caddy reload --config /tmp/Caddyfile-pwyw-525-repair
+          docker exec "$ID" rm -f /tmp/Caddyfile-pwyw-525-repair
+          echo 'Caddy configuration restored without restarting any container'
+          # No cert private key content is printed.
+          echo | timeout 9 openssl s_client -connect 127.0.0.1:443 -servername pwyw.smarbiz.sbs 2>&1 |
+             grep -E 'subject=|issuer=|Verify return code:|no peer certificate|alert' | head -9 || true
+          REPAIR_CADDY
+      - name: Verify public hostname, direct origin and other sites
+        shell: bash
+        run: |
+          set -u
+          for name in pwyw.smarbiz.sbs publisher.smarbiz.sbs reimflow.smarbiz.sbs; do
+            echo "Checking $name with explicit origin SNI"
+            result=000
+            for n in 1 6; do
+              result=$(curl -kLsS --max-time 12 --resolve "$name:443:82.165.187.14" -o /dev/null -w '%{http_code}' "https://$name/" 2>/dev/null || true)
+              if [ "$result" = 200 ] || [ "$result" = 302 ] || [ "$result" = 301 ]; then break; fi
+              sleep 5
+            done
+            echo "ORIGIN $name HTTP $result"
+            if [ "$name" = pwyw.smarbiz.sbs ]; then
+              test "$result" = 200
+            fi
+          done
+          public=000
+          for n in 1 10; do
+            public=$(curl -sS --max-time 14 https://pwyw.smarbiz.sbs/api/health -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+            echo "PUBLIC PWYW HTTP $public, check $n"
+            [ "$public" = 200 ] && exit 0
+            sleep 6
+          done
+          echo "::error::Origin route repaired, but public hostname not yet healthy. Check ACME/Caddy certificate issuance."
+          exit 1

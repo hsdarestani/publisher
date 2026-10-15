@@ -180,7 +180,7 @@ jobs:
           # Optional secure admin provisioning, never ship passwords in git or logs.
           # Supply PWYW_ADMIN_EMAIL and PWYW_ADMIN_PASSWORD as Actions secrets.
           if [ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
-            printf '%s\\n%s\\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" |
+            printf '%s\n%s\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" |
               "${SSH[@]}" root@"$DEPLOY_HOST" 'cd /opt/pwyw && docker compose exec -T web python admin_bootstrap.py'
             echo "PWYW operator account provisioned from Actions secrets"
           else

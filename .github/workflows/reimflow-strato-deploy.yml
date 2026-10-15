@@ -38,7 +38,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -319,6 +319,11 @@ jobs:
                 exit 1
               fi
               echo "Reimflow community API: OK"
+              PLATFORM_JS="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/platform.js?v=20261015-real1)"
+              if [[ "$SITE" != *'platform.js?v=20261015-real1'* ]] || [[ "$PLATFORM_JS" != *'ReimflowPlatform'* ]]; then
+                echo "::error::Real community client missing after deploy."
+                exit 1
+              fi
               echo "Reimflow site: OK"
               echo "API status: $HEALTH"
               # Verify the source deployed with the themed dark search skeleton.

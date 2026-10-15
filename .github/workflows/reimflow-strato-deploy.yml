@@ -35,6 +35,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           python3 -m unittest discover -s tests -p "test_rhyme_api.py"
           python3 -m unittest discover -s tests -p "test_rhyme_async_http.py"
+          python3 -m unittest discover -s tests -p "test_rhyme_timeout_fallback.py"
           python3 -m unittest discover -s tests -p "test_rhyme_quality.py"
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..

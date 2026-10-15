@@ -1,0 +1,68 @@
+name: Export signed Reimflow 1.0.0 private release artifacts
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/reimflow-export-first-build.yml']
+permissions: {contents: read}
+jobs:
+  export-signed:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Retrieve only the Reimflow build artifacts from Publisher
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"; umask 077
+          KEY="$RUNNER_TEMP/reimflow-export-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"; chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/reimflow-export-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"; chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          SSH=(ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST")
+          mkdir -p release-artifacts
+          for PLATFORM in android ios; do
+            if [ "$PLATFORM" = android ]; then TARGET="release-artifacts/reimflow-1.0.0-build1-android.aab"; else TARGET="release-artifacts/reimflow-1.0.0-build1-ios.ipa"; fi
+            EXPECTED=$("${SSH[@]}" "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"from apps.publisher.models import Build; b=Build.objects.get(release__app__slug='reimflow',release__version_name='1.0.0',release__build_number=1,platform='$PLATFORM'); assert b.status=='succeeded' and b.artifact; print(b.artifact_checksum)\"" | tail -n1 | tr -d '\r')
+            test "${#EXPECTED}" -eq 64
+            read -r -d '' CODE <<'PY' || true
+          import os,sys
+          from pathlib import Path
+          from apps.publisher.models import Build
+          platform=os.environ['PLATFORM']
+          b=Build.objects.get(release__app__slug='reimflow',release__version_name='1.0.0',release__build_number=1,platform=platform)
+          assert b.status=='succeeded' and b.artifact
+          sys.stdout.buffer.write(Path(b.artifact.path).read_bytes())
+          PY
+            DATA=$(printf %s "$CODE" | base64 -w0)
+            "${SSH[@]}" "cd /opt/aplus-publisher && printf '%s' '$DATA' | base64 -d | docker compose exec -T -e PLATFORM='$PLATFORM' web python manage.py shell -c 'exec(__import__(\"sys\").stdin.read())'" > "$TARGET"
+            test -s "$TARGET"
+            GOT=$(sha256sum "$TARGET" | awk '{print $1}')
+            test "$GOT" = "$EXPECTED" || { echo "::error::Checksum mismatch for $PLATFORM"; exit 1; }
+            echo "$PLATFORM verified: $(wc -c < "$TARGET") bytes"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reimflow-signed-android-aab-and-ios-ipa
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 14

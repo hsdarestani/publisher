@@ -29,15 +29,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile reimflow-src/api.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py
+          python3 -m py_compile reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py
           cd reimflow-src
+          python3 -m unittest discover -s tests -p "test_platform_api.py"
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           python3 -m unittest discover -s tests -p "test_rhyme_api.py"
           python3 -m unittest discover -s tests -p "test_rhyme_quality.py"
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js rhyme-fallback.js rhyme-previews.js api.py rhyme-quality.py rhyme-intent.py styles.css themes.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -47,6 +48,11 @@ jobs:
           DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
           EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REIMFLOW_SMTP_HOST: ${{ secrets.REIMFLOW_SMTP_HOST }}
+          REIMFLOW_SMTP_PORT: ${{ secrets.REIMFLOW_SMTP_PORT }}
+          REIMFLOW_SMTP_USER: ${{ secrets.REIMFLOW_SMTP_USER }}
+          REIMFLOW_SMTP_PASSWORD: ${{ secrets.REIMFLOW_SMTP_PASSWORD }}
+          REIMFLOW_SMTP_FROM: ${{ secrets.REIMFLOW_SMTP_FROM }}
         run: |
           set -euo pipefail
           test "$DEPLOY_HOST" = "82.165.187.14" || { echo "::error::Publisher HOST must point to the new STRATO 82.165.187.14"; exit 1; }
@@ -76,6 +82,14 @@ jobs:
           if [ -n "$OPENAI_API_KEY" ]; then
             printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$ENVFILE"
           fi
+          # SMTP stays optional until the operator configures dedicated secrets.
+          if [ -n "$REIMFLOW_SMTP_HOST" ]; then
+            printf "REIMFLOW_SMTP_HOST=%s\\n" "$REIMFLOW_SMTP_HOST" >> "$ENVFILE"
+            printf "REIMFLOW_SMTP_PORT=%s\\n" "${REIMFLOW_SMTP_PORT:-587}" >> "$ENVFILE"
+            printf "REIMFLOW_SMTP_USER=%s\\n" "$REIMFLOW_SMTP_USER" >> "$ENVFILE"
+            printf "REIMFLOW_SMTP_PASSWORD=%s\\n" "$REIMFLOW_SMTP_PASSWORD" >> "$ENVFILE"
+            printf "REIMFLOW_SMTP_FROM=%s\\n" "$REIMFLOW_SMTP_FROM" >> "$ENVFILE"
+          fi
           chmod 600 "$ENVFILE"
           scp -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$PORT" "$RUNNER_TEMP/reimflow-strato.tar.gz" "$ENVFILE" root@"$DEPLOY_HOST":/tmp/
           ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$DEPLOY_HOST" 'bash -se' <<'REMOTE'
@@ -92,12 +106,21 @@ jobs:
           mkdir -p /opt/reimflow/site /opt/reimflow/data
           chmod 755 /opt/reimflow/site
           chown 10001:10001 /opt/reimflow/data
+          # Keep previous source snapshot for immediate manual rollback without touching DB/media.
+          if [ -f /opt/reimflow/api.py ]; then
+            mkdir -p /opt/reimflow/source-backups
+            BACKUP="/opt/reimflow/source-backups/before-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+            tar -czf "$BACKUP" -C /opt/reimflow site api.py 2>/dev/null || true
+          fi
           rm -f /opt/reimflow/site/*.js /opt/reimflow/site/*.css /opt/reimflow/site/*.html
           tar -xzf /tmp/reimflow-strato.tar.gz -C /opt/reimflow/site
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
+          mv /opt/reimflow/site/platform_api.py /opt/reimflow/platform_api.py
+          mv /opt/reimflow/site/role_admin.py /opt/reimflow/role_admin.py
           mv /opt/reimflow/site/rap-flow-analysis.py /opt/reimflow/rap-flow-analysis.py
           mv /opt/reimflow/site/rhyme-quality.py /opt/reimflow/rhyme-quality.py
           mv /opt/reimflow/site/rhyme-intent.py /opt/reimflow/rhyme-intent.py
+          chmod 644 /opt/reimflow/platform_api.py /opt/reimflow/role_admin.py
           chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py /opt/reimflow/rhyme-intent.py
           cp /tmp/reimflow-strato.env /opt/reimflow/.env
           chmod 600 /opt/reimflow/.env
@@ -108,7 +131,7 @@ jobs:
               server_name _;
               root /usr/share/nginx/html;
               index index.html;
-              client_max_body_size 5m;  # Enable audio upload at the server level too
+              client_max_body_size 14m;  # Allow licensed audio uploads up to 12 MiB
               location = /api/flow/analyze {
                   proxy_pass http://127.0.0.1:8787;
                   proxy_set_header Host $host;
@@ -137,7 +160,7 @@ jobs:
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_connect_timeout 5s;
                   proxy_read_timeout 60s;
-                  client_max_body_size 5m;
+                  client_max_body_size 14m;
               }
               location / {
                   add_header Cache-Control "no-cache" always;
@@ -182,6 +205,8 @@ jobs:
                 REIMFLOW_DB: /var/lib/reimflow/reimflow.sqlite3
               volumes:
                 - ./api.py:/app/api.py:ro
+                - ./platform_api.py:/app/platform_api.py:ro
+                - ./role_admin.py:/app/role_admin.py:ro
                 - ./rap-flow-analysis.py:/app/rap-flow-analysis.py:ro
                 - ./rhyme-quality.py:/app/rhyme-quality.py:ro
                 - ./rhyme-intent.py:/app/rhyme-intent.py:ro
@@ -189,7 +214,7 @@ jobs:
               read_only: true
               tmpfs:
                 - /tmp
-              mem_limit: 192m
+              mem_limit: 256m
               cpus: 0.6
               security_opt:
                 - no-new-privileges:true
@@ -288,6 +313,17 @@ jobs:
             SITE="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/ || true)"
             HEALTH="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/api/health || true)"
             if [[ "$SITE" == *"Reimflow"* ]] && [[ "$HEALTH" == *'"ok": true'* ]]; then
+              PLATFORM="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/api/platform/bootstrap || true)"
+              if [[ "$PLATFORM" != *'"ok": true'* ]]; then
+                echo "::error::Reimflow platform API unavailable after deployment."
+                exit 1
+              fi
+              echo "Reimflow community API: OK"
+              PLATFORM_JS="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/platform.js?v=20261015-real1)"
+              if [[ "$SITE" != *'platform.js?v=20261015-real1'* ]] || [[ "$PLATFORM_JS" != *'ReimflowPlatform'* ]]; then
+                echo "::error::Real community client missing after deploy."
+                exit 1
+              fi
               echo "Reimflow site: OK"
               echo "API status: $HEALTH"
               # Verify the source deployed with the themed dark search skeleton.

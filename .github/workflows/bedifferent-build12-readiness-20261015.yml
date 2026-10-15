@@ -44,6 +44,9 @@ jobs:
           fi
           ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
           set -euo pipefail
+          echo "APP_DIRECTORY_PRESENT=$(test -d /opt/bedifferent && echo yes || echo no)"
+          echo "APP_PROD_ENV_PRESENT=$(test -f /opt/bedifferent/.env.production && echo yes || echo no)"
+          echo "APP_DOCKER_CONTAINERS=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei 'bedifferent|be-different' | head -n 4 | tr '\n' ',' || true)"
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
           import json

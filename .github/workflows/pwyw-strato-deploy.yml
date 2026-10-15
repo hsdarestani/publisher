@@ -1,0 +1,158 @@
+name: PWYW on STRATO — isolated pilot deploy
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pwyw-strato-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pwyw-isolated-strato
+  cancel-in-progress: false
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - name: Checkout PWYW product only
+        uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/pwyw
+          ref: main
+          path: pwyw-src
+
+      - name: Validate code and test tenant isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/pwyw-test-venv
+          /tmp/pwyw-test-venv/bin/pip install -q -r pwyw-src/requirements.txt httpx==0.28.1
+          cd pwyw-src
+          /tmp/pwyw-test-venv/bin/python -m py_compile app.py
+          /tmp/pwyw-test-venv/bin/python -m unittest discover -s tests -v
+          test -s static/index.html
+          test -s static/play.js
+          test -s static/dashboard.js
+          tar --exclude='.git' --exclude='data' --exclude='__pycache__' -czf "$RUNNER_TEMP/pwyw-pilot.tar.gz" -C .. pwyw-src
+
+      - name: SSH preflight and isolated deployment
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          AI_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_HOST" = "82.165.187.14" || { echo "::error::Publisher production secrets do not point to the expected STRATO host. Nothing changed."; exit 1; }
+          test -n "$DEPLOY_KEY" || { echo "::error::Publisher SSH key missing. Nothing changed."; exit 1; }
+          PORT="${DEPLOY_PORT:-22}"
+          umask 077
+          KEY_FILE="$RUNNER_TEMP/pwyw-key"
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if [ -n "$DEPLOY_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/pwyw-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$DEPLOY_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY_FILE" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$DEPLOY_HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$EXPECTED_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
+          fi
+          SSH=(ssh -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          SCP=(scp -i "$KEY_FILE" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$PORT")
+          # Read-only check before any changes. Explicitly do NOT run Publisher compose up.
+          "${SSH[@]}" root@"$DEPLOY_HOST" 'bash -se' <<'PRECHECK'
+          set -euo pipefail
+          test -f /opt/aplus-publisher/Caddyfile
+          test -f /opt/aplus-publisher/docker-compose.yml
+          command -v docker >/dev/null
+          cd /opt/aplus-publisher
+          CADDY_ID="$(docker compose ps -q caddy)"
+          test -n "$CADDY_ID"
+          test "$(docker inspect -f '{{.State.Running}}' "$CADDY_ID")" = true
+          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
+          docker compose exec -T web curl -fsS --max-time 7 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
+          printf "Caddy and Publisher preflight passed.\n"
+          df -Pk /opt | awk 'NR==2 {if ($4<500000) exit 1; print "Disk preflight passed"}'
+          PRECHECK
+          # AI remains off by default in production pilot; enable only after costs/legal review.
+          "${SCP[@]}" "$RUNNER_TEMP/pwyw-pilot.tar.gz" root@"$DEPLOY_HOST":/tmp/pwyw-pilot.tar.gz
+          "${SSH[@]}" root@"$DEPLOY_HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          trap 'rm -f /tmp/pwyw-pilot.tar.gz' EXIT
+          cd /opt/aplus-publisher
+          CADDY_ID="$(docker compose ps -q caddy)"
+          test -n "$CADDY_ID"
+          NETWORK="$(docker inspect "$CADDY_ID" --format '{{range $name, $network := .NetworkSettings.Networks}}{{println $name}}{{end}}' | head -n1)"
+          test -n "$NETWORK" && docker network inspect "$NETWORK" >/dev/null
+          mkdir -p /opt/pwyw/data /opt/pwyw/backups
+          chown 10061:10061 /opt/pwyw/data
+          chmod 750 /opt/pwyw/data
+          if [ -f /opt/pwyw/app.py ]; then
+            tar -czf "/opt/pwyw/backups/release-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /opt/pwyw app.py requirements.txt Dockerfile compose.yaml static || true
+          fi
+          tar -xzf /tmp/pwyw-pilot.tar.gz -C /opt/pwyw --strip-components=1
+          cat > /opt/pwyw/.env <<EOF
+          PUBLISHER_NETWORK=$NETWORK
+          PUBLIC_BASE_URL=https://pwyw.smarbiz.sbs
+          EOF
+          chmod 600 /opt/pwyw/.env
+          cd /opt/pwyw
+          docker compose config --quiet
+          # Single independent Compose project; no host published ports or changes to neighbor stacks.
+          docker compose up -d --build --no-deps web
+          ID="$(docker compose ps -q web)"
+          test -n "$ID"
+          for i in $(seq 1 22); do
+            if docker exec "$ID" python -c 'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1:8080/api/health",timeout=3).status==200' >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" -eq 22 ]; then docker compose logs --tail=90 web; exit 1; fi
+            sleep 2
+          done
+          # Isolated route, append IN PLACE to preserve Caddy's bind-mounted inode.
+          cd /opt/aplus-publisher
+          if ! grep -qF 'pwyw.smarbiz.sbs {' Caddyfile; then
+            cp Caddyfile "/opt/pwyw/backups/Caddyfile-before-pwyw-$(date -u +%Y%m%dT%H%M%SZ)"
+            cat >> Caddyfile <<'CADDY'
+
+          # PWYW pilot: separate resource-limited container, shared Caddy route only.
+          pwyw.smarbiz.sbs {
+            encode zstd gzip
+            reverse_proxy pwyw-web:8080
+            header X-Content-Type-Options nosniff
+          }
+          CADDY
+          fi
+          if ! docker compose exec -T caddy grep -qF 'pwyw.smarbiz.sbs {' /etc/caddy/Caddyfile </dev/null; then
+            echo "::error::Caddy bind mount is stale. Refusing to restart shared reverse proxy."
+            exit 1
+          fi
+          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
+          docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile </dev/null
+          # Direct internal route must be healthy before public checks.
+          docker exec "$CADDY_ID" wget -qO- http://pwyw-web:8080/api/health | grep -q '"ok":true'
+          docker compose exec -T web curl -fsS --max-time 7 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
+          echo "PWYW isolated container and new Caddy route healthy; Publisher unchanged."
+          REMOTE
+          # Direct origin check does not depend on public DNS. Public HTTPS is required for done.
+          ORIGIN="$(curl -k -sS --connect-timeout 8 --max-time 18 --resolve "pwyw.smarbiz.sbs:443:$DEPLOY_HOST" -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
+          echo "STRATO origin PWYW /api/health HTTP $ORIGIN"
+          test "$ORIGIN" = 200 || { echo "::error::PWYW route is not healthy from runner"; exit 1; }
+          PUBLIC="$(curl -sS --retry 5 --retry-delay 3 --retry-connrefused --connect-timeout 8 --max-time 20 -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
+          echo "Public PWYW HTTPS /api/health HTTP $PUBLIC"
+          test "$PUBLIC" = 200 || { echo "::error::Check PWYW DNS/Cloudflare TLS; origin route is healthy."; exit 1; }
+          echo "PWYW deployed successfully without restarting any neighbor service."

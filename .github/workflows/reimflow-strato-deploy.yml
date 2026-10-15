@@ -29,16 +29,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py
+          python3 -m py_compile reimflow-src/rhyme_jobs.py reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py
           cd reimflow-src
           python3 -m unittest discover -s tests -p "test_platform_api.py"
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           python3 -m unittest discover -s tests -p "test_rhyme_api.py"
+          python3 -m unittest discover -s tests -p "test_rhyme_async_http.py"
+          python3 -m unittest discover -s tests -p "test_rhyme_timeout_fallback.py"
           python3 -m unittest discover -s tests -p "test_rhyme_quality.py"
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -115,12 +117,13 @@ jobs:
           rm -f /opt/reimflow/site/*.js /opt/reimflow/site/*.css /opt/reimflow/site/*.html
           tar -xzf /tmp/reimflow-strato.tar.gz -C /opt/reimflow/site
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
+          mv /opt/reimflow/site/rhyme_jobs.py /opt/reimflow/rhyme_jobs.py
           mv /opt/reimflow/site/platform_api.py /opt/reimflow/platform_api.py
           mv /opt/reimflow/site/role_admin.py /opt/reimflow/role_admin.py
           mv /opt/reimflow/site/rap-flow-analysis.py /opt/reimflow/rap-flow-analysis.py
           mv /opt/reimflow/site/rhyme-quality.py /opt/reimflow/rhyme-quality.py
           mv /opt/reimflow/site/rhyme-intent.py /opt/reimflow/rhyme-intent.py
-          chmod 644 /opt/reimflow/platform_api.py /opt/reimflow/role_admin.py
+          chmod 644 /opt/reimflow/platform_api.py /opt/reimflow/rhyme_jobs.py /opt/reimflow/role_admin.py
           chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py /opt/reimflow/rhyme-intent.py
           cp /tmp/reimflow-strato.env /opt/reimflow/.env
           chmod 600 /opt/reimflow/.env
@@ -205,6 +208,7 @@ jobs:
                 REIMFLOW_DB: /var/lib/reimflow/reimflow.sqlite3
               volumes:
                 - ./api.py:/app/api.py:ro
+                - ./rhyme_jobs.py:/app/rhyme_jobs.py:ro
                 - ./platform_api.py:/app/platform_api.py:ro
                 - ./role_admin.py:/app/role_admin.py:ro
                 - ./rap-flow-analysis.py:/app/rap-flow-analysis.py:ro
@@ -274,11 +278,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for QUERY in "Blue Ferrari" "Blue Talisman" "Blue paper"; do
+          for QUERY in "Blue Ferrari" "Blue Talisman" "Blue paper" "Jude Bellingham"; do
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
               -d "$PAYLOAD" https://reimflow.smarbiz.sbs/api/rhymes || true)"
+            if [[ "$STATUS" == "202" ]]; then
+              JOB_ID="$(python3 - "$RUNNER_TEMP/quality-response" <<'PY'
+          import json,sys
+          data=json.load(open(sys.argv[1],encoding="utf8"))
+          assert data.get("pending") is True and data.get("job_id")
+          print(data["job_id"])
+          PY
+              )"
+              for POLL in $(seq 1 100); do
+                sleep 2
+                STATUS="$(curl -sS --max-time 12 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
+                  -H 'Accept: application/json' "https://reimflow.smarbiz.sbs/api/rhymes/jobs/$JOB_ID" || true)"
+                if [[ "$STATUS" != "202" ]]; then break; fi
+              done
+            fi
             echo "Rhyme quality live HTTP for $QUERY: $STATUS"
             if [[ "$STATUS" != "200" ]]; then
               echo "::error::High quality AI rhyme endpoint failed for $QUERY (HTTP $STATUS)."
@@ -296,6 +315,8 @@ jobs:
           assert data.get("review_model"),"Second model must judge every result"
           assert all(x.get("strength") in ("stark","brauchbar") for x in items)
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
+          if query=="Jude Bellingham":
+              assert len(items)>=1,"Expected independently reviewed Jude Bellingham rhymes"
           if query=="Blue paper":
               assert len(items)>=2,"Expected multiple quality-reviewed paper rhymes, not an empty result"
               assert any(x.get("scope")=="end_word" for x in items),"Expected final word rhymes"
@@ -364,8 +385,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261015-phrase3')"
-              if [[ "$SITE" != *'app.js?v=20261015-phrase3'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS"; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261016-async1')"
+              if [[ "$SITE" != *'app.js?v=20261016-async1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi

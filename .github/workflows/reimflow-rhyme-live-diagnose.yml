@@ -1,0 +1,63 @@
+name: Diagnose live Reimflow AI rhyme failure
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/reimflow-rhyme-live-diagnose.yml']
+permissions: {contents: read}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Diagnose live AI endpoint and upstream model access without printing keys
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"; umask 077
+          KEY="$RUNNER_TEMP/reimflow-diagnostic-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"; chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/reimflow-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"; chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"; chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/reimflow
+          docker compose ps --format 'table {{.Service}}\t{{.Status}}'
+          docker compose exec -T api python - <<'PY'
+          import os,json,urllib.request,urllib.error,urllib.parse
+          key=os.getenv('OPENAI_API_KEY','').strip()
+          print("LIVE_OPENAI_KEY_PRESENT",bool(key))
+          for name in ('OPENAI_MODEL','RHYME_REVIEW_MODEL'):
+              model=os.getenv(name,'')
+              print("LIVE_MODEL",name,model)
+              if not key:continue
+              req=urllib.request.Request('https://api.openai.com/v1/models/'+urllib.parse.quote(model),
+                  headers={'Authorization':'Bearer '+key})
+              try:
+                  with urllib.request.urlopen(req,timeout=12) as response: print("MODEL_CHECK",name,response.status)
+              except urllib.error.HTTPError as exc:
+                  print("MODEL_CHECK",name,"HTTP",exc.code)
+                  # Do not log headers or account-specific upstream payload.
+              except Exception as exc: print("MODEL_CHECK",name,type(exc).__name__)
+          PY
+          echo "RECENT_RHYME_ERRORS"
+          docker compose logs --since 40m --tail=180 api 2>&1 | grep -E 'rhyme upstream:|rhyme request failed:|rhyme quality gate:' | tail -n 30 || true
+          REMOTE

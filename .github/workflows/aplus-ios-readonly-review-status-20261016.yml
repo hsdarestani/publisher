@@ -57,35 +57,58 @@ jobs:
               if name and state: print('JOB '+name.get_text(' ',strip=True)+'='+state.get_text(' ',strip=True))
           print('RELEASE_9_1_0_29_END')
           PY
-      - name: Query Apple's live App Store Connect review/version states (READ ONLY)
+      - name: Query Apple review state directly using Publisher's existing SSH key (read only)
         shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq sshpass >/dev/null
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
           port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
-          timeout 75 sshpass -p "$PASS" ssh -p "$port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=9 -o ServerAliveCountMax=2 root@"$HOST" 'bash -s' <<'REMOTE'
+          umask 077
+          key="$RUNNER_TEMP/aplus-review-status-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$key"
+          chmod 600 "$key"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            askpass="$RUNNER_TEMP/aplus-review-status-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$askpass"
+            chmod 700 "$askpass"
+            DISPLAY=:0 SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$key" </dev/null
+            rm -f "$askpass"
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$port" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          timeout 115 ssh -i "$key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=9 -o ServerAliveCountMax=2 root@"$HOST" 'bash -se' <<'REMOTE'
           set -euo pipefail
           cd /opt/aplus-publisher
-          timeout 55 docker compose exec -T web python manage.py shell -c "
-          from apps.publisher.models import MobileApp
+          timeout 95 docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp, Release, Job, Submission
           from apps.integrations.apple_store import AppleStoreClient
-          a=MobileApp.objects.get(slug='a-plus-solution')
-          c=AppleStoreClient(a.apple_account)
-          app=c.find_app(a.bundle_id)
-          print('APPLE_APPLICATION_VERIFIED=yes')
-          versions=c.list_versions(app['id'],limit=30)
+          app=MobileApp.objects.get(slug='a-plus-solution')
+          c=AppleStoreClient(app.apple_account)
+          a=c.find_app(app.bundle_id)
+          print('APPLE_APP_ID_VERIFIED',a['id'])
+          versions=c.list_versions(a['id'],limit=30)
           for v in versions:
               at=v.get('attributes',{})
-              version=at.get('versionString','')
-              if version.startswith('1.0.'):
-                  print('APPLE_VERSION',version,'STATE',at.get('appStoreState') or at.get('appVersionState') or 'UNKNOWN')
+              if str(at.get('versionString','')).startswith('1.0.'):
+                  print('APPLE_VERSION',at.get('versionString'),'STATE',at.get('appStoreState') or at.get('appVersionState') or 'unknown')
           for state in ('WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES','READY_FOR_REVIEW','COMPLETE'):
               try:
-                  submissions=c.list_review_submissions(app['id'],state)
-                  print('APPLE_SUBMISSION_STATE',state,'COUNT',len(submissions))
+                  v=c.list_review_submissions(a['id'],state)
+                  print('APPLE_REVIEW_SUBMISSIONS',state,'COUNT',len(v))
               except Exception as e:
-                  print('APPLE_SUBMISSION_QUERY_ERROR',state,type(e).__name__)
-          " </dev/null
-          echo APPLE_READONLY_INSPECTION_COMPLETE=yes
+                  print('APPLE_REVIEW_QUERY_ERROR',state,type(e).__name__)
+          for r in Release.objects.filter(app=app).order_by('-build_number')[:4]:
+              print('PUBLISHER_RELEASE',r.version_name,r.build_number,'STATE',r.status)
+              for plat in ('ios','android'):
+                  b=r.builds.filter(platform=plat).first()
+                  if b: print('PUBLISHER_BUILD',r.version_name,plat,b.status,'HAS_ARTIFACT',bool(b.artifact))
+              for plat in ('ios','android'):
+                  sub=Submission.objects.filter(release=r,platform=plat).first()
+                  if sub: print('PUBLISHER_SUBMISSION',r.version_name,plat,sub.state,bool(sub.submitted_at))
+          print('APPLE_LIVE_READONLY_DONE')
+          PY
           REMOTE

@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 focused studio settings modal: validated hsdarestani/pwyw@c7967a300bf3d347d14caf67880dcd3a4941a38e · CI 38929549807.
+# PWYW 2026-10-16 merchant-facing customer journey preview; tested source hsdarestani/pwyw@5ba6eed880ee31d045451d162153ac16680f7160 · CI 38931805249.
 on:
   push:
     branches: [main]

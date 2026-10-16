@@ -45,7 +45,7 @@ jobs:
           ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
-          import json
+          import json,time,requests
           from apps.publisher.models import MobileApp
           from apps.integrations.apple_store import AppleStoreClient
           app=MobileApp.objects.get(slug='be-different')
@@ -67,7 +67,23 @@ jobs:
               amended=amended.replace(old,new)
             if amended!=current:
               payload={'data':{'type':'appStoreVersionLocalizations','id':identifier,'attributes':{'description':amended}}}
-              client.request('PATCH','/appStoreVersionLocalizations/'+identifier,data=json.dumps(payload))
+              for attempt in range(3):
+                try:
+                  response=requests.patch(
+                    'https://api.appstoreconnect.apple.com/v1/appStoreVersionLocalizations/'+identifier,
+                    headers={'Authorization':'Bearer '+client.token(),'Content-Type':'application/json'},
+                    data=json.dumps(payload),timeout=(8,18))
+                  print('APPLE_PATCH_HTTP_'+lang+'='+str(response.status_code),flush=True)
+                  if not response.ok:
+                    raise RuntimeError('Apple rejected description PATCH: '+str(response.status_code)+' '+response.text[:230])
+                except requests.exceptions.RequestException as exc:
+                  print('APPLE_PATCH_NETWORK_'+lang+'='+type(exc).__name__,flush=True)
+                saved=client.request('GET','/appStoreVersionLocalizations/'+identifier)['data']
+                if saved['attributes']['description']==amended:
+                  break
+                if attempt==2:
+                  raise RuntimeError('Apple did not persist '+lang+' metadata after 3 attempts')
+                time.sleep(3)
             saved=client.request('GET','/appStoreVersionLocalizations/'+identifier)['data']
             assert saved['attributes']['description']==amended
             print('METADATA_UPDATED_AND_VERIFIED='+lang)

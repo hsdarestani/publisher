@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 mobile UX polish and substantive campaign copy; verified hsdarestani/pwyw@d16671a07197cee0990d34e8aa000afc392c11ed · CI 38927331679.
+# PWYW 2026-10-16 focused studio settings modal: validated hsdarestani/pwyw@c7967a300bf3d347d14caf67880dcd3a4941a38e · CI 38929549807.
 on:
   push:
     branches: [main]

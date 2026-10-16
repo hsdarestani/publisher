@@ -180,17 +180,16 @@ jobs:
           # Proof-of-connection is optional; report only an outcome, never secret values.
           cd /opt/pwyw
           docker compose exec -T web python - <<'PY'
-import os
-from campaign_suggestions import cloudflare_candidate
-account=os.getenv("CLOUDFLARE_ACCOUNT_ID","")
-token=os.getenv("CLOUDFLARE_AI_API_TOKEN","")
-if account and token:
-    result=cloudflare_candidate({"name":"Demo Café","industry":"cafe"},"return",0)
-    print("PWYW Workers AI inference: "+("SUCCESS" if result else "UNAVAILABLE; safe local generator active"),flush=True)
-else:
-    print("PWYW Workers AI credentials: INCOMPLETE IN PUBLISHER; safe local generator active",flush=True)
-PY
-
+          import os
+          from campaign_suggestions import cloudflare_candidate
+          account=os.getenv("CLOUDFLARE_ACCOUNT_ID","")
+          token=os.getenv("CLOUDFLARE_AI_API_TOKEN","")
+          if account and token:
+              result=cloudflare_candidate({"name":"Demo Café","industry":"cafe"},"return",0)
+              print("PWYW Workers AI inference: "+("SUCCESS" if result else "UNAVAILABLE; safe local generator active"),flush=True)
+          else:
+              print("PWYW Workers AI credentials: INCOMPLETE IN PUBLISHER; safe local generator active",flush=True)
+          PY
           REMOTE
           # Direct origin check does not depend on public DNS. Public HTTPS is required for done.
           echo "PWYW DNS IPv4 addresses (public):"

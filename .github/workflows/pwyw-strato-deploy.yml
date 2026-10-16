@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 high-quality campaign ideas: approved CI 38941220153 · hsdarestani/pwyw@533dfb091ff2dfa5be7239c300a493b528d8e4c4.
+# PWYW 2026-10-16 merchant-native bilingual copy and verified conversion wording: hsdarestani/pwyw@4970302da992aaf9857de7a8e140c94f16d959a0 CI 38948557870.
 on:
   push:
     branches: [main]

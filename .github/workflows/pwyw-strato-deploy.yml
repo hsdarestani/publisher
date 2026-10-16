@@ -1,4 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
+# PWYW 2026-10-16 release: verified Persian/German UI, campaigns and operator secret provisioning.
 on:
   push:
     branches: [main]

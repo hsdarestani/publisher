@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 studio mobile UX: verified hsdarestani/pwyw@184ed09ebe971dc531e6e7fa1cf797b12cee0d2e · CI run 38920788412.
+# PWYW 2026-10-16 auto-campaign approval wizard: verified hsdarestani/pwyw@07d0a109092fe072b0ef1b8949bce5f9c40cbd2a · CI 38924080325.
 on:
   push:
     branches: [main]
@@ -177,6 +177,20 @@ jobs:
           docker exec "$CADDY_ID" wget -qO- http://pwyw-web:8080/api/health | grep -q '"ok":true'
           docker compose exec -T web curl -fsS --max-time 7 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
           echo "PWYW isolated container and new Caddy route healthy; Publisher unchanged."
+          # Proof-of-connection is optional; report only an outcome, never secret values.
+          cd /opt/pwyw
+          docker compose exec -T web python - <<'PY'
+import os
+from campaign_suggestions import cloudflare_candidate
+account=os.getenv("CLOUDFLARE_ACCOUNT_ID","")
+token=os.getenv("CLOUDFLARE_AI_API_TOKEN","")
+if account and token:
+    result=cloudflare_candidate({"name":"Demo Café","industry":"cafe"},"return",0)
+    print("PWYW Workers AI inference: "+("SUCCESS" if result else "UNAVAILABLE; safe local generator active"),flush=True)
+else:
+    print("PWYW Workers AI credentials: INCOMPLETE IN PUBLISHER; safe local generator active",flush=True)
+PY
+
           REMOTE
           # Direct origin check does not depend on public DNS. Public HTTPS is required for done.
           echo "PWYW DNS IPv4 addresses (public):"

@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 Workers AI credentials verification after user secret setup; isolated PWYW web service only.
+# PWYW 2026-10-16 mobile UX polish and substantive campaign copy; verified hsdarestani/pwyw@d16671a07197cee0990d34e8aa000afc392c11ed · CI 38927331679.
 on:
   push:
     branches: [main]

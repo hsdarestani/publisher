@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 Persian editorial rewrite: validated source hsdarestani/pwyw@3efaea1e92a4c668a4e3fd862b9ae15c61d1d5b1.
+# PWYW 2026-10-16 focused game journey: verified source hsdarestani/pwyw@1033a057bd9468355b56aaa30d4250648dfcf358.
 on:
   push:
     branches: [main]

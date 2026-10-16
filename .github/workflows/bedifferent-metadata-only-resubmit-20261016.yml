@@ -1,0 +1,84 @@
+name: BE DIFFERENT resubmit iOS build 12 after 2.3 metadata fix
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-metadata-only-resubmit-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Verify corrected descriptions and resubmit original review
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-meta-submit-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-meta-submit-pass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release,AppLocalization,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          from django.utils import timezone
+          app=MobileApp.objects.get(slug='be-different')
+          release=Release.objects.get(pk=7,app=app,version_name='1.2.0',build_number=12)
+          ios=release.builds.get(platform='ios')
+          assert ios.status=='succeeded' and ios.external_build_id=='0803e31d-26af-4cfb-976e-713c3212ae84'
+          client=AppleStoreClient(app.apple_account)
+          identifiers={'en-US':'77048cef-82ee-4ab4-b643-140b7beb7427','de-DE':'cbf86e62-c023-4bff-874f-e325702f79d4'}
+          for locale,id in identifiers.items():
+            source=client.request('GET','/appStoreVersionLocalizations/'+id)['data']['attributes']
+            description=source.get('description') or ''
+            if locale=='en-US':
+              assert 'track your completed training sessions' in description and 'communicate with your coach' not in description and 'personal coaching' not in description
+            else:
+              assert 'dokumentiere absolvierte Einheiten' in description and 'kommuniziere mit deinem Trainer' not in description and 'persönliche Betreuung' not in description
+            stored,_=AppLocalization.objects.get_or_create(app=app,locale=locale,defaults={'title':'Be Different'})
+            stored.full_description=description
+            stored.keywords=source.get('keywords') or ''
+            stored.save(update_fields=['full_description','keywords','updated_at'])
+            print('PUBLISHER_APPLE_METADATA_SYNCED='+locale,flush=True)
+          app_id=client.find_app(app.bundle_id)['id']
+          version_id='bec48543-3f4a-47b5-9fb6-53701512abb2'
+          original='4bc6e898-3acf-44ec-9f25-a464a45b6190'
+          result=client.submit_version(app_id,version_id)
+          status=result['submission'].get('attributes',{}).get('state')
+          print('APPLE_RESUBMISSION='+json.dumps({'id':result['submission']['id'],'state':status,'reused':result.get('reused')},sort_keys=True),flush=True)
+          assert result['submission']['id']==original,'Wrong submission selected'
+          assert status in ('WAITING_FOR_REVIEW','IN_REVIEW'),'Apple did not accept review resubmission'
+          Submission.objects.update_or_create(app=app,release=release,platform='ios',defaults={'state':'in_review','external_id':original,'submitted_at':timezone.now(),'last_error':''})
+          release.status='in_review'
+          release.save(update_fields=['status','updated_at'])
+          print('BE_DIFFERENT_CORRECTED_METADATA_SUBMITTED=true',flush=True)
+          PY
+          REMOTE

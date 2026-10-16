@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 merchant-facing customer journey preview; tested source hsdarestani/pwyw@5ba6eed880ee31d045451d162153ac16680f7160 · CI 38931805249.
+# PWYW 2026-10-16 high-quality campaign ideas: approved CI 38941220153 · hsdarestani/pwyw@533dfb091ff2dfa5be7239c300a493b528d8e4c4.
 on:
   push:
     branches: [main]

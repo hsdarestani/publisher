@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 focused game journey: verified source hsdarestani/pwyw@1033a057bd9468355b56aaa30d4250648dfcf358.
+# PWYW 2026-10-16 studio mobile UX: verified hsdarestani/pwyw@184ed09ebe971dc531e6e7fa1cf797b12cee0d2e · CI run 38920788412.
 on:
   push:
     branches: [main]

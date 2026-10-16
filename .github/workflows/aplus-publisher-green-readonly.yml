@@ -1,0 +1,78 @@
+name: Publisher capacity and A+ standby audit (READ ONLY)
+on:
+  push:
+    branches: [audit/aplus-green-publisher-readonly-20261016]
+    paths: ['.github/workflows/aplus-publisher-green-readonly.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      TARGET_HOST: ${{ secrets.HOST }}
+      TARGET_PORT: ${{ secrets.SSH_PORT }}
+      TARGET_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      TARGET_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+      TARGET_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+    steps:
+      - name: Read-only SSH inventory, no changes to remote host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TARGET_HOST" && test -n "$TARGET_KEY"
+          port="$TARGET_PORT"
+          if [ -z "$port" ]; then port=22; fi
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          key="$RUNNER_TEMP/publisher-readonly.key"
+          printf '%s\n' "$TARGET_KEY" | tr -d '\r' > "$key"
+          chmod 600 "$key"
+          trap 'rm -f "$key"' EXIT
+          if [ -n "$TARGET_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            askpass="$RUNNER_TEMP/publisher-audit-askpass"
+            printf '#!/bin/sh\nprintf "%%s" "$TARGET_PASSPHRASE"\n' > "$askpass"
+            chmod 700 "$askpass"
+            DISPLAY=:0 SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$key" </dev/null
+            rm -f "$askpass"
+          fi
+          ssh-keyscan -T 8 -p "$port" -H "$TARGET_HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$TARGET_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F "$TARGET_FINGERPRINT" >/dev/null
+          fi
+          timeout 140 ssh -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=12 -o ServerAliveInterval=10 -o ServerAliveCountMax=2 -p "$port" root@"$TARGET_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          echo PUBLISHER_SSH_CONNECTED=yes
+          printf 'PUBLISHER_ARCH='; uname -m
+          printf 'PUBLISHER_LOAD1='; cut -d' ' -f1 /proc/loadavg
+          printf 'PUBLISHER_RAM_AVAILABLE_MB='; awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo
+          printf 'PUBLISHER_RAM_TOTAL_MB='; awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo
+          printf 'PUBLISHER_DOCKER_DISK_FREE_MB='; df -Pm /var/lib/docker | awk 'END{print $4}'
+          if ! command -v docker >/dev/null 2>&1; then echo PUBLISHER_DOCKER_UNAVAILABLE=yes; exit 0; fi
+          echo PUBLISHER_DOCKER_AVAILABLE=yes
+          echo PUBLISHER_CONTAINERS_BEGIN
+          timeout 12 docker ps --format '{{.Names}}|{{.Status}}' | head -n 35
+          echo PUBLISHER_CONTAINERS_END
+          for path in /opt/aplus-publisher /opt/aplussolution /opt/aplussolution-green; do
+            if test -e "$path"; then echo "PUBLISHER_PATH_PRESENT=$path"; else echo "PUBLISHER_PATH_ABSENT=$path"; fi
+          done
+          if test -f /opt/aplussolution/docker-compose.yml; then
+            cd /opt/aplussolution
+            for svc in db backend frontend caddy; do
+              cid="$(timeout 10 docker compose ps -q "$svc" 2>/dev/null || true)"
+              if test -n "$cid"; then echo "APLUS_SERVICE=$svc:$(docker inspect -f '{{.State.Running}}' "$cid")"; fi
+            done
+            dbid="$(timeout 10 docker compose ps -q db 2>/dev/null || true)"
+            if test -n "$dbid"; then
+              timeout 12 docker compose exec -T db sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "select pg_is_in_recovery()"' 2>/dev/null | sed 's/^t$/APLUS_DB_IS_STANDBY=yes/; s/^f$/APLUS_DB_IS_STANDBY=no/' || true
+            fi
+          fi
+          if test -d /opt/aplus-publisher; then
+            echo PUBLISHER_PROJECT_INSTALLED=yes
+            cd /opt/aplus-publisher
+            timeout 12 docker compose ps --status running --services 2>/dev/null | head -n 20 | sed 's/^/PUBLISHER_RUNNING_SERVICE=/' || true
+          fi
+          echo READ_ONLY_INSPECTION_COMPLETE=yes
+          REMOTE

@@ -33,8 +33,10 @@ jobs:
           python3 -m venv /tmp/pwyw-test-venv
           /tmp/pwyw-test-venv/bin/pip install -q -r pwyw-src/requirements.txt httpx==0.28.1
           cd pwyw-src
-          /tmp/pwyw-test-venv/bin/python -m py_compile app.py
+          /tmp/pwyw-test-venv/bin/python -m py_compile app.py admin_api.py admin_bootstrap.py
           /tmp/pwyw-test-venv/bin/python -m unittest discover -s tests -v
+          test -s static/admin.html
+          test -s static/admin.js
           test -s static/index.html
           test -s static/play.js
           test -s static/dashboard.js

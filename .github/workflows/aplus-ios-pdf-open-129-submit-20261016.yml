@@ -94,14 +94,6 @@ jobs:
           import os, time, re, requests
           from bs4 import BeautifulSoup
           root='https://publisher.smarbiz.sbs'
-          app_page=s.get(root+'/apps/2/',timeout=30)
-          app_page.raise_for_status()
-          links=[a.get('href','') for a in BeautifulSoup(app_page.text,'html.parser').select('a[href]')
-                 if re.fullmatch(r'/apps/releases/\d+/',a.get('href',''))
-                 and '1.0.29' in a.get_text(' ',strip=True)
-                 and '65' in a.get_text(' ',strip=True)]
-          assert len(set(links))==1, 'Expected unique 1.0.29 build 65 release'
-          path=links[0]
           s=requests.Session()
           def csrf(html):
               f=BeautifulSoup(html,'html.parser').select_one('input[name=csrfmiddlewaretoken]')
@@ -111,6 +103,14 @@ jobs:
           login.raise_for_status()
           signin=s.post(root+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':csrf(login.text)},headers={'Referer':root+'/accounts/login/'},timeout=30)
           assert signin.status_code==200,'Publisher login failed'
+          app_page=s.get(root+'/apps/2/',timeout=30)
+          app_page.raise_for_status()
+          links=[a.get('href','') for a in BeautifulSoup(app_page.text,'html.parser').select('a[href]')
+                 if re.fullmatch(r'/apps/releases/\d+/',a.get('href',''))
+                 and '1.0.29' in a.get_text(' ',strip=True)
+                 and '65' in a.get_text(' ',strip=True)]
+          assert len(set(links))==1, 'Expected unique 1.0.29 build 65 release'
+          path=links[0]
           def detail():
               r=s.get(root+path,timeout=30);r.raise_for_status()
               assert '/accounts/login/' not in r.url,'Publisher login expired'

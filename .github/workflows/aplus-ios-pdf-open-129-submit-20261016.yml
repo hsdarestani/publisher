@@ -1,0 +1,164 @@
+name: A+ Solution iOS PDF Save and Open 1.0.29 App Review
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-ios-pdf-open-129-submit-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: aplus-ios-pdf-open-129-65
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    env:
+      PUB_USER: ${{ secrets.ADMIN_EMAIL }}
+      PUB_PASS: ${{ secrets.ADMIN_PASSWORD }}
+    steps:
+      - name: Queue signed iOS PDF fix version 1.0.29 build 65 via Publisher
+        run: |
+          pip -q install requests beautifulsoup4
+          python3 - <<'PY'
+          import os, re, requests
+          from bs4 import BeautifulSoup
+          host='https://publisher.smarbiz.sbs'
+          app='/apps/2/'
+          source='7c6c5cfe698d605a01aefeacfa202059f833a218'
+          session=requests.Session()
+          login=session.get(host+'/accounts/login/',timeout=25)
+          login.raise_for_status()
+          def csrf(html):
+              node=BeautifulSoup(html,'html.parser').select_one('input[name="csrfmiddlewaretoken"]')
+              assert node,'Missing CSRF'
+              return node['value']
+          response=session.post(host+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':csrf(login.text)},headers={'Referer':host+'/accounts/login/'},timeout=25)
+          page=session.get(host+app,timeout=25)
+          assert page.status_code==200 and 'A+ Solution' in page.text and 'aplussolution' in page.text,'Publisher session/app unavailable'
+          soup=BeautifulSoup(page.text,'html.parser')
+          releases={x.get('href',''):x.get_text(' ',strip=True) for x in soup.select('a[href]') if re.fullmatch(r'/apps/releases/\d+/',x.get('href',''))}
+          assert any('1.0.28' in x and '64' in x for x in releases.values()),'Existing released build 64 not confirmed'
+          target=next((p for p,t in releases.items() if '1.0.29' in t and '65' in t),None)
+          if not target:
+              path=app+'releases/new/'
+              form=session.get(host+path,timeout=25)
+              form.raise_for_status()
+              data={'csrfmiddlewaretoken':csrf(form.text),'version_name':'1.0.29','build_number':'65','source_branch':'main','source_commit':source,'android_track':'internal','android_rollout':'1.0000','ios_release_type':'manual','auto_submit':'on','release_notes':'Einsatzplan PDF nach dem Herunterladen automatisch direkt aus Dateien öffnen.'}
+              created=session.post(host+path,data=data,headers={'Referer':host+path},allow_redirects=True,timeout=30)
+              match=re.search(r'/apps/releases/\d+/',created.url)
+              assert match,'Release creation failed: '+created.url+' '+BeautifulSoup(created.text,'html.parser').get_text(' ',strip=True)[:300]
+              target=match.group(0)
+              print('CREATED_RELEASE='+target)
+          else: print('EXISTING_RELEASE='+target)
+          detail=session.get(host+target,timeout=25)
+          assert detail.status_code==200 and '1.0.29' in detail.text and '65' in detail.text,'Wrong release'
+          doc=BeautifulSoup(detail.text,'html.parser')
+          rows=[(r.select_one('strong').get_text(' ',strip=True),r.select_one('span.status').get_text(' ',strip=True)) for r in doc.select('.build-card') if r.select_one('strong') and r.select_one('span.status')]
+          ios=next((status.lower() for platform,status in rows if platform.lower()=='ios'),None)
+          assert ios is not None,'No iOS build record'
+          active=[r.get_text(' ',strip=True).lower() for r in doc.select('a.compact-row') if 'build ios' in r.get_text(' ',strip=True).lower()]
+          if ios!='succeeded' and not any('queued' in row or 'running' in row for row in active):
+              action=target+'action/build_ios/'
+              done=session.post(host+action,data={'csrfmiddlewaretoken':csrf(detail.text)},headers={'Referer':host+target},timeout=25)
+              assert done.status_code==200 and '/accounts/login/' not in done.url,'Failed to queue iOS build'
+              print('IOS_BUILD_QUEUED')
+          else: print('IOS_BUILD_EXISTING='+ios)
+          print('RELEASE_URL='+host+target)
+          PY
+      - name: Wake official Publisher Cloud Mac build agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml', ref: 'main'
+            });
+  finalize:
+    needs: queue
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 85
+    env:
+      PUB_USER: ${{ secrets.ADMIN_EMAIL }}
+      PUB_PASS: ${{ secrets.ADMIN_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Observe latest iOS build, wake upload agent, and confirm real Apple submission
+        run: |
+          pip -q install requests beautifulsoup4
+          python3 -u - <<'PY'
+          import os, time, re, requests
+          from bs4 import BeautifulSoup
+          root='https://publisher.smarbiz.sbs'
+          app_page=s.get(root+'/apps/2/',timeout=30)
+          app_page.raise_for_status()
+          links=[a.get('href','') for a in BeautifulSoup(app_page.text,'html.parser').select('a[href]')
+                 if re.fullmatch(r'/apps/releases/\d+/',a.get('href',''))
+                 and '1.0.29' in a.get_text(' ',strip=True)
+                 and '65' in a.get_text(' ',strip=True)]
+          assert len(set(links))==1, 'Expected unique 1.0.29 build 65 release'
+          path=links[0]
+          s=requests.Session()
+          def csrf(html):
+              f=BeautifulSoup(html,'html.parser').select_one('input[name=csrfmiddlewaretoken]')
+              assert f, 'Publisher CSRF field missing'
+              return f.get('value')
+          login=s.get(root+'/accounts/login/',timeout=30)
+          login.raise_for_status()
+          signin=s.post(root+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':csrf(login.text)},headers={'Referer':root+'/accounts/login/'},timeout=30)
+          assert signin.status_code==200,'Publisher login failed'
+          def detail():
+              r=s.get(root+path,timeout=30);r.raise_for_status()
+              assert '/accounts/login/' not in r.url,'Publisher login expired'
+              assert '1.0.29' in r.text and '65' in r.text,'Incorrect release'
+              return BeautifulSoup(r.text,'html.parser')
+          def do(action, doc):
+              response=s.post(root+path+'action/'+action+'/',data={'csrfmiddlewaretoken':csrf(str(doc))},headers={'Referer':root+path},timeout=40)
+              response.raise_for_status()
+              assert '/accounts/login/' not in response.url,'Publisher session lost during action'
+          def wake():
+              url='https://api.github.com/repos/hsdarestani/publisher/actions/workflows/cloud-macos.yml/dispatches'
+              response=requests.post(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'},json={'ref':'main'},timeout=30)
+              assert response.status_code==204,'Unable to wake cloud Mac: HTTP '+str(response.status_code)
+              print('WOKE_CLOUD_MAC',flush=True)
+          last='';wakes=0;last_wake=time.monotonic()
+          for i in range(150):
+              try:
+                  doc=detail()
+                  rows={}
+                  for a in doc.select('a.compact-row'):
+                      title=a.select_one('strong')
+                      status=a.select_one('span.status')
+                      if title and status: rows.setdefault(title.get_text(' ',strip=True).lower(),[]).append(status.get_text(' ',strip=True).lower())
+                  cards={}
+                  for a in doc.select('.build-card'):
+                      p=a.select_one('strong');v=a.select_one('span.status')
+                      if p and v:cards[p.get_text(' ',strip=True).lower()]=v.get_text(' ',strip=True).lower()
+                  def first(key): return (rows.get(key) or ['none'])[0]
+                  b,u,a=first('build ios'),first('upload app store'),first('submit apple review')
+                  state=f'iOS:{b}, artifact:{cards.get("ios")}, AppleUpload:{u}, AppleSubmission:{a}'
+                  if last!=state:print('RELEASE_STATUS '+state,flush=True);last=state
+                  if a=='succeeded':
+                      print('APPLE_SUBMISSION_CONFIRMED '+root+path,flush=True)
+                      break
+                  if a=='failed':
+                      raise RuntimeError('APPLE_SUBMISSION_FAILED '+state)
+                  if b=='failed' or u=='failed':
+                      raise RuntimeError('APPLE_BUILD_OR_UPLOAD_FAILED '+state)
+                  if u=='succeeded' and a=='none':
+                      do('submit_apple',doc)
+                      print('QUEUED_FINAL_APPLE_SUBMISSION',flush=True)
+                  if b=='succeeded' and u=='none':
+                      do('upload_apple',doc)
+                      print('QUEUED_APPLE_UPLOAD',flush=True)
+                  if (b in ('queued','running') or u in ('queued','running')) and time.monotonic()-last_wake>900 and wakes<3:
+                      wake();wakes+=1;last_wake=time.monotonic()
+              except requests.RequestException as e:
+                  print('TRANSIENT_PUBLISHER_READ_FAILURE '+type(e).__name__,flush=True)
+              time.sleep(30)
+          else:raise RuntimeError('APPLE_SUBMISSION_NOT_CONFIRMED_IN_MONITOR_WINDOW '+last)
+          PY

@@ -52,6 +52,8 @@ jobs:
           DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
           EXPECTED_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
           AI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CF_AI_TOKEN: ${{ secrets.CLOUDFLARE_AI_API_TOKEN }}
+          CF_AI_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_EMAIL: ${{ secrets.PWYW_ADMIN_EMAIL }}
           ADMIN_PASSWORD: ${{ secrets.PWYW_ADMIN_PASSWORD }}
         run: |
@@ -94,10 +96,22 @@ jobs:
           df -Pk /opt | awk 'NR==2 {if ($4<500000) exit 1; print "Disk preflight passed"}'
           PRECHECK
           # AI remains off by default in production pilot; enable only after costs/legal review.
+          # Stage optional Workers AI credentials over SSH stdin, never in URLs, git or logs.
+          AI_ENV_FILE="$RUNNER_TEMP/pwyw-ai.env"
+          : > "$AI_ENV_FILE"
+          chmod 600 "$AI_ENV_FILE"
+          if [[ "${CF_AI_ACCOUNT:-}" =~ ^[0-9a-fA-F]{32}$ ]] && [[ "${CF_AI_TOKEN:-}" =~ ^[A-Za-z0-9._-]{15,}$ ]]; then
+            printf 'CLOUDFLARE_ACCOUNT_ID=%s\nCLOUDFLARE_AI_API_TOKEN=%s\n' "$CF_AI_ACCOUNT" "$CF_AI_TOKEN" > "$AI_ENV_FILE"
+            echo "Workers AI credentials staged securely for PWYW only."
+          else
+            echo "Workers AI unavailable (requires both Publisher secrets). Safe campaign templates stay enabled."
+          fi
+          "${SSH[@]}" root@"$DEPLOY_HOST" 'umask 077; cat > /tmp/pwyw-ai.pending' < "$AI_ENV_FILE"
+          rm -f "$AI_ENV_FILE"
           "${SCP[@]}" "$RUNNER_TEMP/pwyw-pilot.tar.gz" root@"$DEPLOY_HOST":/tmp/pwyw-pilot.tar.gz
           "${SSH[@]}" root@"$DEPLOY_HOST" 'bash -se' <<'REMOTE'
           set -euo pipefail
-          trap 'rm -f /tmp/pwyw-pilot.tar.gz' EXIT
+          trap 'rm -f /tmp/pwyw-pilot.tar.gz /tmp/pwyw-ai.pending' EXIT
           cd /opt/aplus-publisher
           CADDY_ID="$(docker compose ps -q caddy)"
           test -n "$CADDY_ID"
@@ -114,6 +128,10 @@ jobs:
           PUBLISHER_NETWORK=$NETWORK
           PUBLIC_BASE_URL=https://pwyw.smarbiz.sbs
           EOF
+          if [ -s /tmp/pwyw-ai.pending ]; then
+            cat /tmp/pwyw-ai.pending >> /opt/pwyw/.env
+          fi
+          rm -f /tmp/pwyw-ai.pending
           chmod 600 /opt/pwyw/.env
           cd /opt/pwyw
           docker compose config --quiet

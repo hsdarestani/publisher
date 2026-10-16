@@ -87,5 +87,12 @@ jobs:
           echo PUBLISHER_REPLICATION_SERVICE_NAMES_BEGIN
           systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk 'tolower($1) ~ /aplus|repl|autossh/ {print $1 "|" $3 "|" $4}' | head -n 15 || true
           echo PUBLISHER_REPLICATION_SERVICE_NAMES_END
+          echo APLUS_FILE_SYNC_STATUS_BEGIN
+          systemctl show aplus-standby-file-sync.service --no-pager --property=LoadState,ActiveState,SubState,Result,ExecMainStartTimestamp,ExecMainExitTimestamp 2>/dev/null || true
+          systemctl list-timers --all --no-pager --no-legend 2>/dev/null | grep -i 'aplus-standby-file-sync' | head -n 2 || true
+          for path in /opt/aplussolution-standby /opt/aplussolution-standby/media /opt/aplussolution-backup /srv/aplussolution /srv/aplussolution-backup; do
+            if test -d "$path"; then du -sh "$path" 2>/dev/null | sed 's/^/APLUS_MEDIA_OR_PROJECT_SIZE=/' ; fi
+          done
+          echo APLUS_FILE_SYNC_STATUS_END
           echo READ_ONLY_INSPECTION_COMPLETE=yes
           REMOTE

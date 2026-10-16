@@ -1,0 +1,91 @@
+name: Read-only A+ Solution Publisher and Apple iOS state (2026-10-16)
+on:
+  push:
+    branches: [audit/aplus-ios-review-status-20261016]
+    paths: ['.github/workflows/aplus-ios-readonly-review-status-20261016.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 9
+    env:
+      PUB_USER: ${{ secrets.ADMIN_EMAIL }}
+      PUB_PASS: ${{ secrets.ADMIN_PASSWORD }}
+      HOST: ${{ secrets.HOST }}
+      PASS: ${{ secrets.PASS }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+    steps:
+      - name: Inspect Publisher release 9 and latest A+ builds (GET only)
+        shell: bash
+        run: |
+          pip -q install requests beautifulsoup4
+          python3 - <<'PY'
+          import requests,os,re
+          from bs4 import BeautifulSoup
+          s=requests.Session()
+          host='https://publisher.smarbiz.sbs'
+          login=s.get(host+'/accounts/login/',timeout=25)
+          login.raise_for_status()
+          token=BeautifulSoup(login.text,'html.parser').select_one('input[name=csrfmiddlewaretoken]')
+          assert token is not None
+          signin=s.post(host+'/accounts/login/',data={'username':os.environ['PUB_USER'],'password':os.environ['PUB_PASS'],'csrfmiddlewaretoken':token['value']},headers={'Referer':host+'/accounts/login/'},timeout=25)
+          signin.raise_for_status()
+          assert '/accounts/login/' not in signin.url, 'Not logged in'
+          app=s.get(host+'/apps/2/',timeout=25)
+          app.raise_for_status()
+          soup=BeautifulSoup(app.text,'html.parser')
+          print('PUBLISHER_RELEASE_SUMMARY_BEGIN')
+          for node in soup.select('a[href]'):
+              path=node.get('href','')
+              if re.fullmatch(r'/apps/releases/\d+/',path):
+                  title=node.get_text(' ',strip=True)
+                  if any(x in title for x in ('1.0.28','1.0.29','1.0.30')):
+                      print('RELEASE '+path+' '+re.sub(r'\s+',' ',title)[:160])
+          print('PUBLISHER_RELEASE_SUMMARY_END')
+          detail=s.get(host+'/apps/releases/9/',timeout=25)
+          detail.raise_for_status()
+          assert '1.0.29' in detail.text,'Release 9 version mismatch'
+          doc=BeautifulSoup(detail.text,'html.parser')
+          print('RELEASE_9_1_0_29_BEGIN')
+          for node in doc.select('.build-card'):
+              platform=node.select_one('strong');state=node.select_one('span.status')
+              if platform and state: print('BUILD '+platform.get_text(' ',strip=True)+'='+state.get_text(' ',strip=True))
+          for node in doc.select('a.compact-row'):
+              name=node.select_one('strong');state=node.select_one('span.status')
+              if name and state: print('JOB '+name.get_text(' ',strip=True)+'='+state.get_text(' ',strip=True))
+          print('RELEASE_9_1_0_29_END')
+          PY
+      - name: Query Apple's live App Store Connect review/version states (READ ONLY)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
+          timeout 75 sshpass -p "$PASS" ssh -p "$port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=9 -o ServerAliveCountMax=2 root@"$HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          timeout 55 docker compose exec -T web python manage.py shell -c "
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+          a=MobileApp.objects.get(slug='a-plus-solution')
+          c=AppleStoreClient(a.apple_account)
+          app=c.find_app(a.bundle_id)
+          print('APPLE_APPLICATION_VERIFIED=yes')
+          versions=c.list_versions(app['id'],limit=30)
+          for v in versions:
+              at=v.get('attributes',{})
+              version=at.get('versionString','')
+              if version.startswith('1.0.'):
+                  print('APPLE_VERSION',version,'STATE',at.get('appStoreState') or at.get('appVersionState') or 'UNKNOWN')
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW','UNRESOLVED_ISSUES','READY_FOR_REVIEW','COMPLETE'):
+              try:
+                  submissions=c.list_review_submissions(app['id'],state)
+                  print('APPLE_SUBMISSION_STATE',state,'COUNT',len(submissions))
+              except Exception as e:
+                  print('APPLE_SUBMISSION_QUERY_ERROR',state,type(e).__name__)
+          " </dev/null
+          echo APPLE_READONLY_INSPECTION_COMPLETE=yes
+          REMOTE

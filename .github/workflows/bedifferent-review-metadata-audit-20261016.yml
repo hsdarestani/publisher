@@ -1,0 +1,70 @@
+name: BE DIFFERENT 2.3 metadata rejection inspection
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-review-metadata-audit-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect iOS App Store description metadata and rejected Apple review
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-16-metadata-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-16-metadata-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release
+          from apps.integrations.apple_store import AppleStoreClient
+          a=MobileApp.objects.get(slug='be-different')
+          c=AppleStoreClient(a.apple_account)
+          rid=c.find_app(a.bundle_id)['id']
+          v=next(v for v in c.list_versions(rid) if v.get('attributes',{}).get('versionString')=='1.2.0')
+          print('APP_VERSION='+json.dumps({'id':v['id'],'state':v.get('attributes',{}).get('appStoreState')}))
+          for loc in a.localizations.all():
+            print('PUBLISHER_LOCALIZATION='+json.dumps({'locale':loc.locale,'subtitle':loc.subtitle,'short_description':loc.short_description,'full_description':loc.full_description,'promotional_text':loc.promotional_text,'release_notes':loc.release_notes},ensure_ascii=False))
+          endpoint='/appStoreVersions/'+v['id']+'/appStoreVersionLocalizations?limit=200'
+          response=c.request('GET',endpoint)
+          for loc in response.get('data',[]):
+            attrs=loc.get('attributes',{})
+            print('APPLE_LOCALIZATION='+json.dumps({'id':loc['id'],'locale':attrs.get('locale'),'description':attrs.get('description'),'promotionalText':attrs.get('promotionalText'),'whatsNew':attrs.get('whatsNew'),'keywords':attrs.get('keywords')},ensure_ascii=False))
+          for state in ['UNRESOLVED_ISSUES','READY_FOR_REVIEW','WAITING_FOR_REVIEW','IN_REVIEW']:
+            for sub in c.list_review_submissions(rid,state):
+              items=c.list_review_submission_items(sub['id'])
+              if any((i.get('relationships',{}).get('appStoreVersion',{}).get('data') or {}).get('id')==v['id'] for i in items):
+                print('REVIEW_SUBMISSION='+json.dumps({'id':sub['id'],'state':state,'items':[{'id':i['id'],'state':i.get('attributes',{}).get('state')} for i in items]}))
+          PY
+          REMOTE

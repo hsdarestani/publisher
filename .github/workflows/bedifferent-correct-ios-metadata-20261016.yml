@@ -1,0 +1,75 @@
+name: BE DIFFERENT correct iOS listing metadata
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-correct-ios-metadata-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Fix App Store EN and DE listing descriptions only
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-copy-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-ios-copy-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='be-different')
+          client=AppleStoreClient(app.apple_account)
+          fixes={
+          'en-US':('77048cef-82ee-4ab4-b643-140b7beb7427',
+          [('BE DIFFERENT brings training, recovery and personal coaching together.','BE DIFFERENT brings training, recovery and activity tracking together.'),
+          ('Explore the exercise library, communicate with your coach and get assistance from Different AI.','Explore the exercise library, plan workouts and track your completed training sessions.')]),
+          'de-DE':('cbf86e62-c023-4bff-874f-e325702f79d4',
+          [('BE DIFFERENT verbindet Training, Regeneration und persönliche Betreuung in einem System.','BE DIFFERENT verbindet Training, Regeneration und Aktivitätsübersichten in einem System.'),
+          ('Nutze die Übungsbibliothek, kommuniziere mit deinem Trainer und erhalte Unterstützung durch Different AI.','Nutze die Übungsbibliothek, plane dein Training und dokumentiere absolvierte Einheiten.')])}
+          for lang,(identifier,pairs) in fixes.items():
+            loc=client.request('GET','/appStoreVersionLocalizations/'+identifier)['data']
+            assert loc['attributes']['locale']==lang
+            current=loc['attributes']['description']
+            amended=current
+            for old,new in pairs:
+              assert old in amended or new in amended
+              amended=amended.replace(old,new)
+            if amended!=current:
+              payload={'data':{'type':'appStoreVersionLocalizations','id':identifier,'attributes':{'description':amended}}}
+              client.request('PATCH','/appStoreVersionLocalizations/'+identifier,data=json.dumps(payload))
+            saved=client.request('GET','/appStoreVersionLocalizations/'+identifier)['data']
+            assert saved['attributes']['description']==amended
+            print('METADATA_UPDATED_AND_VERIFIED='+lang)
+          PY
+          REMOTE

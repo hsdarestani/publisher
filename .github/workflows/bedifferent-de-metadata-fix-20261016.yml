@@ -1,0 +1,78 @@
+name: BE DIFFERENT fix de-DE App Store metadata only
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-de-metadata-fix-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Update German BE DIFFERENT App Store description
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-de-only-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-de-only-pass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,time,requests
+          from apps.publisher.models import MobileApp
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='be-different')
+          client=AppleStoreClient(app.apple_account)
+          identifier='cbf86e62-c023-4bff-874f-e325702f79d4'
+          text="BE DIFFERENT verbindet Training, Regeneration und Aktivitätsübersichten in einem System.\n\nVerfolge deinen Leistungswert und die Vollständigkeit deiner Daten. Plane dein Training, protokolliere Übungen und verfolge deine Fortschritte. Tageschecks, Ernährung und Regeneration helfen dir, deinen Alltag bewusster zu gestalten.\n\nNutze die Übungsbibliothek, plane dein Training und dokumentiere absolvierte Einheiten. Unterstützte Gesundheitsdaten und Wearables kannst du freiwillig verbinden. Ohne Verbindung bleiben fehlende Daten sichtbar.\n\nDeine Daten kontrollierst du selbst: Einstellungen, Datenexport und Kontolöschung sind in deinem Konto verfügbar. Gesundheitsdaten werden nur mit deiner Einwilligung verarbeitet. Die App bietet Trainings und Lifestyle Unterstützung und ersetzt keine medizinische Diagnose oder Behandlung."
+          body={'data':{'type':'appStoreVersionLocalizations','id':identifier,'attributes':{'description':text}}}
+          url='https://api.appstoreconnect.apple.com/v1/appStoreVersionLocalizations/'+identifier
+          for attempt in range(1,4):
+            try:
+              resp=requests.patch(url,headers={'Authorization':'Bearer '+client.token(),'Content-Type':'application/json'},data=json.dumps(body),timeout=(8,22))
+              print('DE_PATCH_HTTP='+str(resp.status_code),flush=True)
+              if not resp.ok: raise RuntimeError('Apple refused metadata update: '+str(resp.status_code)+' '+resp.text[:200])
+            except requests.exceptions.RequestException as e:
+              print('DE_PATCH_NETWORK='+type(e).__name__,flush=True)
+            try:
+              confirm=requests.get(url,headers={'Authorization':'Bearer '+client.token(),'Content-Type':'application/json'},timeout=(8,15))
+              if confirm.ok:
+                attrs=confirm.json()['data']['attributes']
+                if attrs.get('locale')=='de-DE' and attrs.get('description')==text:
+                  print('DE_DESCRIPTION_UPDATED_AND_VERIFIED=true',flush=True)
+                  break
+            except requests.exceptions.RequestException:
+              pass
+            if attempt==3:
+              raise RuntimeError('German App Store description not verifiably saved')
+            time.sleep(5)
+          PY
+          REMOTE

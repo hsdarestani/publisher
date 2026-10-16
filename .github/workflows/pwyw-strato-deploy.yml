@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-16 final: validated Persian/German landing, all 10 games including canvas, studio and admin.
+# PWYW 2026-10-16 visual coherence release: validated source hsdarestani/pwyw@b2aa4a8ba3eafbae3b607b3c30ca1ccccb4051f2.
 on:
   push:
     branches: [main]

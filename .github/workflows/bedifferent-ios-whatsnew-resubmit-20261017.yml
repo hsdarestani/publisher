@@ -1,0 +1,91 @@
+name: BE DIFFERENT 1.2.1 Apple required whatsNew fix and resubmit
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-ios-whatsnew-resubmit-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  fix-submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Repair required Apple localizations and submit Build 13 once
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-metadata-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          STATUS="$RUNNER_TEMP/bd-ios-metadata-status.txt"
+          set +e
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' > "$STATUS" 2>&1 <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug="be-different")
+          rel=Release.objects.get(app=app,version_name="1.2.1",build_number=13)
+          b=rel.builds.get(platform="ios")
+          assert b.status=="succeeded" and b.external_build_id, "App Store IPA not uploaded/processed"
+          assert app.apple_account and app.apple_account.configured
+          print("FIX_REASON=Apple 409 ENTITY_ERROR.ATTRIBUTE.REQUIRED whatsNew",flush=True)
+          updated=[]
+          for loc in app.localizations.all():
+              if loc.locale.lower().startswith("de"):
+                  notes="Neu in Version 1.2.1: BE FOCUSED Atemübungen, verbesserte Athletenübersicht und Digital Twin sowie klarere Informationen zu Wearables und Gesundheitsdaten. In App Käufe sind derzeit nicht verfügbar."
+              else:
+                  notes="New in version 1.2.1: BE FOCUSED breathing sessions, an improved athlete dashboard and digital twin, and clearer wearable and health data information. In app purchases are not currently available."
+              if loc.release_notes!=notes:
+                  loc.release_notes=notes
+                  loc.save(update_fields=["release_notes","updated_at"])
+                  updated.append(loc.locale)
+          print("UPDATED_APP_STORE_WHATS_NEW_LOCALES="+",".join(updated),flush=True)
+          sub=Submission.objects.filter(release=rel,platform="ios").first()
+          last=Job.objects.filter(release=rel,type="submit_apple").order_by("-id").first()
+          print("IOS_BEFORE="+str({"release":rel.pk,"submission":sub.state if sub else None,"last_job":(last.pk,last.status,(last.error or "")[-300:] if last.status=="failed" else "") if last else None}),flush=True)
+          if sub and sub.state in ("in_review","approved","live"):
+              print("IOS_ACTION=ALREADY_SUBMITTED",flush=True)
+          elif last and last.status in ("queued","running"):
+              print("IOS_ACTION=ACTIVE_JOB_"+str(last.pk),flush=True)
+          elif last and last.status=="succeeded":
+              print("IOS_ACTION=PRIOR_JOB_SUCCEEDED_CHECK_STORE",flush=True)
+          else:
+              job=enqueue_job("submit_apple",app=app,release=rel,build=b)
+              print("IOS_ACTION=QUEUED_RESUBMISSION_"+str(job.pk),flush=True)
+          PY
+          REMOTE
+          RC=$?
+          set -e
+          tail -c 11000 "$STATUS"
+          { printf 'Apple metadata repair and resubmit run %s\n\n' "$GITHUB_RUN_ID"; tail -c 11000 "$STATUS"; } | jq -Rs '{body: .}' > "$RUNNER_TEMP/issue.json"
+          curl --silent --show-error --fail-with-body -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/issue.json" "https://api.github.com/repos/hsdarestani/publisher/issues/113/comments" > /dev/null
+          test "$RC" -eq 0

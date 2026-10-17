@@ -96,8 +96,8 @@ jobs:
           docker compose config --quiet
           docker compose up -d db
           for i in $(seq 1 35); do
-            if docker compose exec -T db pg_isready -U ffm -d ffm >/dev/null 2>&1; then break; fi
-            test "$i" -ne 35 || exit 1
+            if docker compose exec -T db pg_isready -U ffm -d ffm </dev/null >/dev/null 2>&1; then break; fi
+            if [ "$i" -eq 35 ]; then docker compose ps -a; docker compose logs --tail=90 db; exit 1; fi
             sleep 2
           done
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql
@@ -107,7 +107,7 @@ jobs:
           test -n "$APP_ID"
           for i in $(seq 1 45); do
             if docker exec "$APP_ID" node -e 'fetch("http://127.0.0.1:3000/api/health").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' >/dev/null 2>&1; then break; fi
-            if [ "$i" -eq 45 ]; then docker compose logs --tail=90 web; exit 1; fi
+            if [ "$i" -eq 45 ]; then docker compose ps -a; docker compose logs --tail=90 web db; exit 1; fi
             sleep 3
           done
           cd /opt/aplus-publisher

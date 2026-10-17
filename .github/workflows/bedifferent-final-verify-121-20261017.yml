@@ -1,0 +1,97 @@
+name: BE DIFFERENT 1.2.1 final read only store check
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-final-verify-121-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Confirm 1.2.1 review submissions without additional uploads
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-verify-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          STATUS="$RUNNER_TEMP/be-different-final.txt"
+          set +e
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' > "$STATUS" 2>&1 <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          from apps.integrations.google_play import GooglePlayClient
+          app=MobileApp.objects.get(slug="be-different")
+          for platform,num,t in [("android",12,"submit_google"),("ios",13,"submit_apple")]:
+              rel=Release.objects.get(app=app,version_name="1.2.1",build_number=num)
+              sub=Submission.objects.filter(release=rel,platform=platform).first()
+              job=Job.objects.filter(release=rel,type=t).order_by("-id").first()
+              print(platform.upper()+"_RELEASE_ID="+str(rel.pk),flush=True)
+              print(platform.upper()+"_JOB="+str({"id":job.pk,"status":job.status,"error":(job.error or "")[-700:] if job and job.status=="failed" else ""}) if job else "NONE",flush=True)
+              print(platform.upper()+"_PUBLISHER_SUBMISSION="+str({"state":sub.state,"external_id":sub.external_id} if sub else None),flush=True)
+          try:
+              client=AppleStoreClient(app.apple_account)
+              record=client.find_app(app.bundle_id)
+              matches=[v for v in client.list_versions(str(record["id"])) if v.get("attributes",{}).get("versionString")=="1.2.1"]
+              print("APPLE_VERSION_121="+str([{"id":v["id"],"state":v.get("attributes",{}).get("appStoreState")} for v in matches]),flush=True)
+              if matches:
+                  vid=matches[0]["id"]
+                  for state in ["WAITING_FOR_REVIEW","IN_REVIEW","READY_FOR_REVIEW","UNRESOLVED_ISSUES"]:
+                      subs=client.list_review_submissions(str(record["id"]),state)
+                      target=[str(s["id"]) for s in subs if client._review_submission_matches(s,vid)[0]]
+                      if target: print("APPLE_REVIEW_"+state+"="+str(target),flush=True)
+          except Exception as e:
+              print("APPLE_READ_ERROR="+str(e)[-550:],flush=True)
+          try:
+              g=GooglePlayClient(app.google_account)
+              e=g._open_edit(app.package_name)
+              try:
+                  path=f"/applications/{g._q(app.package_name)}/edits/{e.edit_id}/tracks"
+                  data=g._edit_request(e,"GET",path)
+                  prod=next((v for v in data.get("tracks",[]) if v.get("track")=="production"),{})
+                  found=[{"name":v.get("name"),"status":v.get("status"),"versionCodes":v.get("versionCodes")} for v in prod.get("releases",[]) if "12" in [str(n) for n in v.get("versionCodes",[])]]
+                  print("GOOGLE_PRODUCTION_BUILD12="+str(found),flush=True)
+              finally:
+                  g._safe_delete_edit(e)
+          except Exception as e:
+              print("GOOGLE_READ_ERROR="+str(e)[-500:],flush=True)
+          PY
+          REMOTE
+          RC=$?
+          set -e
+          tail -c 12000 "$STATUS"
+          { printf 'Read-only store verification run %s\n\n' "$GITHUB_RUN_ID"; tail -c 12000 "$STATUS"; } | jq -Rs '{body: .}' > "$RUNNER_TEMP/issue.json"
+          curl --silent --show-error --fail-with-body -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/issue.json" "https://api.github.com/repos/hsdarestani/publisher/issues/113/comments" > /dev/null
+          test "$RC" -eq 0

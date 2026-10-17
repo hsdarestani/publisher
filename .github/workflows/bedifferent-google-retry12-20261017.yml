@@ -1,0 +1,71 @@
+name: BE DIFFERENT retry Google submission 1.2.1 (12)
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-google-retry12-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Queue Google Play submit after expired edit without rebuilding
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-android-retry-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='be-different')
+          release=Release.objects.get(id=14,app=app,version_name='1.2.1',build_number=12)
+          build=release.builds.get(platform='android')
+          assert app.package_name=='com.smarbiz.bedifferent'
+          assert build.status=='succeeded' and build.artifact and build.artifact_size>1000000
+          assert release.android_track=='production'
+          existing=Submission.objects.filter(release=release,platform='android',state__in=['in_review','approved','live']).first()
+          if existing:
+            print('ANDROID_RETRY_SKIP=ALREADY_SUBMITTED:'+existing.state,flush=True)
+          else:
+            current=Job.objects.filter(release=release,build=build,type='submit_google',status__in=['queued','running','succeeded']).order_by('-id').first()
+            if current:
+              print('ANDROID_RETRY_SKIP=ACTIVE_OR_SUCCESS:'+str(current.id)+':'+current.status,flush=True)
+            else:
+              last=Job.objects.filter(release=release,build=build,type='submit_google').order_by('-id').first()
+              assert last and last.status=='failed','Expected previous failed edit submission'
+              assert 'edit has expired' in last.error.lower(),'Last error not expired Google edit; aborting unverified retry'
+              job=enqueue_job('submit_google',app=app,release=release,build=build)
+              print('ANDROID_RETRY_QUEUED='+str(job.id),flush=True)
+          PY
+          REMOTE

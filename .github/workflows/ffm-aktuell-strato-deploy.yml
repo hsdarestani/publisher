@@ -1,4 +1,4 @@
-# Deployment request: FFM Stadtstudio responsive admin release main 0fd7f64e (2026-10-17)
+# Deployment request: FFM Stadtstudio final German font polish main 3113512 (2026-10-17)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

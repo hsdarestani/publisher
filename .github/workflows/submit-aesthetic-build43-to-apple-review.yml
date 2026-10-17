@@ -1,0 +1,108 @@
+name: Submit A+ Esthetic Build 43 to Apple review
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/submit-aesthetic-build43-to-apple-review.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Replace obsolete 1.0.36 review and submit uploaded 1.0.37 Build 43
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/esthetic-apple-diagnostic-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/apple-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          PY_CODE=$(cat <<'PY'
+          import time
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
+          assert release.source_commit=='29baafa43aa24117c039e0df519bb714ea0aa7c4', 'Release source mismatch'
+          build=release.builds.get(platform='ios')
+          assert build.status=='succeeded' and bool(build.external_build_id),'Build 43 has no uploaded iOS binary'
+          existing=Submission.objects.filter(release=release, platform='ios').first()
+          if existing and existing.state not in ('not_submitted','failed'):
+              print('ALREADY_SUBMITTED',existing.state,existing.external_id)
+          else:
+              client=AppleStoreClient(app.apple_account)
+              asc=client.find_app(app.bundle_id)
+              versions=client.list_versions(asc['id'])
+              new=[x for x in versions if x.get('attributes',{}).get('versionString')=='1.0.37']
+              old=[x for x in versions if x.get('attributes',{}).get('versionString')=='1.0.36']
+              if new:
+                  state=new[0].get('attributes',{}).get('appStoreState')
+                  assert state in ('PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','DEVELOPER_REJECTED','METADATA_REJECTED','REJECTED'), '1.0.37 already exists in unexpected state: '+str(state)
+              else:
+                  assert len(old)==1 and old[0]['attributes'].get('appStoreState')=='WAITING_FOR_REVIEW', 'Unexpected existing Apple version: manual review required'
+                  waiting=client.list_review_submissions(asc['id'],'WAITING_FOR_REVIEW')
+                  matches=[]
+                  for review in waiting:
+                      item,items=client._review_submission_matches(review,old[0]['id'])
+                      if item:
+                          assert len(items)==1, 'Old review contains other items; will not cancel'
+                          matches.append(review)
+                  assert len(matches)==1,'Expected exactly one matching old Apple review'
+                  print('OLD_REVIEW_VERIFIED','1.0.36',matches[0]['id'])
+                  client.cancel_review_submission(matches[0]['id'])
+                  print('OLD_REVIEW_CANCEL_REQUESTED')
+                  for i in range(30):
+                      active=False
+                      for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                          for review in client.list_review_submissions(asc['id'],state):
+                              item,_=client._review_submission_matches(review,old[0]['id'])
+                              active=active or bool(item)
+                      if not active:
+                          print('OLD_REVIEW_RELEASED')
+                          break
+                      time.sleep(2)
+                  else:
+                      raise RuntimeError('Old Apple review still active. No new submission queued.')
+              live=release.jobs.filter(type='submit_apple',status__in=('queued','running','succeeded')).first()
+              if live:
+                  print('EXISTING_SUBMIT_JOB',live.pk,live.status)
+              else:
+                  last=release.jobs.filter(type='submit_apple').order_by('-pk').first()
+                  if last and last.status=='failed':
+                      raise RuntimeError('Prior submission failed; inspect error before retrying')
+                  job=enqueue_job('submit_apple',app=app,release=release,build=build)
+                  print('NEW_APPLE_SUBMISSION_JOB',job.pk)
+          print('APPLE_BUILD43_HANDOFF_COMPLETE')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

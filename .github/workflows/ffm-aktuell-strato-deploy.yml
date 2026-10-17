@@ -1,4 +1,4 @@
-# Deployment request: FFM admin atomic activation 500 fix, main 46f1df4 (2026-10-17)
+# Deployment request: FFM Stadtstudio responsive admin release main 0fd7f64e (2026-10-17)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

@@ -1,4 +1,4 @@
-# Deployment request: FFM editorial verification release (2026-10-17, main f1603352)
+# Deployment request: FFM admin activation password feedback 2026-10-17, main 5cca9b2
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

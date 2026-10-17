@@ -1,4 +1,4 @@
-name: Diagnose A+ Esthetic Apple review for Build 43
+name: Verify A+ Esthetic Build 43 Apple submission
 on:
   push:
     branches: [main]
@@ -49,6 +49,7 @@ jobs:
           app=MobileApp.objects.get(slug='a-esthetic')
           target=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
           print('RELEASE',target.pk,target.status,target.source_commit)
+          print('POST_SUBMISSION_JOB_481_CHECK')
           for build in target.builds.all():
               print('BUILD',build.platform,build.status,'external',bool(build.external_build_id))
           for sub in Submission.objects.filter(app=app).order_by('-pk')[:12]:

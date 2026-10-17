@@ -100,10 +100,27 @@ jobs:
             if [ "$i" -eq 35 ]; then docker compose ps -a; docker compose logs --tail=90 db; exit 1; fi
             sleep 2
           done
+          # Repair only the independent FFM database role; changing a container
+          # POSTGRES_PASSWORD env does not automatically rotate an initialized PG role.
+          # Password remains in the remote isolated database container, never in logs.
+          docker compose exec -T db sh -eu -c '
+            test "$POSTGRES_USER" = "ffm"
+            test "$POSTGRES_DB" = "ffm"
+            printf "ALTER ROLE ffm PASSWORD '\''%s'\'';\n" "$POSTGRES_PASSWORD" | psql -X -v ON_ERROR_STOP=1 -U ffm -d ffm >/dev/null
+          ' </dev/null
+          echo "Independent FFM PostgreSQL role credentials synchronized."
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/seed.sql
           docker compose up -d --build --no-deps web
           APP_ID="$(docker compose ps -q web)"
+          # Ensure the web connection string and DB container have identical credentials,
+          # without revealing secrets in CI logs.
+          DB_PASS="$(docker compose exec -T db printenv POSTGRES_PASSWORD </dev/null | tr -d '\r\n')"
+          APP_PASS="$(docker exec "$APP_ID" node -e 'process.stdout.write(new URL(process.env.DATABASE_URL).password)')"
+          test -n "$DB_PASS" && test "$DB_PASS" = "$APP_PASS" || { echo "::error::FFM web/database password mismatch"; exit 1; }
+          unset DB_PASS APP_PASS
+          echo "FFM container credential parity verified."
+
           test -n "$APP_ID"
           for i in $(seq 1 45); do
             if docker exec "$APP_ID" node -e 'fetch("http://127.0.0.1:3000/api/health").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' >/dev/null 2>&1; then break; fi

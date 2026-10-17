@@ -1,0 +1,77 @@
+name: BE DIFFERENT 1.2.2 Apple review status audit
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-122-apple-review-audit-20261018.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Inspect Apple 1.2.2 build and review submission read only
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-verify-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          STATUS="$RUNNER_TEMP/be-different-final.txt"
+          set +e
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug="be-different")
+          rel=Release.objects.filter(app=app,version_name="1.2.2",build_number=14).first()
+          print("BD_RELEASE="+str({"id":rel.pk if rel else None,"status":rel.status if rel else None}),flush=True)
+          if rel:
+              print("BD_SUBMISSION="+str([{"platform":s.platform,"state":s.state} for s in Submission.objects.filter(release=rel)]),flush=True)
+              print("BD_IOS_JOBS="+str([{"id":j.id,"type":j.type,"status":j.status,"error":str(j.error or "")[-180:]} for j in Job.objects.filter(release=rel).order_by("-id")[:8]]),flush=True)
+          try:
+              c=AppleStoreClient(app.apple_account)
+              record=c.find_app(app.bundle_id)
+              print("APPLE_APP_FOUND="+str(bool(record)),flush=True)
+              versions=[v for v in c.list_versions(str(record["id"])) if v.get("attributes",{}).get("versionString")=="1.2.2"]
+              print("APPLE_VERSION_122="+str([{"id":v["id"],"state":v.get("attributes",{}).get("appStoreState")} for v in versions]),flush=True)
+              if versions:
+                  for state in ["WAITING_FOR_REVIEW","IN_REVIEW","READY_FOR_REVIEW","UNRESOLVED_ISSUES","PENDING_DEVELOPER_RELEASE","PENDING_APPLE_RELEASE","REJECTED","PREPARE_FOR_SUBMISSION","METADATA_REJECTED","READY_FOR_DISTRIBUTION"]:
+                      try:
+                          subs=c.list_review_submissions(str(record["id"]),state)
+                          matched=[str(sub["id"]) for sub in subs if c._review_submission_matches(sub,versions[0]["id"])[0]]
+                          if matched: print("APPLE_REVIEW_"+state+"="+str(matched),flush=True)
+                      except Exception as err:
+                          print("APPLE_REVIEW_QUERY_WARNING="+type(err).__name__,flush=True)
+          except Exception as err:
+              print("APPLE_CHECK_ERROR="+type(err).__name__+":"+str(err)[:220],flush=True)
+          PY
+          REMOTE

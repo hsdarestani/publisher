@@ -1,0 +1,86 @@
+name: Resume A+ Esthetic Build 43 Apple review
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/resume-aesthetic-apple-build43-review.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Reuse released App Store draft and enqueue one Build 43 submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/esthetic-apple-diagnostic-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/apple-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
+          build=release.builds.get(platform='ios')
+          assert release.source_commit=='29baafa43aa24117c039e0df519bb714ea0aa7c4', 'wrong source'
+          assert build.status=='succeeded' and build.external_build_id, 'Build 43 iOS not uploaded'
+          client=AppleStoreClient(app.apple_account)
+          asc=client.find_app(app.bundle_id)
+          version_list=client.list_versions(asc['id'])
+          target=[x for x in version_list if x.get('attributes',{}).get('versionString')=='1.0.37']
+          old=[x for x in version_list if x.get('attributes',{}).get('versionString')=='1.0.36']
+          if not target:
+              assert len(old)==1 and old[0]['attributes'].get('appStoreState')=='DEVELOPER_REJECTED','Apple old review not editable yet'
+              for state in ('WAITING_FOR_REVIEW','IN_REVIEW'):
+                  for review in client.list_review_submissions(asc['id'],state):
+                      item,_=client._review_submission_matches(review,old[0]['id'])
+                      assert not item, 'Old version is still under review; cannot replace'
+              print('REUSING_EDITABLE_APP_VERSION',old[0]['id'])
+              revised=client.update_version_string(old[0]['id'],'1.0.37')
+              print('VERSION_RENAMED',revised['id'],revised.get('attributes',{}).get('versionString'))
+          else:
+              print('TARGET_VERSION_EXISTS',target[0]['id'],target[0]['attributes'].get('appStoreState'))
+          submitted=Submission.objects.filter(release=release,platform='ios').first()
+          if submitted and submitted.state not in ('not_submitted','failed'):
+              print('ALREADY_SUBMITTED',submitted.state)
+          else:
+              active=release.jobs.filter(type='submit_apple',status__in=('queued','running','succeeded')).first()
+              if active:
+                  print('ALREADY_ENQUEUED',active.pk,active.status)
+              else:
+                  job=enqueue_job('submit_apple',app=app,release=release,build=build)
+                  print('SUBMISSION_JOB_QUEUED',job.pk)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

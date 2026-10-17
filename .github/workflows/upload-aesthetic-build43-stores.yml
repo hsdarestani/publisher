@@ -1,0 +1,89 @@
+name: Upload A+ Esthetic Build 43 to both stores
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upload-aesthetic-build43-stores.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Queue one upload for each successful Build 43 artifact
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/esthetic-apple-diagnostic-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/apple-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-esthetic')
+          rel=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
+          assert rel.source_commit=='29baafa43aa24117c039e0df519bb714ea0aa7c4','unexpected release source'
+          android=rel.builds.get(platform='android')
+          ios=rel.builds.get(platform='ios')
+          assert android.status=='succeeded' and ios.status=='succeeded','native builds must succeed before uploads'
+          def latest(kind):
+              return rel.jobs.filter(type=kind).order_by('-pk').first()
+          for kind,build,kw in [
+              ('upload_google',android,{}),
+              ('upload_apple',ios,{'agent':True,'platform':'macos'}),
+          ]:
+              current=latest(kind)
+              if current and current.status in {'queued','running','succeeded'}:
+                  print('UPLOAD_ALREADY_PRESENT',kind,current.status,current.pk)
+                  continue
+              if current and current.status=='failed':
+                  raise RuntimeError('Existing failed upload: manual inspection required for '+kind)
+              if Submission.objects.filter(release=rel,platform='android' if kind=='upload_google' else 'ios').exists():
+                  print('SUBMISSION_ALREADY_PRESENT',kind)
+                  continue
+              if kind=='upload_apple' and ios.external_build_id:
+                  print('APPLE_ALREADY_UPLOADED')
+                  continue
+              job=enqueue_job(kind,app=app,release=rel,build=build,**kw)
+              print('UPLOAD_QUEUED',kind,job.pk)
+          print('UPLOAD_QUEUE_DONE',rel.version_name,rel.build_number)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+
+      - name: Wake publisher upload agents
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main
+          gh workflow run cloud-linux.yml --repo "$GITHUB_REPOSITORY" --ref main

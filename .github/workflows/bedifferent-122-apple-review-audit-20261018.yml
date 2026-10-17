@@ -61,7 +61,9 @@ jobs:
               c=AppleStoreClient(app.apple_account)
               record=c.find_app(app.bundle_id)
               print("APPLE_APP_FOUND="+str(bool(record)),flush=True)
-              versions=[v for v in c.list_versions(str(record["id"])) if v.get("attributes",{}).get("versionString")=="1.2.2"]
+              all_versions=c.list_versions(str(record["id"]))
+              print("APPLE_ALL_VERSIONS="+str([{"id":v["id"],"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState")} for v in all_versions[:15]]),flush=True)
+              versions=[v for v in all_versions if v.get("attributes",{}).get("versionString")=="1.2.2"]
               print("APPLE_VERSION_122="+str([{"id":v["id"],"state":v.get("attributes",{}).get("appStoreState")} for v in versions]),flush=True)
               if versions:
                   for state in ["WAITING_FOR_REVIEW","IN_REVIEW","READY_FOR_REVIEW","UNRESOLVED_ISSUES","PENDING_DEVELOPER_RELEASE","PENDING_APPLE_RELEASE","REJECTED","PREPARE_FOR_SUBMISSION","METADATA_REJECTED","READY_FOR_DISTRIBUTION"]:

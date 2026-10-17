@@ -84,3 +84,5 @@ jobs:
             -H "Content-Type: application/json" \
             --data-binary @/tmp/bedifferent-comment.json \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/113/comments" >/dev/null
+
+# Follow up: validate Apple whatsNew corrected resubmission job 480.

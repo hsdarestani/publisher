@@ -1,0 +1,54 @@
+name: Unblock latest A+ Esthetic Build 42
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/unblock-stale-a-esthetic-release-20261017.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  unblock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify and release stale A+ Esthetic store workflow lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLD=39038964876
+          NEW=39043637366
+          old_json=$(gh api "repos/$REPO/actions/runs/$OLD")
+          new_json=$(gh api "repos/$REPO/actions/runs/$NEW")
+          old_status=$(jq -r .status <<<"$old_json")
+          new_status=$(jq -r .status <<<"$new_json")
+          old_workflow=$(jq -r .name <<<"$old_json")
+          new_workflow=$(jq -r .name <<<"$new_json")
+          printf 'Old: %s [%s]\nNew: %s [%s]\n' "$old_workflow" "$old_status" "$new_workflow" "$new_status"
+          if [[ "$old_workflow" != 'Build and submit A+ Esthetic 1.0.32 Build 38' ]]; then
+            echo 'Unexpected old workflow, no cancellation.'
+            exit 1
+          fi
+          if [[ "$new_workflow" != 'Build and submit A+ Esthetic 1.0.36 Build 42' ]]; then
+            echo 'Unexpected successor workflow, no cancellation.'
+            exit 1
+          fi
+          if [[ "$new_status" == completed ]]; then
+            echo 'The successor already finished; nothing to unblock.'
+            exit 0
+          fi
+          if [[ "$old_status" == completed ]]; then
+            echo 'Old workflow has already completed; lock will clear automatically.'
+            exit 0
+          fi
+          if [[ "$old_status" != in_progress && "$old_status" != queued && "$old_status" != pending ]]; then
+            echo 'Old run is not in a cancellable state.'
+            exit 1
+          fi
+          gh api -X POST "repos/$REPO/actions/runs/$OLD/cancel" >/dev/null
+          echo 'Cancellation requested only for obsolete Build 38 to unblock Build 42.'

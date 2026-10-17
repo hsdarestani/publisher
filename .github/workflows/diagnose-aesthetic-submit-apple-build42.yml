@@ -61,6 +61,23 @@ jobs:
               error=re.sub(r'AKIA[A-Z0-9]{16}|sk-[A-Za-z0-9_-]{20,}','[REDACTED]',error)
               print('JOB',job.pk,job.type,job.status,'error',error[:850])
           print('APPLE_JOBS_END')
+          from apps.integrations.apple_store import AppleStoreClient
+          client=AppleStoreClient(app.apple_account)
+          asc=client.find_app(app.bundle_id)
+          print('ASC_VERSIONS_START')
+          for item in client.list_versions(asc['id']):
+              attrs=item.get('attributes',{})
+              print('ASC_VERSION',attrs.get('versionString'),attrs.get('appStoreState'),attrs.get('appVersionState'),attrs.get('platform'))
+          print('ASC_VERSIONS_END')
+          print('ASC_REVIEW_START')
+          for state in ('WAITING_FOR_REVIEW','IN_REVIEW','READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+              try:
+                  rows=client.list_review_submissions(asc['id'],state)
+                  for row in rows[:6]:
+                      print('ASC_REVIEW',state,row.get('id'))
+              except Exception as exc:
+                  print('ASC_REVIEW_ERROR',state,type(exc).__name__,str(exc)[:150])
+          print('ASC_REVIEW_END')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)

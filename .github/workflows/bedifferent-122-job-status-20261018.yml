@@ -81,3 +81,5 @@ jobs:
               print("RELEASE_JOB="+str({"id":j.id,"type":j.type,"status":j.status,"error_tail":(j.error or "")[-160:] if j.status=="failed" else ""}),flush=True)
           PY
           REMOTE
+
+# Read-only recheck of finalized native release after the successful cloud builds.

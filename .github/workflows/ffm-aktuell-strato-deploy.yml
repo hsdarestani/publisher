@@ -1,3 +1,4 @@
+# Deployment request: FFM editorial verification release (2026-10-17, main f1603352)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

@@ -1,0 +1,61 @@
+name: BE DIFFERENT 1.2.2 Publisher Jobs Status
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-122-job-status-20261018.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read only Publisher jobs 485 486 and release 1.2.2
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-status-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-status-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          app=MobileApp.objects.get(slug="be-different")
+          for j in Job.objects.filter(pk__in=[485,486]).order_by("id"):
+              print("PUBLISHER_JOB="+str({"id":j.id,"type":j.type,"status":j.status,"error_tail":(j.error or "")[-250:] if j.status=="failed" else ""}),flush=True)
+          for r in Release.objects.filter(app=app,version_name="1.2.2",build_number=14).order_by("-created_at")[:3]:
+              print("PUBLISHER_RELEASE="+str({"id":r.id,"version":r.version_name,"build":r.build_number,"status":r.status,"source":(r.source_commit or "")[:12]}),flush=True)
+              for b in Build.objects.filter(release=r):
+                  print("PUBLISHER_BUILD="+str({"id":b.id,"platform":b.platform,"status":b.status,"external_id":b.external_build_id}),flush=True)
+              for s in Submission.objects.filter(release=r):
+                  print("PUBLISHER_SUBMISSION="+str({"platform":s.platform,"state":s.state,"error_tail":(s.last_error or "")[-250:] if s.state in ("failed","error") else ""}),flush=True)
+          PY
+          REMOTE

@@ -113,6 +113,11 @@ jobs:
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/seed.sql
           docker compose up -d --build --no-deps web
           APP_ID="$(docker compose ps -q web)"
+          DB_HOST="$(docker exec "$APP_ID" node -e 'process.stdout.write(new URL(process.env.DATABASE_URL).hostname)')"
+          test "$DB_HOST" = "ffm-aktuell-db" || { echo "::error::FFM database host must not be the shared 'db' alias"; exit 1; }
+          unset DB_HOST
+          echo "FFM PostgreSQL hostname is isolated from Publisher."
+
           # Ensure the web connection string and DB container have identical credentials,
           # without revealing secrets in CI logs.
           DB_PASS="$(docker compose exec -T db printenv POSTGRES_PASSWORD </dev/null | tr -d '\r\n')"

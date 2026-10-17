@@ -1,0 +1,88 @@
+name: Replace old A+ Esthetic Apple review with Build 42
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/replace-aesthetic-apple-review-1-0-31-with-1-0-36.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify prior review version and release Apple review slot
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/apple-review-replacement-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/apple-review-replacement-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          PY_CODE=$(cat <<'PY'
+          import time
+          from apps.publisher.models import MobileApp, Release, Submission
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(app=app,version_name='1.0.36',build_number=42)
+          build=release.builds.get(platform='ios')
+          assert build.status=='succeeded' and build.external_build_id, 'Target 1.0.36 build is not uploaded'
+          assert not Submission.objects.filter(release=release, platform='ios').exists(), 'Already submitted; stop'
+          client=AppleStoreClient(app.apple_account)
+          asc=client.find_app(app.bundle_id)
+          versions=client.list_versions(asc['id'])
+          old=[x for x in versions if x['attributes'].get('versionString')=='1.0.31' and x['attributes'].get('platform')=='IOS']
+          newer=[x for x in versions if x['attributes'].get('versionString')=='1.0.36' and x['attributes'].get('platform')=='IOS']
+          assert not newer, '1.0.36 App Store version already exists; manual follow-up instead'
+          assert len(old)==1 and old[0]['attributes'].get('appStoreState')=='WAITING_FOR_REVIEW', 'Expected 1.0.31 review is not waiting'
+          waiting=client.list_review_submissions(asc['id'],'WAITING_FOR_REVIEW')
+          matches=[]
+          for submission in waiting:
+              item,all_items=client._review_submission_matches(submission,old[0]['id'])
+              if item:
+                  assert len(all_items)==1, 'Submission includes other review items; do not cancel'
+                  matches.append(submission)
+          assert len(matches)==1, 'Expected exactly one matching old review submission'
+          print('OLD_REVIEW_CONFIRMED',old[0]['attributes'].get('versionString'),'WAITING_FOR_REVIEW')
+          print('NEW_BUILD_CONFIRMED',release.version_name,release.build_number)
+          client.cancel_review_submission(matches[0]['id'])
+          print('OLD_REVIEW_WITHDRAWAL_REQUESTED')
+          for attempt in range(18):
+              time.sleep(3)
+              current=client.list_versions(asc['id'])
+              old_state=next((x['attributes'].get('appStoreState') for x in current if x['id']==old[0]['id']),None)
+              print('OLD_VERSION_STATE',old_state)
+              if old_state in {'DEVELOPER_REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','METADATA_REJECTED','REJECTED'}:
+                  print('REVIEW_SLOT_AVAILABLE_FOR_1_0_36')
+                  break
+          else:
+              raise RuntimeError('Apple has not yet released the previous review; do not create a new version now')
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" \
+            "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

@@ -1,0 +1,145 @@
+name: FFM Aktuell — isolated STRATO deploy
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ffm-aktuell-strato-deploy.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ffm-aktuell-isolated-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/ffm-aktuell
+          ref: main
+          path: ffm-src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify FFM and package
+        run: |
+          set -euo pipefail
+          cd ffm-src
+          npm install --no-audit --no-fund
+          npm test
+          npm run typecheck
+          npm run build
+          cd ..
+          tar --exclude=.git --exclude=node_modules --exclude=.next --exclude=.env -czf "$RUNNER_TEMP/ffm-src.tar.gz" ffm-src
+      - name: Isolated server deployment
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test "$HOST" = '82.165.187.14' || { echo "::error::Unexpected production host; no changes."; exit 1; }
+          test -n "$SSH_PRIVATE_KEY" || { echo "::error::Missing Publisher SSH key."; exit 1; }
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/ffm-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/ffm-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'PREFLIGHT'
+          set -euo pipefail
+          test -f /opt/aplus-publisher/Caddyfile
+          cd /opt/aplus-publisher
+          ID="$(docker compose ps -q caddy)"
+          test -n "$ID"
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
+          docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile </dev/null
+          df -Pk /opt | awk 'NR==2 { if ($4<1200000) exit 1; print "Disk preflight passed" }'
+          PREFLIGHT
+          scp -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$PORT" "$RUNNER_TEMP/ffm-src.tar.gz" root@"$HOST":/tmp/ffm-src.tar.gz
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          trap 'rm -f /tmp/ffm-src.tar.gz' EXIT
+          cd /opt/aplus-publisher
+          CADDY_ID="$(docker compose ps -q caddy)"
+          NETWORK="$(docker inspect "$CADDY_ID" --format '{{range $name, $network := .NetworkSettings.Networks}}{{println $name}}{{end}}' | head -n1)"
+          docker network inspect "$NETWORK" >/dev/null
+          mkdir -p /opt/ffm-aktuell/backups
+          if [ -f /opt/ffm-aktuell/package.json ]; then
+            tar --exclude=backups --exclude=.env -czf "/opt/ffm-aktuell/backups/previous-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /opt/ffm-aktuell . || true
+          fi
+          tar -xzf /tmp/ffm-src.tar.gz -C /opt/ffm-aktuell --strip-components=1
+          cd /opt/ffm-aktuell
+          if [ ! -f .env ]; then
+            umask 077
+            printf 'POSTGRES_PASSWORD=%s\nSESSION_SECRET=%s\nPUBLISHER_NETWORK=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 48)" "$NETWORK" > .env
+          else
+            grep -q '^PUBLISHER_NETWORK=' .env || printf 'PUBLISHER_NETWORK=%s\n' "$NETWORK" >> .env
+          fi
+          chmod 600 .env
+          docker compose config --quiet
+          docker compose up -d db
+          for i in $(seq 1 35); do
+            if docker compose exec -T db pg_isready -U ffm -d ffm >/dev/null 2>&1; then break; fi
+            test "$i" -ne 35 || exit 1
+            sleep 2
+          done
+          docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql
+          docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/seed.sql
+          docker compose up -d --build --no-deps web
+          APP_ID="$(docker compose ps -q web)"
+          test -n "$APP_ID"
+          for i in $(seq 1 45); do
+            if docker exec "$APP_ID" node -e 'fetch("http://127.0.0.1:3000/api/health").then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))' >/dev/null 2>&1; then break; fi
+            if [ "$i" -eq 45 ]; then docker compose logs --tail=90 web; exit 1; fi
+            sleep 3
+          done
+          cd /opt/aplus-publisher
+          if ! grep -qF 'ffm-aktuell.smarbiz.sbs {' Caddyfile; then
+            cp Caddyfile /opt/ffm-aktuell/backups/Caddyfile-before-ffm
+            cat >> Caddyfile <<'CADDY'
+
+          # FFM Aktuell: separate city platform, shared edge proxy only.
+          ffm-aktuell.smarbiz.sbs {
+            encode zstd gzip
+            reverse_proxy ffm-aktuell-web:3000
+            header X-Content-Type-Options nosniff
+          }
+          CADDY
+          fi
+          docker cp /opt/aplus-publisher/Caddyfile "$CADDY_ID":/tmp/Caddyfile-ffm
+          docker exec "$CADDY_ID" caddy validate --config /tmp/Caddyfile-ffm
+          docker exec "$CADDY_ID" caddy reload --config /tmp/Caddyfile-ffm
+          docker exec "$CADDY_ID" rm -f /tmp/Caddyfile-ffm
+          docker exec "$CADDY_ID" wget -qO- http://ffm-aktuell-web:3000/api/health | grep -q '"status":"ok"'
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
+          echo "FFM and Publisher internal health OK."
+          REMOTE
+          ORIGIN=000
+          for i in $(seq 1 14); do
+            ORIGIN="$(curl -k -sS --connect-timeout 8 --max-time 20 --resolve "ffm-aktuell.smarbiz.sbs:443:$HOST" -o /dev/null -w '%{http_code}' https://ffm-aktuell.smarbiz.sbs/api/health 2>/dev/null || true)"
+            [ "$ORIGIN" = 200 ] && break
+            sleep 5
+          done
+          echo "FFM origin HTTPS status: $ORIGIN"
+          test "$ORIGIN" = 200 || { echo "::error::FFM origin TLS not healthy."; exit 1; }
+          PUBLIC="$(curl -sS --connect-timeout 8 --max-time 20 -o /dev/null -w '%{http_code}' https://ffm-aktuell.smarbiz.sbs/api/health || true)"
+          echo "FFM public HTTPS status: $PUBLIC"
+          test "$PUBLIC" = 200 || { echo "::error::FFM public DNS/Cloudflare route not healthy."; exit 1; }
+          echo "FFM Aktuell live without restarting Publisher or other apps."

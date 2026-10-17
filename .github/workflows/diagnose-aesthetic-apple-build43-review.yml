@@ -50,6 +50,12 @@ jobs:
           target=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
           print('RELEASE',target.pk,target.status,target.source_commit)
           print('POST_SUBMISSION_JOB_481_CHECK')
+          import inspect
+          from apps.integrations.apple_store import AppleStoreClient
+          live_method=inspect.getsource(AppleStoreClient.ensure_version)
+          print('LIVE_ENSURE_VERSION_START')
+          print(live_method)
+          print('LIVE_ENSURE_VERSION_END')
           import re
           issue=target.jobs.filter(type='submit_apple').order_by('-pk').first()
           if issue:

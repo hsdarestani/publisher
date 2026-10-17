@@ -111,6 +111,12 @@ jobs:
           echo "Independent FFM PostgreSQL role credentials synchronized."
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/seed.sql
+          # Preserve real OSM source metadata and review flags. The SQL is idempotent
+          # and never promotes candidates into published or verified places.
+          if [ -s data/osm-discovery.sql ]; then
+            docker compose exec -T db psql -q -v ON_ERROR_STOP=1 -U ffm -d ffm < data/osm-discovery.sql </dev/null
+            echo 'Frankfurt OSM discovery candidates imported for review.'
+          fi
           docker compose up -d --build --no-deps web
           APP_ID="$(docker compose ps -q web)"
           DB_HOST="$(docker exec "$APP_ID" node -e 'process.stdout.write(new URL(process.env.DATABASE_URL).hostname)')"

@@ -1,0 +1,80 @@
+name: BE DIFFERENT Google Play current release diagnostic
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-google-current-state-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect Google track and Publisher Android builds read only
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-google-live-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          from apps.integrations.google_play import GooglePlayClient
+          app=MobileApp.objects.get(slug='be-different')
+          print('ANDROID_APP='+json.dumps({'package_name':app.package_name,'google_linked':bool(app.google_account_id),'google_configured':bool(app.google_account and app.google_account.configured)}),flush=True)
+          for r in Release.objects.filter(app=app).order_by('-created_at')[:12]:
+            for b in r.builds.filter(platform='android'):
+              print('ANDROID_BUILD='+json.dumps({'release_id':r.id,'version':r.version_name,'build_number':r.build_number,'release_status':r.status,'build_status':b.status,'external_build_id':b.external_build_id,'source':r.source_commit[:12],'track':r.android_track,'created':r.created_at.isoformat()}),flush=True)
+              for j in Job.objects.filter(release=r,build=b).order_by('-created_at')[:8]:
+                print('ANDROID_JOB='+json.dumps({'id':j.id,'type':j.type,'status':j.status,'error_tail':(j.error or '')[-200:]}),flush=True)
+            for s in Submission.objects.filter(release=r,platform='android'):
+              print('ANDROID_SUBMISSION='+json.dumps({'release_id':r.id,'state':s.state,'external_id':s.external_id,'error_tail':(s.last_error or '')[-200:]}),flush=True)
+          if not app.google_account_id:
+            print('GOOGLE_TRACK_CHECK=NO_ACCOUNT',flush=True)
+          else:
+            client=GooglePlayClient(app.google_account)
+            edit=None
+            try:
+              edit=client._open_edit(app.package_name)
+              path=f"/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks"
+              response=client._edit_request(edit,'GET',path)
+              for track in response.get('tracks',[]):
+                print('GOOGLE_TRACK='+json.dumps({'track':track.get('track'),'releases':[{'name':x.get('name'),'status':x.get('status'),'versionCodes':x.get('versionCodes'),'userFraction':x.get('userFraction')} for x in track.get('releases',[])]}),flush=True)
+              print('GOOGLE_TRACK_CHECK=SUCCESS',flush=True)
+            except Exception as error:
+              print('GOOGLE_TRACK_CHECK=FAILED',flush=True)
+              print('GOOGLE_TRACK_ERROR='+type(error).__name__+': '+str(error)[:250],flush=True)
+            finally:
+              if edit is not None:
+                client._safe_delete_edit(edit)
+          PY
+          REMOTE

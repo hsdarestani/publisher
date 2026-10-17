@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  statuses: write
 jobs:
   finalize:
     runs-on: ubuntu-latest
@@ -14,6 +15,7 @@ jobs:
     timeout-minutes: 16
     steps:
       - name: Verify releases and safely resume missing store submissions
+        id: finalize
         env:
           HOST: ${{ secrets.HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
@@ -42,7 +44,7 @@ jobs:
           if [ -n "$SSH_HOST_FINGERPRINT" ]; then
             ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
           fi
-          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE' | tee /tmp/bd-finalize-result.log
           set -euo pipefail
           cd /opt/aplus-publisher
           docker compose exec -T web python manage.py shell <<'PY'
@@ -119,3 +121,22 @@ jobs:
           print('BE_DIFFERENT_FINALIZE_REQUESTED=true',flush=True)
           PY
           REMOTE
+      - name: Publish dispatch result as GitHub status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINALIZE_RESULT: ${{ steps.finalize.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$FINALIZE_RESULT" = "success" ]; then STATE=success; else STATE=failure; fi
+          ANDROID="$(grep -E '^ANDROID_ACTION=' /tmp/bd-finalize-result.log 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+          IOS="$(grep -E '^IOS_ACTION=' /tmp/bd-finalize-result.log 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+          DESCRIPTION="Android: ${ANDROID:-unverified}; iOS: ${IOS:-unverified}"
+          DESCRIPTION="$(printf '%s' "$DESCRIPTION" | cut -c1-140)"
+          PAYLOAD="$(jq -n --arg state "$STATE" --arg description "$DESCRIPTION" --arg context "be-different/publisher-dispatch-121" '{state:$state,description:$description,context:$context}')"
+          curl -fsS --retry 3 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" >/dev/null

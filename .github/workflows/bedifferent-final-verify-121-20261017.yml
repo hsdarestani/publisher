@@ -1,4 +1,5 @@
 name: BE DIFFERENT 1.2.1 final read only store check
+# Recheck after iOS whatsNew locale fix and Publisher job 480
 on:
   push:
     branches: [main]

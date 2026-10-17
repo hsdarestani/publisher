@@ -1,4 +1,4 @@
-# Deployment request: FFM visitor search-first UX simplify 1e0ae284, 2026-10-18
+# Deployment request: FFM visual-first Discover cards and pictogram categories 318c506 (2026-10-18)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

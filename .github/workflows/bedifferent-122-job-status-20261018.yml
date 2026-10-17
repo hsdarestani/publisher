@@ -1,3 +1,4 @@
+# Read only status checkpoint after store upload
 name: BE DIFFERENT 1.2.2 Publisher Jobs Status
 on:
   push:

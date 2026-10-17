@@ -78,6 +78,7 @@ jobs:
               except Exception as exc:
                   print('ASC_REVIEW_ERROR',state,type(exc).__name__,str(exc)[:150])
           print('ASC_REVIEW_END')
+          print('AFTER_REVIEW_WITHDRAWAL_CHECK')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)

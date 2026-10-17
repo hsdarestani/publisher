@@ -48,6 +48,7 @@ jobs:
           app=MobileApp.objects.get(slug='a-esthetic')
           rel=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
           print('RELEASE',rel.pk,rel.status,'source',rel.source_commit)
+          print('CHECK_UPLOADS_AFTER_JOB_475_476')
           for build in rel.builds.order_by('platform'):
               print('BUILD',build.platform,build.status,'uploaded',bool(build.external_build_id))
           for sub in Submission.objects.filter(release=rel).order_by('-pk')[:6]:

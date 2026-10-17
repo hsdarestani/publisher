@@ -1,0 +1,63 @@
+name: BE DIFFERENT Android job 459 detailed status
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-android-job459-detail-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Inspect BE DIFFERENT build 12 job progress and assigned agent
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-job459-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import Job,BuildAgent
+          j=Job.objects.select_related('build__agent','release').get(pk=459)
+          b=j.build
+          a=b.agent if b else None
+          print('JOB459='+json.dumps({'status':j.status,'progress':j.progress,'started':str(j.started_at),'updated':str(j.updated_at),'finished':str(j.finished_at),'required_platform':j.required_platform,'available_to_agents':j.available_to_agents,'error_tail':j.error[-350:] if j.error else '','log_size':len(j.logs),'result_keys':list(j.result.keys()) if isinstance(j.result,dict) else []}),flush=True)
+          print('BUILD459='+json.dumps({'status':b.status,'agent':a.name if a else None,'agent_online':a.online if a else None,'agent_last_seen':str(a.last_seen_at) if a else None,'started':str(b.started_at),'updated':str(b.updated_at),'finished':str(b.finished_at),'artifact_size':b.artifact_size,'logs_size':len(b.logs)}),flush=True)
+          for line in j.logs.splitlines()[-50:]:
+             low=line.lower()
+             if any(t in low for t in ('build','gradle','npm','compile','artifact','error','upload','running','work','done','timeout','fail','aab','bundle','progress','starting','queued')):
+                print('JOB459_TRACE='+line[:220],flush=True)
+          for a in BuildAgent.objects.filter(enabled=True).order_by('-last_seen_at')[:10]:
+             print('AGENT='+json.dumps({'id':a.id,'name':a.name,'platform':a.platform,'online':a.online,'last_seen':str(a.last_seen_at)}),flush=True)
+          PY
+          REMOTE

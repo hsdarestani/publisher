@@ -50,6 +50,13 @@ jobs:
           target=Release.objects.get(app=app,version_name='1.0.37',build_number=43)
           print('RELEASE',target.pk,target.status,target.source_commit)
           print('POST_SUBMISSION_JOB_481_CHECK')
+          import re
+          issue=target.jobs.filter(type='submit_apple').order_by('-pk').first()
+          if issue:
+              msg=str(issue.error or '').replace('\\n',' ').replace('\\r',' ')
+              msg=re.sub(r'(?i)(bearer\\s+|token[=:]\\s*|password[=:]\\s*)[^\\s,;]+',r'\\1[REDACTED]',msg)
+              msg=re.sub(r'AKIA[A-Z0-9]{16}|sk-[A-Za-z0-9_-]{20,}','[REDACTED]',msg)
+              print('APPLE_SUBMIT_ERROR',issue.pk,issue.status,msg[:1450])
           for build in target.builds.all():
               print('BUILD',build.platform,build.status,'external',bool(build.external_build_id))
           for sub in Submission.objects.filter(app=app).order_by('-pk')[:12]:

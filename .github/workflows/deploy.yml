@@ -9,6 +9,7 @@ on:
     paths-ignore:
       - '.github/workflows/**'
       - 'status/**'
+      - 'Caddyfile' # Edge route updates are handled by isolated app workflows; no Publisher restart.
   workflow_dispatch:
 
 permissions:

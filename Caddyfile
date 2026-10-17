@@ -31,3 +31,10 @@ pwyw.smarbiz.sbs {
   reverse_proxy pwyw-web:8080
   header X-Content-Type-Options nosniff
 }
+
+# FFM Aktuell isolated city platform; stable Docker network host.
+ffm-aktuell.smarbiz.sbs {
+  encode zstd gzip
+  reverse_proxy ffm-aktuell-web:3000
+  header X-Content-Type-Options nosniff
+}

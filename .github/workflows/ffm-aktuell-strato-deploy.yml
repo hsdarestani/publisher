@@ -117,6 +117,10 @@ jobs:
             docker compose exec -T db psql -q -v ON_ERROR_STOP=1 -U ffm -d ffm < data/osm-discovery.sql
             echo 'Frankfurt OSM discovery candidates imported for review.'
           fi
+          if [ -s data/apotheken-import.sql ]; then
+            docker compose exec -T db psql -q -v ON_ERROR_STOP=1 -U ffm -d ffm < data/apotheken-import.sql
+            echo 'Frankfurt OSM pharmacies imported without duty/openNow assertions.'
+          fi
           docker compose up -d --build --no-deps web
           APP_ID="$(docker compose ps -q web)"
           DB_HOST="$(docker exec "$APP_ID" node -e 'process.stdout.write(new URL(process.env.DATABASE_URL).hostname)')"

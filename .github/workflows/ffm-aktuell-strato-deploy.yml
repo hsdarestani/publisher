@@ -114,7 +114,7 @@ jobs:
           # Preserve real OSM source metadata and review flags. The SQL is idempotent
           # and never promotes candidates into published or verified places.
           if [ -s data/osm-discovery.sql ]; then
-            docker compose exec -T db psql -q -v ON_ERROR_STOP=1 -U ffm -d ffm < data/osm-discovery.sql </dev/null
+            docker compose exec -T db psql -q -v ON_ERROR_STOP=1 -U ffm -d ffm < data/osm-discovery.sql
             echo 'Frankfurt OSM discovery candidates imported for review.'
           fi
           docker compose up -d --build --no-deps web

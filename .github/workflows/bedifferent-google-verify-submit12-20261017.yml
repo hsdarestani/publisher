@@ -1,0 +1,87 @@
+name: BE DIFFERENT Google Play build 12 submission verification
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-google-verify-submit12-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 16
+    steps:
+      - name: Wait for submit job 472; verify Google Production only after completion
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-google-verify-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import time,json
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          from apps.integrations.google_play import GooglePlayClient
+          job=Job.objects.get(pk=472)
+          app=MobileApp.objects.get(slug='be-different')
+          release=Release.objects.get(pk=14,app=app,version_name='1.2.1',build_number=12)
+          assert job.release_id==release.id and job.type=='submit_google'
+          deadline=time.monotonic()+600
+          last=''
+          while time.monotonic()<deadline:
+             job.refresh_from_db()
+             if job.status!=last:
+                print('GOOGLE_SUBMIT_STATUS='+job.status,flush=True)
+                last=job.status
+             if job.status in ('succeeded','failed','cancelled'):
+                break
+             time.sleep(12)
+          job.refresh_from_db()
+          print('GOOGLE_SUBMIT_FINAL='+json.dumps({'status':job.status,'id':job.pk,'error':(job.error or '')[-420:] if job.status=='failed' else ''}),flush=True)
+          if job.status=='failed': raise RuntimeError('Google submit job failed; see redacted error above')
+          if job.status!='succeeded': raise RuntimeError('Google submit did not finish within verification window')
+          sub=Submission.objects.filter(release=release,platform='android').first()
+          print('PUBLISHER_SUBMISSION='+json.dumps({'state':sub.state if sub else None,'error':(sub.last_error or '')[-250:] if sub else ''}),flush=True)
+          assert sub and sub.state in ('in_review','ready_for_review','approved','live'), 'Publisher did not confirm review submission'
+          client=GooglePlayClient(app.google_account)
+          edit=None
+          try:
+             edit=client._open_edit(app.package_name)
+             path=f"/applications/{client._q(app.package_name)}/edits/{edit.edit_id}/tracks"
+             data=client._edit_request(edit,'GET',path)
+             prod=next((x for x in data.get('tracks',[]) if x.get('track')=='production'),{})
+             for track in prod.get('releases',[]):
+                print('GOOGLE_PRODUCTION='+json.dumps({'name':track.get('name'),'status':track.get('status'),'versionCodes':track.get('versionCodes')}),flush=True)
+             matched=any('12' in [str(x) for x in t.get('versionCodes',[])] for t in prod.get('releases',[]))
+             print('GOOGLE_BUILD12_ON_PRODUCTION='+str(matched),flush=True)
+          finally:
+             if edit is not None: client._safe_delete_edit(edit)
+          PY
+          REMOTE

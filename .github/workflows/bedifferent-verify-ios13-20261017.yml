@@ -1,0 +1,86 @@
+name: BE DIFFERENT verify Apple build 13 store acceptance
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-verify-ios13-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 7
+    steps:
+      - name: Check current submission jobs directly in Publisher
+        id: check
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-check-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-check-pass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE' | tee /tmp/bedifferent-store-verification.txt
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json,time
+          from apps.publisher.models import MobileApp,Release,Job,Submission
+          a=MobileApp.objects.get(slug='be-different')
+          for platform,number in [('android',12),('ios',13)]:
+              r=Release.objects.get(app=a,version_name='1.2.1',build_number=number)
+              b=r.builds.get(platform=platform)
+              job_type='submit_google' if platform=='android' else 'submit_apple'
+              last=Job.objects.filter(release=r,type=job_type).order_by('-id').first()
+              if platform=='ios' and last and last.status in ('running','queued'):
+                  for i in range(24):
+                      time.sleep(8)
+                      last.refresh_from_db()
+                      if last.status not in ('queued','running'): break
+              sub=Submission.objects.filter(release=r,platform=platform).first()
+              print('STORE_STATE='+json.dumps({'platform':platform,'version':'1.2.1','build_number':number,'build_status':b.status,'submit_job_id':last.pk if last else None,'submit_status':last.status if last else None,'submission_state':sub.state if sub else None,'external_submission_id':str(sub.external_id)[:80] if sub else None,'error':(last.error or '')[-240:] if last and last.status=='failed' else ''}),flush=True)
+          PY
+          REMOTE
+      - name: Post observed result to release tracking issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_RESULT: ${{ steps.check.outcome }}
+        run: |
+          set -euo pipefail
+          printf 'BE DIFFERENT live store verification: %s\n\n' "$JOB_RESULT" > /tmp/bedifferent-comment.txt
+          if [ -f /tmp/bedifferent-store-verification.txt ]; then
+            grep '^STORE_STATE=' /tmp/bedifferent-store-verification.txt >> /tmp/bedifferent-comment.txt || true
+          fi
+          printf '\nWorkflow: https://github.com/%s/actions/runs/%s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> /tmp/bedifferent-comment.txt
+          jq -Rs '{body: .}' /tmp/bedifferent-comment.txt > /tmp/bedifferent-comment.json
+          curl -fsS --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/bedifferent-comment.json \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/113/comments" >/dev/null

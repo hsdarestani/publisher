@@ -1,3 +1,4 @@
+# Read-only Apple version state diagnostic after blocked 1.2.2 submission
 # Check store submission status after both 1.2.2 native cloud builds completed
 # Read only status checkpoint after store upload
 name: BE DIFFERENT 1.2.2 Publisher Jobs Status
@@ -64,7 +65,9 @@ jobs:
               from apps.integrations.apple_store import AppleStoreClient
               client=AppleStoreClient(app.apple_account)
               record=client.find_app(app.bundle_id)
-              match=[v for v in client.list_versions(str(record["id"])) if v.get("attributes",{}).get("versionString")=="1.2.2"]
+              versions=client.list_versions(str(record["id"]))
+              print("APPLE_STORE_LATEST_VERSIONS="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState"),"id":v.get("id")} for v in versions[:12]]),flush=True)
+              match=[v for v in versions if v.get("attributes",{}).get("versionString")=="1.2.2"]
               print("APPLE_STORE_VERSION_122="+str([{"id":v["id"],"state":v.get("attributes",{}).get("appStoreState")} for v in match]),flush=True)
               if match:
                   version_id=str(match[0]["id"])

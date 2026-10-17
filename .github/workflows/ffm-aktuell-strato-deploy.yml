@@ -1,4 +1,4 @@
-# Deployment request: FFM Stadtstudio final German font polish main 3113512 (2026-10-17)
+# Deployment request: FFM visitor search-first UX simplify 1e0ae284, 2026-10-18
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

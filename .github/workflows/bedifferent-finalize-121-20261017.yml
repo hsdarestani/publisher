@@ -1,0 +1,121 @@
+name: BE DIFFERENT finalize 1.2.1 store submissions
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-finalize-121-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 16
+    steps:
+      - name: Verify releases and safely resume missing store submissions
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-finalize-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-finalize-pass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json, time
+          from apps.publisher.models import MobileApp, Release, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='be-different',package_name='com.smarbiz.bedifferent')
+          assert app.apple_account and app.apple_account.configured
+          assert app.google_account and app.google_account.configured
+          releases={}
+          for platform,number in [('android',12),('ios',13)]:
+              release=None
+              for attempt in range(25):
+                  release=Release.objects.filter(app=app,version_name='1.2.1',build_number=number).first()
+                  if release: break
+                  time.sleep(12)
+              if not release:
+                  raise RuntimeError('Missing Publisher release for '+platform+' 1.2.1 ('+str(number)+')')
+              releases[platform]=release
+              print('RELEASE='+json.dumps({'platform':platform,'id':release.pk,'version':release.version_name,'build':release.build_number,'auto_submit':release.auto_submit,'status':release.status},sort_keys=True),flush=True)
+          android=releases['android']
+          assert android.android_track=='production','Android target must be production'
+          ab=android.builds.filter(platform='android').first()
+          assert ab is not None,'Missing Android build'
+          asub=Submission.objects.filter(release=android,platform='android').first()
+          ajobs=Job.objects.filter(release=android,type='submit_google').order_by('-id')
+          ajob=ajobs.first()
+          print('ANDROID_STATE='+json.dumps({'build':ab.status,'submission':asub.state if asub else None,'latest_job':ajob.pk if ajob else None,'job_status':ajob.status if ajob else None,'error':(ajob.error or '')[-250:] if ajob and ajob.status=='failed' else ''}),flush=True)
+          if asub and asub.state in ('in_review','approved','live'):
+              print('ANDROID_ACTION=ALREADY_SUBMITTED',flush=True)
+          elif ajobs.filter(status__in=['queued','running','succeeded']).exists():
+              print('ANDROID_ACTION=SUBMISSION_ALREADY_QUEUED_OR_DONE',flush=True)
+          elif ab.status=='succeeded' and ab.artifact and ab.artifact_size>1000000:
+              if ajob and ajob.status=='failed' and ('edit has expired' in (ajob.error or '').lower() or 'invalid value for short description' in (ajob.error or '').lower()):
+                  new=enqueue_job('submit_google',app=app,release=android,build=ab)
+                  print('ANDROID_ACTION=RETRY_SUBMIT_JOB_'+str(new.pk),flush=True)
+              elif not ajob:
+                  new=enqueue_job('submit_google',app=app,release=android,build=ab)
+                  print('ANDROID_ACTION=SUBMIT_JOB_'+str(new.pk),flush=True)
+              else:
+                  print('ANDROID_ACTION=FAILED_NEEDS_DIAGNOSIS',flush=True)
+                  raise RuntimeError('Android previously failed with an unrecognized error; refusing blind retry')
+          else:
+              print('ANDROID_ACTION=BUILD_PENDING',flush=True)
+          ios=releases['ios']
+          if not ios.auto_submit:
+              ios.auto_submit=True
+              ios.save(update_fields=['auto_submit','updated_at'])
+              print('IOS_AUTO_SUBMIT_ENABLED=true',flush=True)
+          ib=ios.builds.filter(platform='ios').first()
+          assert ib is not None,'Missing iOS build'
+          isub=Submission.objects.filter(release=ios,platform='ios').first()
+          buildjob=Job.objects.filter(release=ios,type='build_ios').order_by('-id').first()
+          upload=Job.objects.filter(release=ios,type='upload_apple').order_by('-id').first()
+          submit=Job.objects.filter(release=ios,type='submit_apple').order_by('-id').first()
+          print('IOS_STATE='+json.dumps({'build':ib.status,'build_job':buildjob.status if buildjob else None,'upload':upload.status if upload else None,'submit':submit.status if submit else None,'submission':isub.state if isub else None,'processed_build':bool(ib.external_build_id)}),flush=True)
+          if isub and isub.state in ('in_review','approved','live'):
+              print('IOS_ACTION=ALREADY_SUBMITTED',flush=True)
+          elif Job.objects.filter(release=ios,type='submit_apple',status__in=['queued','running','succeeded']).exists():
+              print('IOS_ACTION=SUBMISSION_ALREADY_QUEUED_OR_DONE',flush=True)
+          elif ib.status=='succeeded' and ib.external_build_id and upload and upload.status=='succeeded':
+              new=enqueue_job('submit_apple',app=app,release=ios,build=ib)
+              print('IOS_ACTION=SUBMIT_JOB_'+str(new.pk),flush=True)
+          elif ib.status=='succeeded' and ib.artifact and not Job.objects.filter(release=ios,type='upload_apple',status__in=['queued','running','succeeded']).exists():
+              new=enqueue_job('upload_apple',app=app,release=ios,build=ib,agent=True,platform='macos')
+              print('IOS_ACTION=UPLOAD_JOB_'+str(new.pk),flush=True)
+          elif buildjob and buildjob.status in ('queued','running'):
+              print('IOS_ACTION=BUILD_IN_PROGRESS_WITH_AUTO_SUBMIT',flush=True)
+          elif buildjob and buildjob.status=='failed':
+              print('IOS_ACTION=BUILD_FAILED',flush=True)
+              raise RuntimeError('iOS native build failed; submission cannot proceed until fixed')
+          else:
+              print('IOS_ACTION=AWAITING_UPLOAD_WITH_AUTO_SUBMIT',flush=True)
+          print('BE_DIFFERENT_FINALIZE_REQUESTED=true',flush=True)
+          PY
+          REMOTE

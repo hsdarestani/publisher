@@ -1,4 +1,4 @@
-# Deployment request: FFM admin activation password feedback 2026-10-17, main 5cca9b2
+# Deployment request: FFM admin atomic activation 500 fix, main 46f1df4 (2026-10-17)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

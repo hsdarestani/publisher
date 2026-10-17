@@ -1,4 +1,4 @@
-name: Inspect A+ Esthetic canonical release readiness
+name: Inspect A+ Esthetic release readiness October 17
 on:
   workflow_dispatch:
   push:
@@ -27,7 +27,7 @@ jobs:
           from apps.integrations.apple_store import AppleStoreClient
           app=MobileApp.objects.get(slug='a-esthetic')
           print('SOURCE',app.github_repo_full_name if hasattr(app,'github_repo_full_name') else app.slug,'LATEST',app.latest_commit_sha)
-          for rel in Release.objects.filter(app=app).order_by('-pk')[:8]:
+          for rel in Release.objects.filter(app=app).order_by('-pk')[:12]:
               print('REL',rel.pk,rel.version_name,rel.build_number,rel.status,rel.source_commit)
               for b in rel.builds.all():
                   print('BLD',b.platform,b.status,str(b.commit_sha or '')[:12],bool(b.artifact),bool(b.external_build_id))
@@ -45,11 +45,11 @@ jobs:
                   record=api.find_app(app.bundle_id)
                   for item in api.list_versions(record['id']):
                       data=item.get('attributes',{})
-                      if data.get('versionString') in ('1.0.28','1.0.29','1.0.30'):
+                      if data.get('versionString') in ('1.0.28','1.0.29','1.0.30','1.0.31','1.0.32'):
                           print('APPLE_VERSION',item['id'],data.get('versionString'),data.get('appStoreState') or data.get('appVersionState'))
               except Exception as ex:
                   print('APPLE_STATUS_ERROR',type(ex).__name__,str(ex)[:200])
-          print('INSPECT_DONE')
+          print('INSPECT_DONE_20261017')
           PY
           )
           ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)

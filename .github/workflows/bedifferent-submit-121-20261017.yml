@@ -1,0 +1,148 @@
+name: BE DIFFERENT 1.2.1 submit both stores safely
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-submit-121-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 22
+    steps:
+      - name: Verify active versions and enqueue only missing release stages
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-release-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          STATUS="$RUNNER_TEMP/be-different-submission-status.txt"
+          echo 'Release request: iOS 1.2.1 (13) and Android 1.2.1 (12)' > "$STATUS"
+          set +e
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' >> "$STATUS" 2>&1 <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import re
+          from apps.publisher.models import MobileApp, Release, Build, Submission, Job
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug="be-different")
+          assert app.package_name=="com.smarbiz.bedifferent" and app.bundle_id=="com.smarbiz.bedifferent"
+          assert app.apple_account and app.apple_account.configured, "Apple credentials not ready"
+          assert app.google_account and app.google_account.configured, "Google credentials not ready"
+          print("TARGET=BE_DIFFERENT_1.2.1",flush=True)
+          # Apple's Oct 16 rejection said the listed coach chat / Different AI claims
+          # did not match available features. Remove only those unsupported lines.
+          changed=[]
+          for loc in app.localizations.all():
+              updated=[]
+              for field in ("full_description","short_description","promotional_text","subtitle"):
+                  old=getattr(loc,field) or ""
+                  lines=old.splitlines()
+                  newlines=[]
+                  for line in lines:
+                      if re.search(r"communicate with your coach and get assistance from Different AI",line,re.I):
+                          line=re.sub(r"(?i)communicate with your coach and get assistance from Different AI[.!]?","",line).strip(" ,.;")
+                      if line.strip(): newlines.append(line)
+                  new="\n".join(newlines)
+                  if new!=old and "Different AI" in old:
+                      setattr(loc,field,new)
+                      updated.append(field)
+              if updated:
+                  loc.save(update_fields=updated+["updated_at"])
+                  changed.append(loc.locale+":"+",".join(updated))
+          print("APPLE_METADATA_CORRECTIONS="+("|".join(changed) if changed else "none"),flush=True)
+          android=Release.objects.get(app=app,version_name="1.2.1",build_number=12)
+          assert android.android_track=="production", "Android track not production"
+          ab=android.builds.filter(platform="android").order_by("-id").first()
+          asub=Submission.objects.filter(release=android,platform="android").first()
+          aj=Job.objects.filter(release=android,type__in=["submit_google","upload_google"]).order_by("-id").first()
+          print("ANDROID_INITIAL="+str({"release":android.pk,"build":ab.status if ab else None,"submission":asub.state if asub else None,"job":(aj.pk,aj.status) if aj else None}),flush=True)
+          if asub and asub.state in ("in_review","approved","live"):
+              print("ANDROID_ACTION=ALREADY_SUBMITTED",flush=True)
+          elif aj and aj.status in ("queued","running"):
+              print("ANDROID_ACTION=EXISTING_SUBMISSION_JOB_"+str(aj.pk),flush=True)
+          elif ab and ab.status=="succeeded" and ab.artifact and ab.artifact_size>1000000:
+              if asub and asub.state=="ready_for_review":
+                  print("ANDROID_ACTION=GOOGLE_MANUAL_SEND_FOR_REVIEW_REQUIRED",flush=True)
+              else:
+                  job=enqueue_job("submit_google",app=app,release=android,build=ab)
+                  print("ANDROID_ACTION=QUEUED_SUBMIT_"+str(job.pk),flush=True)
+          else:
+              print("ANDROID_ACTION=BLOCKED_BUILD_NOT_READY",flush=True)
+          ios=Release.objects.filter(app=app,version_name="1.2.1",build_number=13).first()
+          if ios is None:
+              ios=Release.objects.create(app=app,version_name="1.2.1",build_number=13,source_branch="main",auto_submit=True,ios_release_type="manual",release_notes="iOS 1.2.1: BE FOCUSED, improved athlete view, digital twin and clearer wearable data. No in-app purchases.")
+              print("IOS_RELEASE_CREATED="+str(ios.pk),flush=True)
+          if not ios.auto_submit:
+              ios.auto_submit=True
+              ios.save(update_fields=["auto_submit","updated_at"])
+          ib=ios.builds.filter(platform="ios").order_by("-id").first()
+          isub=Submission.objects.filter(release=ios,platform="ios").first()
+          ij=Job.objects.filter(release=ios,type="submit_apple").order_by("-id").first()
+          uj=Job.objects.filter(release=ios,type="upload_apple").order_by("-id").first()
+          bj=Job.objects.filter(release=ios,type="build_ios").order_by("-id").first()
+          print("IOS_INITIAL="+str({"release":ios.pk,"build":ib.status if ib else None,"apple_build_id":bool(ib.external_build_id) if ib else False,"submission":isub.state if isub else None,"build_job":(bj.pk,bj.status) if bj else None,"upload_job":(uj.pk,uj.status) if uj else None,"submit_job":(ij.pk,ij.status) if ij else None}),flush=True)
+          if isub and isub.state in ("in_review","approved","live"):
+              print("IOS_ACTION=ALREADY_SUBMITTED",flush=True)
+          elif ij and ij.status in ("queued","running","succeeded"):
+              print("IOS_ACTION=EXISTING_SUBMISSION_JOB_"+str(ij.pk),flush=True)
+          elif ib and ib.status=="succeeded" and ib.external_build_id:
+              job=enqueue_job("submit_apple",app=app,release=ios,build=ib)
+              print("IOS_ACTION=QUEUED_APP_STORE_REVIEW_"+str(job.pk),flush=True)
+          elif uj and uj.status in ("queued","running"):
+              print("IOS_ACTION=UPLOAD_IN_PROGRESS_"+str(uj.pk)+"_AUTOSUBMIT_ENABLED",flush=True)
+          elif ib and ib.status=="succeeded" and ib.artifact and ib.artifact_size>1000000:
+              job=enqueue_job("upload_apple",app=app,release=ios,build=ib,agent=True,platform="macos")
+              print("IOS_ACTION=QUEUED_APP_STORE_UPLOAD_"+str(job.pk)+"_AUTOSUBMIT_ENABLED",flush=True)
+          elif bj and bj.status in ("queued","running"):
+              print("IOS_ACTION=BUILD_IN_PROGRESS_"+str(bj.pk)+"_AUTOSUBMIT_ENABLED",flush=True)
+          elif ib and ib.external_build_id:
+              print("IOS_ACTION=BLOCKED_INVALID_BUILD_STATE",flush=True)
+          else:
+              if ib is None: ib=Build.objects.create(release=ios,platform="ios",status="queued")
+              else:
+                  ib.status="queued"
+                  ib.logs=""
+                  ib.save(update_fields=["status","logs","updated_at"])
+              job=enqueue_job("build_ios",app=app,release=ios,build=ib,agent=True,platform="macos")
+              print("IOS_ACTION=QUEUED_CLOUD_MAC_BUILD_"+str(job.pk)+"_AUTO_UPLOAD_SUBMIT_ENABLED",flush=True)
+          PY
+          REMOTE
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            printf '\nWorkflow stage failed with exit code %s; refer to Actions logs.\n' "$RC" >> "$STATUS"
+          fi
+          tail -c 10000 "$STATUS"
+          { printf 'Store submission job: %s\n\n' "$GITHUB_RUN_ID"; tail -c 11000 "$STATUS"; } | jq -Rs '{body: .}' > "$RUNNER_TEMP/issue.json"
+          curl --silent --show-error --fail-with-body -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" -H "Content-Type: application/json" --data-binary @"$RUNNER_TEMP/issue.json" "https://api.github.com/repos/hsdarestani/publisher/issues/113/comments" > /dev/null
+          test "$RC" -eq 0

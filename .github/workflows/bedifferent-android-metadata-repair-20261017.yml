@@ -1,0 +1,101 @@
+name: BE DIFFERENT Android listing repair
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-android-metadata-repair-20261017.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Repair missing Play short descriptions before Android 1.2.1 release
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-google-copy-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-12-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from django.db import transaction
+          from apps.publisher.models import MobileApp,AppLocalization
+          from apps.integrations.google_play import GooglePlayClient
+          a=MobileApp.objects.get(slug='be-different')
+          assert a.package_name=='com.smarbiz.bedifferent'
+          defaults={
+             'de-DE':'Training, Regeneration und Fortschritt an einem Ort.',
+             'en-US':'Track workouts, recovery and progress with BE DIFFERENT.'
+          }
+          with transaction.atomic():
+             locs=list(AppLocalization.objects.select_for_update().filter(app=a))
+             assert {'de-DE','en-US'}.issubset({l.locale for l in locs}), 'Missing DE/EN Publisher localizations; abort'
+             for loc in locs:
+                before=loc.short_description or loc.subtitle
+                if not before and loc.locale in defaults:
+                    loc.short_description=defaults[loc.locale]
+                    loc.save(update_fields=['short_description','updated_at'])
+                current=(loc.short_description or loc.subtitle).strip()
+                if not current or len(current)>80:
+                    raise RuntimeError('Missing or invalid shortDescription in '+loc.locale)
+                if not loc.title.strip() or not loc.full_description.strip():
+                    raise RuntimeError('Incomplete Publisher locale '+loc.locale)
+                print('LOCALIZATION_OK='+loc.locale+' title_len='+str(len(loc.title))+' short_len='+str(len(current))+' full_len='+str(len(loc.full_description)),flush=True)
+          c=GooglePlayClient(a.google_account)
+          edit=None
+          try:
+             edit=c._open_edit(a.package_name)
+             path='/applications/'+c._q(a.package_name)+'/edits/'+edit.edit_id+'/listings'
+             remote=c._edit_request(edit,'GET',path).get('listings',[])
+             by_locale={v.get('language'):v for v in remote}
+             for locale,short in defaults.items():
+                r=by_locale.get(locale) or {}
+                loc=next(l for l in locs if l.locale==locale)
+                title=r.get('title') or loc.title
+                full=r.get('fullDescription') or loc.full_description
+                assert title and full and len(title)<=50 and len(full)<=4000
+                if r.get('shortDescription')==short:
+                    print('GOOGLE_LISTING_ALREADY_OK='+locale,flush=True)
+                    continue
+                payload={'title':title,'shortDescription':short,'fullDescription':full,'video':r.get('video') or ''}
+                c._edit_request(edit,'PUT',path+'/'+c._q(locale),json_body=payload)
+                print('GOOGLE_LISTING_UPDATED='+locale,flush=True)
+             c._validate_edit(edit)
+             result=c._commit_edit(edit)
+             edit=None
+             print('GOOGLE_LISTING_COMMIT=SUCCESS',flush=True)
+             if isinstance(result,dict) and result.get('_changes_not_sent_for_review'):
+                 print('GOOGLE_LISTING_REQUIRES_MANUAL_SEND=true',flush=True)
+          finally:
+             if edit is not None:
+                 c._safe_delete_edit(edit)
+          PY
+          REMOTE

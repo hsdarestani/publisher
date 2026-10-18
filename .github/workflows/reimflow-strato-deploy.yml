@@ -340,6 +340,26 @@ jobs:
               assert not rejected.intersection(str(x.get("word","")).casefold() for x in items),"Phonetically weak Ferrari matches passed"
           PY
           done
+      - name: Diagnose isolated Reimflow API after failed live quality check
+        if: failure()
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.HOST }}
+          DEPLOY_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/reimflow-deploy-key"
+          if [ ! -s "$KEY" ] || [ -z "$DEPLOY_HOST" ]; then
+            echo "Deployment SSH unavailable for API log diagnosis."
+            exit 0
+          fi
+          PORT="${DEPLOY_PORT:-22}"
+          if [ -n "$DEPLOY_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/reimflow-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$DEPLOY_HOST"             'cd /opt/reimflow && docker compose logs --since=12m --tail=140 api 2>&1 | grep -E "rhyme upstream:|rhyme request failed:|rhyme quality gate:|Reimflow API listening" || true'
       - name: Verify public domain and AI health
         shell: bash
         run: |

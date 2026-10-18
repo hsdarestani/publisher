@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-18 Ashkan-style clarity redesign: hsdarestani/pwyw@6243c33f2daa0299571be5ed3c298908fba03c74 CI 39148914609 PASS.
+# PWYW compact merchant UI QA verified at b0e76a397e39bc2c89ac68577b03056c21d54fdb
 on:
   push:
     branches: [main]

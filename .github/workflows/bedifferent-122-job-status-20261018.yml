@@ -83,3 +83,5 @@ jobs:
           REMOTE
 
 # Read-only recheck of finalized native release after the successful cloud builds.
+
+# Refresh confirmed store submission state on 2026-10-18.

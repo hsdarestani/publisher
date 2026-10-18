@@ -425,8 +425,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261016-async1')"
-              if [[ "$SITE" != *'app.js?v=20261016-async1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261019-de1')"
+              if [[ "$SITE" != *'app.js?v=20261019-de1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi
@@ -465,14 +465,14 @@ jobs:
                 exit 1
               fi
               echo "Recording WAV duration and robust HTTP analysis errors: verified"
-              OFFLINE_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-fallback.js?v=20261015-rhyme1')"
-              if [[ "$SITE" != *'rhyme-fallback.js?v=20261015-rhyme1'* ]] || [[ "$APP_JS" != *'Vorschläge ohne KI-Prüfung'* ]] || [[ "$OFFLINE_JS" != *'ReimflowOfflineRhymes'* ]]; then
+              OFFLINE_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-fallback.js?v=20261019-de1')"
+              if [[ "$SITE" != *'rhyme-fallback.js?v=20261019-de1'* ]] || [[ "$APP_JS" != *'Vorschläge ohne KI-Prüfung'* ]] || [[ "$OFFLINE_JS" != *'ReimflowOfflineRhymes'* ]]; then
                 echo "::error::Rhyme search offline recovery is not deployed."
                 exit 1
               fi
               echo "Rhyme search offline recovery: verified"
-              PREVIEW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-previews.js?v=20261015-phrase2')"
-              if [[ "$SITE" != *'rhyme-previews.js?v=20261015-phrase2'* ]] || [[ "$PREVIEW_JS" != *'ReimflowRhymePreviews'* ]] || [[ "$APP_JS" != *'Sofort-Ideen fürs Endwort'* ]]; then
+              PREVIEW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-previews.js?v=20261019-de1')"
+              if [[ "$SITE" != *'rhyme-previews.js?v=20261019-de1'* ]] || [[ "$PREVIEW_JS" != *'ReimflowRhymePreviews'* ]] || [[ "$APP_JS" != *'Sofort-Ideen fürs Endwort'* ]]; then
                 echo "::error::Immediate phrase and anchor rhyme previews are not deployed."
                 exit 1
               fi

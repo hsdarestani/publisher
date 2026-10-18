@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW compact merchant UI QA verified at b0e76a397e39bc2c89ac68577b03056c21d54fdb
+# PWYW Persian merchant heading hotfix 39b752ac848c42efad7fd7f117cef4b1247cf03e
 on:
   push:
     branches: [main]

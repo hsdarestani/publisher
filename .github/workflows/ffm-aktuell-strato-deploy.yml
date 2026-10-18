@@ -1,4 +1,4 @@
-# Deployment request: FFM modal close toolbar 4eab19d 2026-10-18
+# Deployment request: FFM phase1 location action features f6e41ff 2026-10-18
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

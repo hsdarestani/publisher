@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW 2026-10-18 one-step campaign results: hsdarestani/pwyw@78438f1fd24eefb26b76cc35777d17dd54b8e15f CI 39146957125 PASS.
+# PWYW 2026-10-18 Ashkan-style clarity redesign: hsdarestani/pwyw@6243c33f2daa0299571be5ed3c298908fba03c74 CI 39148914609 PASS.
 on:
   push:
     branches: [main]

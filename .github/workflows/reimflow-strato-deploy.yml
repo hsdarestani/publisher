@@ -290,7 +290,7 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
-      - name: Require independently reviewed quality for two real searches
+      - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash
         run: |
           set -euo pipefail
@@ -331,12 +331,10 @@ jobs:
           assert data.get("review_model"),"Second model must judge every result"
           assert all(x.get("strength") in ("stark","brauchbar") for x in items)
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
-          if query=="Jude Bellingham":
-              assert len(items)>=1,"Expected independently reviewed Jude Bellingham rhymes"
-          if query=="Blue paper":
-              assert len(items)>=2,"Expected multiple quality-reviewed paper rhymes, not an empty result"
-              assert any(x.get("scope")=="end_word" for x in items),"Expected final word rhymes"
-              assert any(x.get("scope") in ("full_phrase","phrase_variation") for x in items),"Expected meaningful multiword lyric matches"
+          assert all(x.get("german_valid") is True for x in items),"Non-German or unverified rhyme passed the language gate"
+          assert all(x.get("register")!="Englisch/Code-Switch" for x in items),"English code-switch escaped into German-only suggestions"
+          # Foreign input is allowed, but German-only mode may have zero legitimate rhymes.
+          # Never force English suggestions to satisfy a result-count assertion.
           if query=="Blue Ferrari":
               rejected={"toyota","karaoke","marinade","batterie","fabriki"}
               assert not rejected.intersection(str(x.get("word","")).casefold() for x in items),"Phonetically weak Ferrari matches passed"
@@ -361,7 +359,11 @@ jobs:
                 echo "::error::Real community client missing after deploy."
                 exit 1
               fi
-              echo "Reimflow site: OK"
+              if [[ "$SITE" != *"app.js?v=20261019-de1"* ]]; then
+                echo "::error::German-only rhyme client is missing from the deployed site."
+                exit 1
+              fi
+              echo "Reimflow site: OK (German-only client verified)"
               echo "API status: $HEALTH"
               # Verify the source deployed with the themed dark search skeleton.
               LOADING_CSS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/sonic-atelier.css?v=20261014-de1')"

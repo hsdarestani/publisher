@@ -296,7 +296,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for QUERY in "Blue Ferrari" "Blue Talisman" "Blue paper" "Jude Bellingham"; do
+          for QUERY in "Blue Ferrari" "Blue Talisman" "Blue paper" "Jude Bellingham" "Abendhimmel"; do
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
@@ -335,6 +335,13 @@ jobs:
           assert all(x.get("strength") in ("stark","brauchbar") for x in items)
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
           assert all(x.get("german_valid") is True for x in items),"Non-German or unverified rhyme passed the language gate"
+          if query=="Abendhimmel":
+              times=data.get("timing_ms") or {}
+              assert all(isinstance(times.get(stage),int) and times[stage]>=0
+                         for stage in ("generation","review")),"Missing cold AI latency measurements"
+              print("COLD GERMAN RHYME GENERATION ms:",times["generation"],
+                    "INDEPENDENT REVIEW ms:",times["review"],
+                    "TOTAL ms:",times["generation"]+times["review"])
           assert all(x.get("register")!="Englisch/Code-Switch" for x in items),"English code-switch escaped into German-only suggestions"
           # Foreign input is allowed, but German-only mode may have zero legitimate rhymes.
           # Never force English suggestions to satisfy a result-count assertion.

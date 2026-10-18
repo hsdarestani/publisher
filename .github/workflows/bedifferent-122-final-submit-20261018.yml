@@ -1,0 +1,154 @@
+name: BE DIFFERENT 1.2.2 finalize Apple and verify Google
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bedifferent-122-final-submit-20261018.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 14
+    steps:
+      - name: Safely replace older Apple pending review and submit redesigned build 14
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-final-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-final-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE' | tee "$RUNNER_TEMP/bd-final-status.txt"
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import time
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug="be-different")
+          rel=Release.objects.get(app=app,version_name="1.2.2",build_number=14)
+          assert rel.source_commit=="2a5843d389fce98838601c196d000492cdf70a13", "Wrong source commit: refused to submit"
+          builds={}
+          for platform in ("android","ios"):
+              b=Build.objects.filter(release=rel,platform=platform,status="succeeded").order_by("-pk").first()
+              if not b: raise RuntimeError("No successful "+platform+" build for redesigned 1.2.2")
+              builds[platform]=b
+          assert bool(builds["ios"].external_build_id), "iOS build 14 not uploaded/processed in App Store Connect"
+          print("TARGET_OK=BE DIFFERENT 1.2.2 (14); redesign source verified",flush=True)
+          google=Submission.objects.filter(release=rel,platform="android").first()
+          print("ANDROID_PUBLISHER="+str({"state":google.state if google else None}),flush=True)
+          from apps.integrations.google_play import GooglePlayClient
+          gp=GooglePlayClient(app.google_account)
+          ed=gp._open_edit(app.package_name)
+          try:
+              data=gp._edit_request(ed,"GET",f"/applications/{gp._q(app.package_name)}/edits/{ed.edit_id}/tracks/production")
+              versions=[{"name":v.get("name"),"status":v.get("status"),"versionCodes":v.get("versionCodes")} for v in data.get("releases",[])]
+              print("ANDROID_PRODUCTION="+str(versions),flush=True)
+              android_live=any("14" in [str(code) for code in v.get("versionCodes",[])] and v.get("name")=="1.2.2" for v in versions)
+              # VersionCode could differ from Publisher's build_number. A previous successful submission is sufficient to avoid duplicate uploading.
+          finally:
+              gp._safe_delete_edit(ed)
+          if not google or google.state not in ("in_review","approved","live"):
+              prior=Job.objects.filter(release=rel,type="submit_google",status__in=("queued","running")).first()
+              if not prior:
+                  job=enqueue_job("submit_google",app=app,release=rel,build=builds["android"])
+                  print("ANDROID_ACTION=QUEUED_SUBMIT_"+str(job.pk),flush=True)
+              else: print("ANDROID_ACTION=EXISTING_RUNNING_"+str(prior.pk),flush=True)
+          else: print("ANDROID_ACTION=ALREADY_SUBMITTED",flush=True)
+          c=AppleStoreClient(app.apple_account)
+          apple_app=c.find_app(app.bundle_id)
+          app_id=str(apple_app["id"])
+          all_versions=c.list_versions(app_id)
+          version122=next((v for v in all_versions if v.get("attributes",{}).get("versionString")=="1.2.2"),None)
+          old=next((v for v in all_versions if v.get("attributes",{}).get("versionString")=="1.2.1"),None)
+          print("APPLE_BEFORE="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState")} for v in all_versions[:10]]),flush=True)
+          existing=Submission.objects.filter(release=rel,platform="ios").first()
+          if existing and existing.state in ("in_review","approved","live") and version122:
+              print("APPLE_ACTION=ALREADY_SUBMITTED_"+existing.state,flush=True)
+          else:
+              if old and not version122 and old.get("attributes",{}).get("appStoreState") in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                  canceled=[]
+                  for state in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                      for sub in c.list_review_submissions(app_id,state):
+                          item,_=c._review_submission_matches(sub,old["id"])
+                          if item:
+                              c.cancel_review_submission(sub["id"])
+                              canceled.append(str(sub["id"]))
+                  print("APPLE_CANCELED_OBSOLETE_121_REVIEWS="+str(canceled),flush=True)
+                  if not canceled:
+                      raise RuntimeError("1.2.1 appears under review, but no matching review submission; refusing unsafe change")
+                  for attempt in range(50):
+                      versions=c.list_versions(app_id)
+                      state121=next((v.get("attributes",{}).get("appStoreState") for v in versions if v.get("attributes",{}).get("versionString")=="1.2.1"),None)
+                      if state121 not in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                          print("APPLE_OLD_STATE_AFTER_CANCEL="+str(state121),flush=True)
+                          break
+                      time.sleep(3)
+                  else:
+                      raise RuntimeError("Apple has not released older 1.2.1 review slot")
+              exact=c.ensure_version(app_id,rel.version_name)
+              print("APPLE_VERSION_PREPARED="+str({"id":exact["id"],"version":exact.get("attributes",{}).get("versionString"),"state":exact.get("attributes",{}).get("appStoreState")}),flush=True)
+              running=Job.objects.filter(release=rel,type="submit_apple",status__in=("queued","running","succeeded")).order_by("-pk").first()
+              if running:
+                  print("APPLE_ACTION=EXISTING_JOB_"+str(running.pk)+"_"+running.status,flush=True)
+                  job=running
+              else:
+                  job=enqueue_job("submit_apple",app=app,release=rel,build=builds["ios"])
+                  print("APPLE_ACTION=QUEUED_SUBMIT_"+str(job.pk),flush=True)
+              for _ in range(110):
+                  job.refresh_from_db()
+                  if job.status in ("succeeded","failed","cancelled"): break
+                  time.sleep(3)
+              job.refresh_from_db()
+              print("APPLE_SUBMIT_JOB="+str({"id":job.pk,"status":job.status,"error_tail":(job.error or "")[-400:] if job.status=="failed" else ""}),flush=True)
+          apple_sub=Submission.objects.filter(release=rel,platform="ios").first()
+          google_sub=Submission.objects.filter(release=rel,platform="android").first()
+          print("FINAL_SUBMISSIONS="+str({"ios":apple_sub.state if apple_sub else None,"ios_external_id":apple_sub.external_id if apple_sub else None,"android":google_sub.state if google_sub else None}),flush=True)
+          final_versions=c.list_versions(app_id)
+          print("APPLE_FINAL_VERSION122="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState")} for v in final_versions if v.get("attributes",{}).get("versionString")=="1.2.2"]),flush=True)
+          PY
+          REMOTE
+      - name: Report verified submission or blocker
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          {
+            echo "### Apple 1.2.2 finalize + Google Production verification — workflow $GITHUB_RUN_ID"
+            echo '~~~'
+            if [ -f "$RUNNER_TEMP/bd-final-status.txt" ]; then
+              grep -E '^(TARGET_OK|ANDROID_PUBLISHER|ANDROID_PRODUCTION|ANDROID_ACTION|APPLE_BEFORE|APPLE_CANCELED_OBSOLETE_121_REVIEWS|APPLE_OLD_STATE_AFTER_CANCEL|APPLE_VERSION_PREPARED|APPLE_ACTION|APPLE_SUBMIT_JOB|FINAL_SUBMISSIONS|APPLE_FINAL_VERSION122)=' "$RUNNER_TEMP/bd-final-status.txt" || true
+            else
+              echo "NO REMOTE STATUS: workflow did not reach Publisher"
+            fi
+            echo '~~~'
+            echo "See GitHub Actions run for any error details."
+          } > "$RUNNER_TEMP/report.md"
+          gh issue comment 114 -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/report.md"

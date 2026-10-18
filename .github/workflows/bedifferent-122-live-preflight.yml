@@ -1,0 +1,97 @@
+name: BE DIFFERENT 1.2.2 live release preflight
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bedifferent-122-live-preflight.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Inspect release 1.2.2 and both stores
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-preflight-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-preflight-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE' | tee "$RUNNER_TEMP/bd-preflight-status.txt"
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          app = MobileApp.objects.get(slug="be-different")
+          r = Release.objects.get(app=app, version_name="1.2.2", build_number=14)
+          print("RELEASE="+str({"id":r.pk,"status":r.status,"source":r.source_commit,"auto_submit":r.auto_submit,"track":r.android_track}),flush=True)
+          for b in Build.objects.filter(release=r).order_by("platform","-pk"):
+              print("BUILD="+str({"platform":b.platform,"id":b.pk,"status":b.status,"commit":b.commit_sha,"apple_uploaded":bool(b.external_build_id)}),flush=True)
+          for j in Job.objects.filter(release=r).order_by("-pk")[:15]:
+              print("JOB="+str({"id":j.pk,"type":j.type,"status":j.status,"error_tail":(j.error or "")[-200:] if j.status=="failed" else ""}),flush=True)
+          for s in Submission.objects.filter(release=r):
+              print("SUBMISSION="+str({"platform":s.platform,"state":s.state,"external_id":s.external_id}),flush=True)
+          try:
+              from apps.integrations.apple_store import AppleStoreClient
+              c = AppleStoreClient(app.apple_account)
+              record=c.find_app(app.bundle_id)
+              versions=c.list_versions(str(record["id"]))
+              print("APPLE_VERSIONS="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState"),"id":v.get("id")} for v in versions[:12]]),flush=True)
+              for state in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                  subs=c.list_review_submissions(str(record["id"]),state)
+                  print("APPLE_REVIEWS_"+state+"="+str([{"id":s.get("id"),"state":s.get("attributes",{}).get("state")} for s in subs[:8]]),flush=True)
+          except Exception as e:
+              print("APPLE_CHECK_ERROR="+type(e).__name__+":"+str(e)[:180],flush=True)
+          try:
+              from apps.integrations.google_play import GooglePlayClient
+              c=GooglePlayClient(app.google_account)
+              edit=c.create_edit(app.package_name)
+              track=c._edit_request(edit,"GET",f"/applications/{c._q(app.package_name)}/edits/{edit.edit_id}/tracks/production")
+              print("GOOGLE_PRODUCTION="+str([{"name":v.get("name"),"status":v.get("status"),"versionCodes":v.get("versionCodes")} for v in track.get("releases",[])]),flush=True)
+              c._safe_delete_edit(edit)
+          except Exception as e:
+              print("GOOGLE_CHECK_ERROR="+type(e).__name__+":"+str(e)[:180],flush=True)
+          PY
+          REMOTE
+      - name: Report only release data to tracking issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "### Release preflight — workflow $GITHUB_RUN_ID"
+            echo '~~~'
+            if [ -f "$RUNNER_TEMP/bd-preflight-status.txt" ]; then
+              grep -E '^(RELEASE|BUILD|JOB|SUBMISSION|APPLE_VERSIONS|APPLE_REVIEWS_|APPLE_CHECK_ERROR|GOOGLE_PRODUCTION|GOOGLE_CHECK_ERROR)=' "$RUNNER_TEMP/bd-preflight-status.txt" | tail -n 45 || true
+            else
+              echo 'PRE-FLIGHT FAILED BEFORE RELEASE INSPECTION'
+            fi
+            echo '~~~'
+          } > "$RUNNER_TEMP/report.md"
+          gh issue comment 114 -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/report.md"

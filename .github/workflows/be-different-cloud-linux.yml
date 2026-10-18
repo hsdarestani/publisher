@@ -66,7 +66,7 @@ jobs:
           for attempt in 1 2 3 4; do
             echo "Installing pinned NDK attempt $attempt/4"
             rm -rf "$ndk_dir" "$sdk/.temp"/*ndk* 2>/dev/null || true
-            if yes | "$manager" --sdk_root="$sdk" --install "ndk;$ndk_version" >/tmp/bd-ndk-install.log 2>&1; then
+            if "$manager" --sdk_root="$sdk" --install "ndk;$ndk_version" </dev/null >/tmp/bd-ndk-install.log 2>&1; then
               if [ -f "$ndk_dir/source.properties" ] && grep -q "Pkg.Revision = $ndk_version" "$ndk_dir/source.properties"; then
                 echo "Validated pinned Android NDK $ndk_version"
                 exit 0

@@ -82,7 +82,7 @@ jobs:
             ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
           fi
           ENVFILE="$RUNNER_TEMP/reimflow-strato.env"
-          printf 'OPENAI_MODEL=gpt-5.6-sol\nRHYME_REVIEW_MODEL=gpt-5.6-terra\n' > "$ENVFILE"
+          printf 'OPENAI_MODEL=gpt-5.6-sol\nRHYME_REVIEW_MODEL=gpt-5.6-terra\nREIMFLOW_RHYME_EFFORT=low\n' > "$ENVFILE"
           if [ -n "$OPENAI_API_KEY" ]; then
             printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$ENVFILE"
           fi
@@ -327,6 +327,7 @@ jobs:
           query=sys.argv[2]
           items=data.get("rhymes") or []
           print("Review:",query,"candidates approved:",len(items),
+                "timing_ms:",data.get("timing_ms"),
                 "generator:",data.get("model"),"reviewer:",data.get("review_model"),
                 "accepted words:",", ".join(str(x.get("word")) for x in items))
           assert data.get("ok") is True and data.get("quality_reviewed") is True
@@ -381,7 +382,7 @@ jobs:
                 echo "::error::Real community client missing after deploy."
                 exit 1
               fi
-              if [[ "$SITE" != *"app.js?v=20261019-de1"* ]]; then
+              if [[ "$SITE" != *"app.js?v=20261019-fast1"* ]]; then
                 echo "::error::German-only rhyme client is missing from the deployed site."
                 exit 1
               fi
@@ -425,8 +426,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261019-de1')"
-              if [[ "$SITE" != *'app.js?v=20261019-de1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261019-fast1')"
+              if [[ "$SITE" != *'app.js?v=20261019-fast1'* ]] || ! grep -Fq '$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi

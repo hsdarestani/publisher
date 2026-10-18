@@ -1,4 +1,4 @@
-# Deployment request: FFM Admin simpler editorial 07278a7 (2026-10-18)
+# Deployment request: FFM readable 3D default map 6b8f91d (2026-10-18)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

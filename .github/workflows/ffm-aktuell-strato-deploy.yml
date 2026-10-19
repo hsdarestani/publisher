@@ -1,4 +1,5 @@
-# Deployment request: FFM phase 4b single-use coupons f494317 (2026-10-19)
+# User-requested FFM Aktuell release of independently CI-validated PR #48.
+# Source commit 1fea9b1c5b7d982f8fd2cc0b4ca4b697d8bb1345; PR is intentionally unmerged.
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:
@@ -19,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/ffm-aktuell
-          ref: main
+          ref: 1fea9b1c5b7d982f8fd2cc0b4ca4b697d8bb1345
           path: ffm-src
       - uses: actions/setup-node@v4
         with:
@@ -28,6 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ffm-src
+          test "$(git rev-parse HEAD)" = '1fea9b1c5b7d982f8fd2cc0b4ca4b697d8bb1345'
           npm install --no-audit --no-fund
           npm test
           npm run typecheck
@@ -82,8 +84,27 @@ jobs:
           NETWORK="$(docker inspect "$CADDY_ID" --format '{{range $name, $network := .NetworkSettings.Networks}}{{println $name}}{{end}}' | head -n1)"
           docker network inspect "$NETWORK" >/dev/null
           mkdir -p /opt/ffm-aktuell/backups
+          umask 077
+          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          BACKUP="/opt/ffm-aktuell/backups/pre-pr48-${STAMP}"
+          OLD_IMAGE="$(docker inspect ffm-aktuell-web --format '{{.Image}}' 2>/dev/null || true)"
+          if [ -n "$OLD_IMAGE" ]; then docker image tag "$OLD_IMAGE" "ffm-aktuell-web:rollback-${STAMP}"; fi
+          restore_web() {
+            rc=$?
+            trap - ERR
+            echo "::error::FFM deploy failed; restoring prior isolated source and web image where available."
+            if [ -f "${BACKUP}.tar.gz" ]; then tar -xzf "${BACKUP}.tar.gz" -C /opt/ffm-aktuell || true; fi
+            cd /opt/ffm-aktuell
+            if [ -n "$OLD_IMAGE" ]; then
+              docker image tag "$OLD_IMAGE" ffm-aktuell-web:latest || true
+              docker compose up -d --no-deps --no-build --force-recreate web || true
+            fi
+            exit "$rc"
+          }
+          trap restore_web ERR
           if [ -f /opt/ffm-aktuell/package.json ]; then
-            tar --exclude=backups --exclude=.env -czf "/opt/ffm-aktuell/backups/previous-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" -C /opt/ffm-aktuell . || true
+            tar --exclude=backups --exclude=.env -czf "${BACKUP}.tar.gz" -C /opt/ffm-aktuell .
+            test -s "${BACKUP}.tar.gz"
           fi
           tar -xzf /tmp/ffm-src.tar.gz -C /opt/ffm-aktuell --strip-components=1
           cd /opt/ffm-aktuell
@@ -110,6 +131,17 @@ jobs:
             printf "ALTER ROLE ffm PASSWORD '\''%s'\'';\n" "$POSTGRES_PASSWORD" | psql -X -v ON_ERROR_STOP=1 -U ffm -d ffm >/dev/null
           ' </dev/null
           echo "Independent FFM PostgreSQL role credentials synchronized."
+          # Essential restore points are captured before any schema mutation.
+          docker compose exec -T db pg_dump -Fc -U ffm -d ffm </dev/null > "${BACKUP}-database.dump"
+          test -s "${BACKUP}-database.dump"
+          chmod 600 "${BACKUP}-database.dump"
+          # Independent private volume backup; never touch Publisher or other tenants.
+          if docker compose ps -q web | grep -q .; then
+            docker compose exec -T web tar -czf - -C /app uploads </dev/null > "${BACKUP}-media.tar.gz"
+            test -s "${BACKUP}-media.tar.gz"
+            chmod 600 "${BACKUP}-media.tar.gz"
+          fi
+          echo "FFM source, DB and media backups secured before migration."
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/seed.sql
           # Preserve real OSM source metadata and review flags. The SQL is idempotent
@@ -163,6 +195,8 @@ jobs:
           docker exec "$CADDY_ID" wget -qO- http://ffm-aktuell-web:3000/api/health | grep -q '"status":"ok"'
           docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
           echo "FFM and Publisher internal health OK."
+          trap - ERR
+          echo "Deployed PR #48 source commit 1fea9b1c5b7d982f8fd2cc0b4ca4b697d8bb1345; FFM backups retained."
           REMOTE
           ORIGIN=000
           for i in $(seq 1 14); do

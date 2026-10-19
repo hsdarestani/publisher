@@ -89,3 +89,5 @@ jobs:
           )
           ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"
           ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"
+
+# Post-unblock verification: 1.0.39 review state after Apple 1.0.38 withdrawal

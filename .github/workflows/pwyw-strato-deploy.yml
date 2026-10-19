@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW multi-goal merchant UX efa6b38bf1b7b12019a6ffd30cb0d75f95acb330 QA 39231487128 passed.
+# PWYW immersive arcade worlds 3649b57347dc34f8452d176b3a2a83c56fb08e44 CI 39236063358 PASS
 on:
   push:
     branches: [main]

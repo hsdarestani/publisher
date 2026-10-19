@@ -68,7 +68,7 @@ jobs:
             err=j.error or ''
             category=','.join(k for k in ('token','auth','unauthorized','forbidden','permission','credentials','cert','not found','not_found','400','401','403','404','409','429','timeout','rate limit','duplicate','processing','review','invalid','expired','missing','itunes','asc','apple','google','api') if k in err.lower())
             print('JOB',kind,j.pk,j.status,'updated',getattr(j,'updated_at','unknown'),'error_present',bool(err),'categories',category)
-PY
+          PY
           )
           ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"
           ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

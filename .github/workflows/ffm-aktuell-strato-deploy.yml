@@ -136,10 +136,12 @@ jobs:
           test -s "${BACKUP}-database.dump"
           chmod 600 "${BACKUP}-database.dump"
           # Independent private volume backup; never touch Publisher or other tenants.
-          if docker compose ps -q web | grep -q .; then
+          if docker compose exec -T web test -d /app/uploads </dev/null >/dev/null 2>&1; then
             docker compose exec -T web tar -czf - -C /app uploads </dev/null > "${BACKUP}-media.tar.gz"
             test -s "${BACKUP}-media.tar.gz"
             chmod 600 "${BACKUP}-media.tar.gz"
+          else
+            echo "Legacy web has no uploads directory; no in-container user media to back up."
           fi
           echo "FFM source, DB and media backups secured before migration."
           docker compose exec -T db psql -v ON_ERROR_STOP=1 -U ffm -d ffm < db/schema.sql

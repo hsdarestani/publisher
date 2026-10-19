@@ -72,7 +72,19 @@ jobs:
            sanitized=re.sub(r'(?i)(bearer\\s+|token[=:]\\s*|password[=:]\\s*)[^\\s,;]+',r'\\1[REDACTED]',err)
            sanitized=re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}','[EMAIL]',sanitized)
            sanitized=re.sub(r'(https?://)[^\\s]+','[URL]',sanitized)
-           print('APPLE_SUBMISSION_ERROR',sanitized.replace('\\n',' ')[:650])
+           print('APPLE_SUBMISSION_ERROR',re.sub(r'\\s+',' ',sanitized)[:1300])
+          from apps.integrations.apple_store import AppleStoreClient
+          client=AppleStoreClient(app.apple_account)
+          asc=client.find_app(app.bundle_id)
+          for v in client.list_versions(asc['id']):
+           at=v.get('attributes',{})
+           if at.get('versionString') in ('1.0.37','1.0.38','1.0.39'):
+            print('APP_VERSION',at.get('versionString'),at.get('appStoreState'),at.get('appVersionState'),v['id'])
+          for status in ('WAITING_FOR_REVIEW','IN_REVIEW','READY_FOR_REVIEW','UNRESOLVED_ISSUES'):
+           subs=client.list_review_submissions(asc['id'],status)
+           for sub in subs[:8]:
+            its=client.list_review_submission_items(sub['id'])
+            print('APPLE_REVIEW',status,'items',len(its),'version_ids',[str(x.get('relationships',{}).get('appStoreVersion',{}).get('data',{}).get('id','')) for x in its])
           PY
           )
           ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"

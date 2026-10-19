@@ -68,6 +68,11 @@ jobs:
             err=j.error or ''
             category=','.join(k for k in ('token','auth','unauthorized','forbidden','permission','credentials','cert','not found','not_found','400','401','403','404','409','429','timeout','rate limit','duplicate','processing','review','invalid','expired','missing','itunes','asc','apple','google','api') if k in err.lower())
             print('JOB',kind,j.pk,j.status,'updated',getattr(j,'updated_at','unknown'),'error_present',bool(err),'categories',category)
+          if err and kind=='submit_apple':
+           sanitized=re.sub(r'(?i)(bearer\\s+|token[=:]\\s*|password[=:]\\s*)[^\\s,;]+',r'\\1[REDACTED]',err)
+           sanitized=re.sub(r'(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}','[EMAIL]',sanitized)
+           sanitized=re.sub(r'(https?://)[^\\s]+','[URL]',sanitized)
+           print('APPLE_SUBMISSION_ERROR',sanitized.replace('\\n',' ')[:650])
           PY
           )
           ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"

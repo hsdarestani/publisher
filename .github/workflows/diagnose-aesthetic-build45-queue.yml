@@ -53,21 +53,21 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           PY_CODE=$(cat <<'PY'
-import json, os, re
-from apps.publisher.models import MobileApp, Release, Submission
-app=MobileApp.objects.get(slug='a-esthetic')
-r=Release.objects.get(app=app,version_name='1.0.39',build_number=45)
-print('RELEASE',r.pk,r.status,r.source_commit)
-for p in ('android','ios'):
- b=r.builds.get(platform=p)
- s=Submission.objects.filter(release=r,platform=p).first()
- print('PLATFORM',p,'build',b.status,'external_build_exists',bool(b.external_build_id),'submission',s.state if s else 'absent')
-for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
- js=list(r.jobs.filter(type=kind).order_by('-pk')[:3])
- for j in js:
-  err=j.error or ''
-  category=','.join(k for k in ('token','auth','unauthorized','forbidden','permission','credentials','cert','not found','not_found','400','401','403','404','409','429','timeout','rate limit','duplicate','processing','review','invalid','expired','missing','itunes','asc','apple','google','api') if k in err.lower())
-  print('JOB',kind,j.pk,j.status,'updated',getattr(j,'updated_at','unknown'),'error_present',bool(err),'categories',category)
+          import json, os, re
+          from apps.publisher.models import MobileApp, Release, Submission
+          app=MobileApp.objects.get(slug='a-esthetic')
+          r=Release.objects.get(app=app,version_name='1.0.39',build_number=45)
+          print('RELEASE',r.pk,r.status,r.source_commit)
+          for p in ('android','ios'):
+           b=r.builds.get(platform=p)
+           s=Submission.objects.filter(release=r,platform=p).first()
+           print('PLATFORM',p,'build',b.status,'external_build_exists',bool(b.external_build_id),'submission',s.state if s else 'absent')
+          for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
+           js=list(r.jobs.filter(type=kind).order_by('-pk')[:3])
+           for j in js:
+            err=j.error or ''
+            category=','.join(k for k in ('token','auth','unauthorized','forbidden','permission','credentials','cert','not found','not_found','400','401','403','404','409','429','timeout','rate limit','duplicate','processing','review','invalid','expired','missing','itunes','asc','apple','google','api') if k in err.lower())
+            print('JOB',kind,j.pk,j.status,'updated',getattr(j,'updated_at','unknown'),'error_present',bool(err),'categories',category)
 PY
           )
           ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"

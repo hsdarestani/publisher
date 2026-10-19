@@ -1,0 +1,74 @@
+name: Diagnose Publisher A+ release45 queue
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-aesthetic-build45-queue.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnosis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment: production
+    steps:
+      - name: Prepare current Publisher SSH identity
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/a-esthetic-release-45-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/a-esthetic-release-45-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "PUBLISHER_SSH_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+      - name: Inspect v1.0.39 platform builds and job states
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+import json, os, re
+from apps.publisher.models import MobileApp, Release, Submission
+app=MobileApp.objects.get(slug='a-esthetic')
+r=Release.objects.get(app=app,version_name='1.0.39',build_number=45)
+print('RELEASE',r.pk,r.status,r.source_commit)
+for p in ('android','ios'):
+ b=r.builds.get(platform=p)
+ s=Submission.objects.filter(release=r,platform=p).first()
+ print('PLATFORM',p,'build',b.status,'external_build_exists',bool(b.external_build_id),'submission',s.state if s else 'absent')
+for kind in ('build_android','build_ios','upload_google','upload_apple','submit_apple'):
+ js=list(r.jobs.filter(type=kind).order_by('-pk')[:3])
+ for j in js:
+  err=j.error or ''
+  category=','.join(k for k in ('token','auth','unauthorized','forbidden','permission','credentials','cert','not found','not_found','400','401','403','404','409','429','timeout','rate limit','duplicate','processing','review','invalid','expired','missing','itunes','asc','apple','google','api') if k in err.lower())
+  print('JOB',kind,j.pk,j.status,'updated',getattr(j,'updated_at','unknown'),'error_present',bool(err),'categories',category)
+PY
+          )
+          ENCODED="$(printf '%s' "$PY_CODE" | base64 -w0)"
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

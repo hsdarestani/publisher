@@ -1,3 +1,4 @@
+# Predeployment preflight for FFM PR #48 (read-only; 2026-10-19)
 name: FFM Aktuell — read-only server diagnostics
 on:
   push:

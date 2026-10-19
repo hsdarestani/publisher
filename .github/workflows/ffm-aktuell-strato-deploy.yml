@@ -1,4 +1,4 @@
-# Deployment request: FFM phase 2c private follows f27f151 (2026-10-19)
+# Deployment request: FFM phase 3a private tours d146052 (2026-10-19)
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:

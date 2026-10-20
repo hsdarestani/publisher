@@ -393,8 +393,8 @@ jobs:
                 echo "::error::German-only rhyme client is missing from the deployed site."
                 exit 1
               fi
-              UX_CSS="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/ux-simple.css?v=20261020-1)"
-              if [[ "$SITE" != *'ux-simple.css?v=20261020-1'* ]] || [[ "$SITE" != *'data-page="more"'* ]] || [[ "$UX_CSS" != *'.home-shortcuts'* ]]; then
+              UX_CSS="$(curl -fsSL --max-time 12 https://reimflow.smarbiz.sbs/ux-simple.css?v=20261020-2)"
+              if [[ "$SITE" != *'ux-simple.css?v=20261020-2'* ]] || [[ "$SITE" != *'data-page="more"'* ]] || [[ "$UX_CSS" != *'.home-shortcuts'* ]]; then
                 echo "::error::Simplified Reimflow UX assets and navigation are missing from production."
                 exit 1
               fi

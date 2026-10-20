@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW premium calm redesign 93e29c70491f1df8597d800937d9d5046b8cb7e5 CI 39508831166 PASS
+# PWYW whole-site unified redesign 8b9a1b0a9425f8c668ccb61c3eff0dbdf072efab CI 39511275627 PASS
 on:
   push:
     branches: [main]

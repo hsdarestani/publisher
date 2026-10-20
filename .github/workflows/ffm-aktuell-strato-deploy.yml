@@ -1,7 +1,7 @@
 # FFM Aktuell step: default 3D startup, readable fallback, complete discovery pages and saved events.
-# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39509676809
+# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39510704345
 # Regression tests and PostgreSQL CI are required to pass first.
-# Source commit 19dff3c41ff1c8fdc583612229f58ad0519c1d4a; PR is intentionally unmerged.
+# Source commit e2e33780b64aecfdbf57bb778afa724ce999a9c3; PR is intentionally unmerged.
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/ffm-aktuell
-          ref: 19dff3c41ff1c8fdc583612229f58ad0519c1d4a
+          ref: e2e33780b64aecfdbf57bb778afa724ce999a9c3
           path: ffm-src
       - uses: actions/setup-node@v4
         with:
@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ffm-src
-          test "$(git rev-parse HEAD)" = '19dff3c41ff1c8fdc583612229f58ad0519c1d4a'
+          test "$(git rev-parse HEAD)" = 'e2e33780b64aecfdbf57bb778afa724ce999a9c3'
           npm install --no-audit --no-fund
           npm test
           npm run typecheck
@@ -200,7 +200,7 @@ jobs:
           docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
           echo "FFM and Publisher internal health OK."
           trap - ERR
-          echo "Deployed PR #48 source commit 19dff3c41ff1c8fdc583612229f58ad0519c1d4a; FFM backups retained."
+          echo "Deployed PR #48 source commit e2e33780b64aecfdbf57bb778afa724ce999a9c3; FFM backups retained."
           REMOTE
           ORIGIN=000
           for i in $(seq 1 14); do

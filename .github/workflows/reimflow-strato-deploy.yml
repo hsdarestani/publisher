@@ -42,7 +42,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:

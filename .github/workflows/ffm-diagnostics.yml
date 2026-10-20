@@ -1,4 +1,4 @@
-# Predeployment preflight for FFM PR #48 (read-only; 2026-10-19)
+# Operational setup check for FFM: capacity and provider readiness only (read-only; 2026-10-21)
 name: FFM Aktuell — read-only server diagnostics
 on:
   push:
@@ -47,10 +47,17 @@ jobs:
           echo '=== FFM CONTAINERS ==='
           cd /opt/ffm-aktuell
           docker compose ps -a </dev/null || true
-          echo '=== DATABASE LOGS (sanitized operational output) ==='
-          docker compose logs --tail=55 db </dev/null || true
-          echo '=== WEB LOGS (sanitized operational output) ==='
-          docker compose logs --tail=35 web </dev/null || true
+          echo '=== FFM PROVIDER CONFIGURATION (booleans only) ==='
+          docker compose exec -T web node -e '
+            const e=process.env;
+            console.log(JSON.stringify({
+              googleOAuth:!!(e.GOOGLE_OAUTH_CLIENT_ID&&e.GOOGLE_OAUTH_CLIENT_SECRET),
+              appleOAuth:!!(e.APPLE_SERVICE_ID&&e.APPLE_TEAM_ID&&e.APPLE_KEY_ID&&e.APPLE_PRIVATE_KEY),
+              emailDelivery:!!(e.RESEND_API_KEY&&e.FFM_EMAIL_FROM),
+              scannerConfigured:!!e.CLAMD_HOST
+            }));
+            fetch("http://127.0.0.1:3000/api/media/status").then(async r=>console.log("mediaStatus",r.status,JSON.stringify(await r.json()))).catch(()=>console.log("mediaStatus unavailable"));
+          ' </dev/null
           echo '=== HOST CAPACITY ==='
           free -m
           df -h /opt

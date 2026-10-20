@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW immersive arcade worlds 3649b57347dc34f8452d176b3a2a83c56fb08e44 CI 39236063358 PASS
+# PWYW premium calm redesign 93e29c70491f1df8597d800937d9d5046b8cb7e5 CI 39508831166 PASS
 on:
   push:
     branches: [main]

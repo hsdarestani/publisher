@@ -1,0 +1,210 @@
+name: A+ Esthetic 1.0.40 Build 46 iOS OAuth Fix via Publisher
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-1-0-40-build46-ios-oauth-fix-20261021.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-ios-social-callback-build46
+  cancel-in-progress: false
+
+jobs:
+  ios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: production
+    env:
+      SOURCE_COMMIT: '85b1b9e601a68539c92fb87f0e2d70baea101557'
+      VERSION_NAME: '1.0.40'
+      BUILD_NUMBER: '46'
+    steps:
+      - name: Checkout exactly the fixed A+ Esthetic source
+        uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/a_esthetic
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: esthetic
+      - name: Reject missing OAuth callback in release source
+        run: |
+          set -euo pipefail
+          cd esthetic
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          python3 scripts/test_ios_social_deeplink.py
+          bash -n scripts/build-ios.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          build = Path('scripts/build-ios.sh').read_text()
+          native = Path('scripts/configure_native_camera_permissions.py').read_text()
+          js = Path('www/account-onboarding.js').read_text()
+          assert 'python3 scripts/configure_native_camera_permissions.py' in build
+          assert 'de.aplusesthetic.app' in native
+          assert 'de.aplusesthetic.app' in build
+          assert 'zipfile.ZipFile' in build and 'Payload/' in build
+          assert 'appUrlOpen' in js and '/social-browser/exchange/' in js
+          print('PASS: source, native callback, signed IPA verification, and browser code exchange.')
+          PY
+      - name: Prepare current Publisher SSH identity
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/a-esthetic-release-46-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/a-esthetic-release-46-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "PUBLISHER_SSH_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+
+      - name: Verify Publisher and queue iOS Build 46
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release, Build, Submission
+          from apps.publisher.tasks import enqueue_job
+
+          source=os.environ['SOURCE_COMMIT']
+          version=os.environ['VERSION_NAME']
+          number=int(os.environ['BUILD_NUMBER'])
+          app=MobileApp.objects.get(slug='a-esthetic')
+          assert app.bundle_id=='de.aplusesthetic.app', 'wrong iOS bundle ID'
+          config=app.build_config or {}
+          command=str(config.get('ios_command') or '')
+          assert 'scripts/build-ios.sh' in command, 'Publisher iOS command bypasses the tested build-ios.sh; refuse unsafe release'
+          assert bool(app.apple_account and app.apple_account.configured), 'Apple Store account not configured'
+          existing=Release.objects.filter(app=app,version_name=version,build_number=number).first()
+          if existing and existing.source_commit!=source:
+              raise SystemExit('Build 46 already exists for another commit')
+          print('PRECHECK', 'bundle',app.bundle_id,'command_has_verified_builder',True,'source',source,'version',version,'build',number)
+          notes='Google Anmeldung auf iPhone verbessert. Sichere Rückkehr zur App nach der Anmeldung.'
+          release,created=Release.objects.get_or_create(
+              app=app,version_name=version,build_number=number,
+              defaults={
+                'status':'building','source_branch':'main','source_commit':source,
+                'android_track':'production','android_rollout':1,
+                'ios_release_type':'manual','auto_submit':True,'release_notes':notes,
+              },
+          )
+          if not created:
+              assert release.source_commit==source, 'release commit changed unexpectedly'
+          app.latest_commit_sha=source
+          app.save(update_fields=['latest_commit_sha','updated_at'])
+          for loc in app.localizations.all():
+              loc.release_notes=notes
+              loc.save(update_fields=['release_notes','updated_at'])
+          ios,_=Build.objects.get_or_create(
+              release=release,platform='ios',
+              defaults={'status':'queued','commit_sha':source},
+          )
+          assert ios.commit_sha==source,'existing iOS build points to another commit'
+          active=release.jobs.filter(type='build_ios',status__in=['queued','running','succeeded']).order_by('-pk').first()
+          if ios.status not in ['running','succeeded'] and not active:
+              ios.status='queued'
+              ios.save(update_fields=['status','updated_at'])
+              job=enqueue_job('build_ios',app=app,release=release,build=ios,agent=True,platform='macos')
+              print('QUEUED_BUILD_IOS',job.pk)
+          else:
+              print('BUILD_ALREADY_IN_PROGRESS',ios.status,getattr(active,'pk',None))
+          print('PUBLISHER_RELEASE',release.pk,version,number,source,'created',created)
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell"
+      - name: Start Publisher macOS signing agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml',
+              ref: 'main'
+            });
+      - name: Track signed IPA, Apple upload, and submission
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          for attempt in $(seq 1 225); do
+            PY_CODE=$(cat <<'PY'
+          import os
+          from apps.publisher.models import MobileApp,Release,Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-esthetic')
+          release=Release.objects.get(app=app,version_name=os.environ['VERSION_NAME'],build_number=int(os.environ['BUILD_NUMBER']))
+          ios=release.builds.get(platform='ios')
+          assert release.source_commit==os.environ['SOURCE_COMMIT']
+          def latest(kind):
+              return release.jobs.filter(type=kind).order_by('-pk').first()
+          def active_or_done(kind):
+              job=latest(kind)
+              return bool(job and job.status in ('queued','running','succeeded'))
+          if ios.status=='succeeded' and not ios.external_build_id and not active_or_done('upload_apple'):
+              job=enqueue_job('upload_apple',app=app,release=release,build=ios,agent=True,platform='macos')
+              print('QUEUED_APPLE_UPLOAD',job.pk)
+          upload=latest('upload_apple')
+          submission=Submission.objects.filter(release=release,platform='ios').first()
+          if ios.status=='succeeded' and ios.external_build_id and upload and upload.status=='succeeded' and not submission and not active_or_done('submit_apple'):
+              job=enqueue_job('submit_apple',app=app,release=release,build=ios)
+              print('QUEUED_APPLE_SUBMISSION',job.pk)
+          submission=Submission.objects.filter(release=release,platform='ios').first()
+          states={k:(latest(k).status if latest(k) else 'none') for k in ('build_ios','upload_apple','submit_apple')}
+          print('IOS_RELEASE_STATE','version',release.version_name,'build',release.build_number,'sha',release.source_commit,'ios',ios.status,'uploaded',bool(ios.external_build_id),'submission',submission.state if submission else 'pending','jobs',states)
+          failures=[(key,latest(key).error or '') for key in states if latest(key) and latest(key).status=='failed']
+          if failures:
+              for key,reason in failures:
+                  print('HARD_FAIL',key,reason[:1000])
+          elif submission and submission.state in ('in_review','approved','live'):
+              print('DONE_SUBMITTED',submission.state,submission.external_id)
+          PY
+            )
+            ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+            set +e
+            STATE=$(ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' -e VERSION_NAME='$VERSION_NAME' -e BUILD_NUMBER='$BUILD_NUMBER' web python manage.py shell" 2>&1)
+            RC=$?
+            set -e
+            echo "$STATE"
+            if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+            if printf '%s' "$STATE" | grep -q '^HARD_FAIL '; then exit 1; fi
+            if printf '%s' "$STATE" | grep -q '^DONE_SUBMITTED '; then exit 0; fi
+            if [ $((attempt % 12)) -eq 0 ]; then
+              gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            fi
+            sleep 20
+          done
+          exit 1

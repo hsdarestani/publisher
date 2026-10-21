@@ -59,7 +59,13 @@ jobs:
               webPushConfigured:!!(e.WEB_PUSH_PUBLIC_KEY&&e.WEB_PUSH_PRIVATE_KEY&&e.WEB_PUSH_SUBJECT&&e.PUSH_WORKER_TOKEN)
             }));
             let pushSigningValid=false;
-            try {require("web-push").getVapidHeaders("https://fcm.googleapis.com",e.WEB_PUSH_SUBJECT,e.WEB_PUSH_PUBLIC_KEY,e.WEB_PUSH_PRIVATE_KEY,"aes128gcm");pushSigningValid=true;}catch{}
+            try {
+              const crypto=require("node:crypto"),pub=Buffer.from(e.WEB_PUSH_PUBLIC_KEY,"base64url"),priv=Buffer.from(e.WEB_PUSH_PRIVATE_KEY,"base64url");
+              const jwk={kty:"EC",crv:"P-256",x:pub.subarray(1,33).toString("base64url"),y:pub.subarray(33,65).toString("base64url")};
+              const key=crypto.createPrivateKey({key:{...jwk,d:priv.toString("base64url")},format:"jwk"});
+              const message=Buffer.from("FFM VAPID readiness check");
+              pushSigningValid=crypto.verify("sha256",message,crypto.createPublicKey({key:jwk,format:"jwk"}),crypto.sign("sha256",message,key));
+            }catch{}
             console.log(JSON.stringify({pushSigningValid,schedulerInstalled:require("node:fs").existsSync("/app/start-server.mjs")}));
             fetch("http://127.0.0.1:3000/api/media/status").then(async r=>console.log("mediaStatus",r.status,JSON.stringify(await r.json()))).catch(()=>console.log("mediaStatus unavailable"));
           ' </dev/null

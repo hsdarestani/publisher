@@ -54,8 +54,13 @@ jobs:
               googleOAuth:!!(e.GOOGLE_OAUTH_CLIENT_ID&&e.GOOGLE_OAUTH_CLIENT_SECRET),
               appleOAuth:!!(e.APPLE_SERVICE_ID&&e.APPLE_TEAM_ID&&e.APPLE_KEY_ID&&e.APPLE_PRIVATE_KEY),
               emailDelivery:!!(e.RESEND_API_KEY&&e.FFM_EMAIL_FROM),
-              scannerConfigured:!!e.CLAMD_HOST
+              scannerConfigured:!!e.CLAMD_HOST,
+              aiConfigured:!!e.OPENAI_API_KEY,
+              webPushConfigured:!!(e.WEB_PUSH_PUBLIC_KEY&&e.WEB_PUSH_PRIVATE_KEY&&e.WEB_PUSH_SUBJECT&&e.PUSH_WORKER_TOKEN)
             }));
+            let pushSigningValid=false;
+            try {require("web-push").getVapidHeaders("https://fcm.googleapis.com",e.WEB_PUSH_SUBJECT,e.WEB_PUSH_PUBLIC_KEY,e.WEB_PUSH_PRIVATE_KEY,"aes128gcm");pushSigningValid=true;}catch{}
+            console.log(JSON.stringify({pushSigningValid,schedulerInstalled:require("node:fs").existsSync("/app/start-server.mjs")}));
             fetch("http://127.0.0.1:3000/api/media/status").then(async r=>console.log("mediaStatus",r.status,JSON.stringify(await r.json()))).catch(()=>console.log("mediaStatus unavailable"));
           ' </dev/null
           echo '=== HOST CAPACITY ==='

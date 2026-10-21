@@ -1,0 +1,82 @@
+name: Inspect A+ Esthetic OAuth Fix Build 46 publisher and Apple status
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/a-esthetic-build46-inspect-20261021.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Prepare current Publisher SSH identity
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/a-esthetic-build46-inspect-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/a-esthetic-build46-inspect-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "PUBLISHER_SSH_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+
+      - name: Read current build, signing and upload status
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          import re
+          from apps.publisher.models import MobileApp,Release,Submission
+          app=MobileApp.objects.get(slug='a-esthetic')
+          config=app.build_config or {}
+          print('CONFIG','bundle',app.bundle_id,'ios_command_uses_expected_script','scripts/build-ios.sh' in str(config.get('ios_command') or ''),'ios_artifact',config.get('ios_artifact'),'apple_configured',bool(app.apple_account and app.apple_account.configured))
+          for rel in Release.objects.filter(app=app,version_name__in=('1.0.39','1.0.40')).order_by('-created_at')[:6]:
+              ios=rel.builds.filter(platform='ios').first()
+              sub=Submission.objects.filter(release=rel,platform='ios').first()
+              print('RELEASE',rel.version_name,rel.build_number,'sha',rel.source_commit,'status',rel.status,'ios',ios.status if ios else 'none','external_build',bool(ios and ios.external_build_id),'submission',sub.state if sub else 'none')
+              for kind in ('build_ios','upload_apple','submit_apple'):
+                  job=rel.jobs.filter(type=kind).order_by('-pk').first()
+                  if job:
+                      error=(job.error or '')
+                      error=re.sub(r'(?i)(key|token|secret|password|authorization)=\S+',r'\1=[redacted]',error)
+                      print('JOB',kind,job.pk,job.status,'error',error[:350] if job.status=='failed' else '')
+          if app.apple_account and app.apple_account.configured:
+              from apps.integrations.apple_store import AppleStoreClient
+              client=AppleStoreClient(app.apple_account)
+              record=client.find_app(app.bundle_id)
+              for v in client.list_versions(record['id']):
+                  attributes=v.get('attributes',{})
+                  if attributes.get('versionString') in ('1.0.38','1.0.39','1.0.40'):
+                      print('APPLE_VERSION',attributes.get('versionString'),attributes.get('appStoreState'),attributes.get('appVersionState'))
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

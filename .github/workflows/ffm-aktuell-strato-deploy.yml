@@ -1,7 +1,7 @@
-# FFM Aktuell increment: current entitlements, moderated replies, account recovery and consented local activity.
-# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39758006936
+# FFM Aktuell: bilingual UI, verified keyboard/accessibility fixes, API contracts and isolated nightly operations.
+# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39833527558
 # Regression tests and PostgreSQL CI are required to pass first.
-# Source commit ca05c79551b094455d92ef966eb1d27c165cabfb; PR is intentionally unmerged.
+# Source commit a580110637c1e543837fd442f793a6e1c5283f1e; PR is intentionally unmerged.
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/ffm-aktuell
-          ref: ca05c79551b094455d92ef966eb1d27c165cabfb
+          ref: a580110637c1e543837fd442f793a6e1c5283f1e
           path: ffm-src
       - uses: actions/setup-node@v4
         with:
@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ffm-src
-          test "$(git rev-parse HEAD)" = 'ca05c79551b094455d92ef966eb1d27c165cabfb'
+          test "$(git rev-parse HEAD)" = 'a580110637c1e543837fd442f793a6e1c5283f1e'
           npm ci --no-audit --no-fund
           npm test
           npm run typecheck
@@ -221,7 +221,16 @@ jobs:
           docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null </dev/null
           echo "FFM and Publisher internal health OK."
           trap - ERR
-          echo "Deployed PR #48 source commit ca05c79551b094455d92ef966eb1d27c165cabfb; FFM backups retained."
+          # Application health has passed. Install only FFM-owned operational units.
+          cd /opt/ffm-aktuell
+          install -m 644 ops/ffm-nightly-backup.service ops/ffm-nightly-backup.timer ops/ffm-health.service ops/ffm-health.timer /etc/systemd/system/
+          systemctl daemon-reload
+          systemctl start ffm-nightly-backup.service
+          systemctl enable --now ffm-nightly-backup.timer ffm-health.timer
+          systemctl start ffm-health.service
+          systemctl is-active --quiet ffm-nightly-backup.timer ffm-health.timer
+          echo "FFM daily private backup and five-minute health/freshness timers active."
+          echo "Deployed PR #48 source commit a580110637c1e543837fd442f793a6e1c5283f1e; FFM backups retained."
           REMOTE
           ORIGIN=000
           for i in $(seq 1 14); do

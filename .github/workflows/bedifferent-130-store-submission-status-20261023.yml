@@ -1,0 +1,97 @@
+name: BE DIFFERENT 1.3.0 Store Submission Status
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-130-store-submission-status-20261023.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Read-only Publisher release 26 and native job 657/658 status
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          PORT="${SSH_PORT:-22}"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keyscan -T 12 -p "$PORT" -H "$HOST" > "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          chmod 600 "$HOME/.ssh/known_hosts"
+          REMOTE_ARGS=(-p "$PORT" -o ConnectTimeout=15 -o StrictHostKeyChecking=yes)
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            umask 077
+            KEY="$RUNNER_TEMP/bedifferent-readonly-ssh-key"
+            printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+            chmod 600 "$KEY"
+            if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+              eval "$(ssh-agent -s)" >/dev/null
+              ASKPASS="$RUNNER_TEMP/bedifferent-readonly-askpass"
+              printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+              chmod 700 "$ASKPASS"
+              DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            fi
+            REMOTE_ARGS+=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes)
+          else
+            test -n "$PASS"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq sshpass
+            REMOTE_ARGS+=(-o PreferredAuthentications=password -o PubkeyAuthentication=no)
+          fi
+          cat > "$RUNNER_TEMP/bd-status-remote.sh" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import json
+          from apps.publisher.models import Release, Build, Job, Submission
+          qs = Release.objects.filter(pk=26, app__slug="be-different", version_name="1.3.0", build_number=21)
+          if not qs.exists():
+              print("STORE_STATUS="+json.dumps({"release_found": False}))
+          else:
+              r=qs.get()
+              row={
+                  "release_found": True,
+                  "release_id": r.id,
+                  "version":r.version_name,
+                  "build_number":r.build_number,
+                  "release_status":r.status,
+                  "auto_submit":r.auto_submit,
+                  "source_commit":r.source_commit[:12],
+                  "builds": [
+                    {"platform":b.platform,"status":b.status,"has_artifact":bool(b.artifact),"external_build_id":b.external_build_id}
+                    for b in Build.objects.filter(release=r).order_by("platform")
+                  ],
+                  "jobs": [
+                    {"id":j.id,"type":j.type,"status":j.status,"progress":j.progress,"has_error":bool(j.error)}
+                    for j in Job.objects.filter(release=r).order_by("id")
+                  ],
+                  "submissions": [
+                    {"platform":s.platform,"state":s.state,"external_id":s.external_id,"submitted_at":str(s.submitted_at or ""),"has_error":bool(s.last_error)}
+                    for s in Submission.objects.filter(release=r).order_by("platform")
+                  ],
+              }
+              print("STORE_STATUS="+json.dumps(row,ensure_ascii=False))
+          PY
+          REMOTE
+          if [ -n "$SSH_PRIVATE_KEY" ]; then
+            ssh "${REMOTE_ARGS[@]}" "root@$HOST" 'bash -se' < "$RUNNER_TEMP/bd-status-remote.sh"
+          else
+            SSHPASS="$PASS" sshpass -e ssh "${REMOTE_ARGS[@]}" "root@$HOST" 'bash -se' < "$RUNNER_TEMP/bd-status-remote.sh"
+          fi

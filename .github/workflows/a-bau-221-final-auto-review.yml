@@ -1,0 +1,105 @@
+name: Commit A+Bau 2.2.1 into active Google review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-bau-google-22002-final
+  cancel-in-progress: true
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install -q 'paramiko>=3.5,<4' 'google-auth>=2.40,<3' 'requests>=2.32,<3'
+
+      - name: Retrieve signed AAB and Google credential
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, paramiko
+          host=os.environ['HOST']; password=os.environ['PASS']; port=int(os.environ.get('SSH_PORT') or 22)
+          c=paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy()); c.connect(hostname=host,port=port,username='root',password=password,timeout=30)
+          def run(cmd):
+              _i,o,e=c.exec_command(cmd,timeout=120); data=o.read(); err=e.read().decode('utf-8','replace'); code=o.channel.recv_exit_status()
+              if code != 0: raise RuntimeError(f'remote command failed ({code}): {err[-1000:]}')
+              return data
+          cred=r'''cd /opt/aplus-publisher && docker compose exec -T web python -c "import json,os,django; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp; a=MobileApp.objects.select_related('google_account').get(slug='a-bau'); print(json.dumps(a.google_account.get_credentials()))"'''
+          aab=r'''cd /opt/aplus-publisher && docker compose exec -T web python -c "import os,sys,django; from pathlib import Path; os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings'); django.setup(); from apps.publisher.models import MobileApp,Release; a=MobileApp.objects.get(slug='a-bau'); r=Release.objects.get(app=a,version_name='2.2.1',build_number=22002); b=r.builds.get(platform='android'); assert b.status=='succeeded' and b.artifact; sys.stdout.buffer.write(Path(b.artifact.path).read_bytes())"'''
+          pathlib.Path('/tmp/google.json').write_bytes(run(cred)); pathlib.Path('/tmp/a-bau-22002.aab').write_bytes(run(aab)); c.close(); print('publisher_payload_retrieved=true')
+          PY
+
+      - name: Verify exact signed AAB startup payload
+        run: |
+          python - <<'PY'
+          import json,re,zipfile
+          with zipfile.ZipFile('/tmp/a-bau-22002.aab') as z:
+              names=set(z.namelist())
+              index=next(n for n in names if n.endswith('/assets/public/index.html'))
+              bundle=next(n for n in names if n.endswith('/assets/public/app.bundle.js'))
+              config=next(n for n in names if n.endswith('/assets/capacitor.config.json'))
+              assert not [n for n in names if n.endswith('/assets/public/app.js')]
+              html=z.read(index).decode('utf-8','replace'); js=z.read(bundle).decode('utf-8','replace'); cfg=json.loads(z.read(config))
+              assert cfg.get('appName')=='A+Bau'
+              assert '<title>A+Bau</title>' in html and 'src="app.bundle.js"' in html
+              assert 'KAYI Haustechnik' not in html
+              assert not re.search(r"from\s+['\"]@capacitor/core['\"]",js)
+              assert 'Anmelden' in js and 'A+Bau' in js
+              print('SIGNED_AAB_STARTUP_VERIFY=SUCCESS')
+          PY
+
+      - name: Commit 22002 to production review
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import quote
+          from google.auth.transport.requests import AuthorizedSession,Request
+          from google.oauth2 import service_account
+          info=json.loads(Path('/tmp/google.json').read_text()); pkg='de.kayihaustechnik.app'; q=quote(pkg,safe='._-'); code='22002'
+          creds=service_account.Credentials.from_service_account_info(info,scopes=['https://www.googleapis.com/auth/androidpublisher']); creds.refresh(Request()); s=AuthorizedSession(creds)
+          api='https://androidpublisher.googleapis.com/androidpublisher/v3'; upload='https://androidpublisher.googleapis.com/upload/androidpublisher/v3'
+          def body(r):
+              try:return json.dumps(r.json(),ensure_ascii=False)[:2000]
+              except:return ' '.join(r.text.split())[:2000]
+          er=s.post(f'{api}/applications/{q}/edits',json={},timeout=60); print(f'edit_open=HTTP_{er.status_code}')
+          if not er.ok: raise RuntimeError(body(er))
+          eid=er.json()['id']
+          try:
+              lr=s.get(f'{api}/applications/{q}/edits/{eid}/bundles',timeout=60)
+              if not lr.ok: raise RuntimeError('list bundles '+body(lr))
+              existing=next((b for b in lr.json().get('bundles',[]) if str(b.get('versionCode'))==code),None)
+              if existing:
+                  print('bundle_22002=reused')
+              else:
+                  ur=s.post(f'{upload}/applications/{q}/edits/{eid}/bundles',params={'uploadType':'media'},data=Path('/tmp/a-bau-22002.aab').read_bytes(),headers={'Content-Type':'application/octet-stream'},timeout=600)
+                  print(f'bundle_upload=HTTP_{ur.status_code}')
+                  if not ur.ok: raise RuntimeError('upload '+body(ur))
+              notes=[{'language':'de-DE','text':'Startproblem beim Öffnen der App behoben. Der A+Bau Login und die native App-Oberfläche laden jetzt zuverlässig.'}]
+              tr=s.put(f'{api}/applications/{q}/edits/{eid}/tracks/production',json={'track':'production','releases':[{'name':'2.2.1 (22002)','versionCodes':[code],'status':'completed','releaseNotes':notes}]},timeout=120)
+              print(f'track_update=HTTP_{tr.status_code}')
+              if not tr.ok: raise RuntimeError('track '+body(tr))
+              cr=s.post(f'{api}/applications/{q}/edits/{eid}:commit',json={},timeout=120)
+              print(f'commit=HTTP_{cr.status_code}')
+              if not cr.ok: raise RuntimeError('commit '+body(cr))
+              print('GOOGLE_PLAY_22002_AUTO_REVIEW_COMMIT=SUCCESS')
+          except Exception:
+              try:s.delete(f'{api}/applications/{q}/edits/{eid}',timeout=60)
+              except Exception:pass
+              raise
+          PY
+
+      - name: Cleanup
+        if: always()
+        run: rm -f /tmp/google.json /tmp/a-bau-22002.aab

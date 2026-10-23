@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# PWYW branded portal reward rules v1 2176f0adff5cb8219d2cb8d85c9d4972957c49eb CI 39939512470 PASS
+# PWYW full portal-first product UX eeb6d27a77b9e4fbcb2ffe900aab4b068b2d50a6 branch QA 39946033784 PASS and previous main QA 39945524792 PASS
 on:
   push:
     branches: [main]

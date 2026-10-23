@@ -95,3 +95,5 @@ jobs:
           else
             SSHPASS="$PASS" sshpass -e ssh "${REMOTE_ARGS[@]}" "root@$HOST" 'bash -se' < "$RUNNER_TEMP/bd-status-remote.sh"
           fi
+
+# Read-only recheck on 2026-10-23 after Step 15 release request; no store mutations.

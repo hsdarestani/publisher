@@ -97,3 +97,5 @@ jobs:
           fi
 
 # Read-only recheck on 2026-10-23 after build 22 Android success and pending iOS.
+
+# Follow-up read-only check after both native build workflows completed on 2026-10-23.

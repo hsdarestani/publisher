@@ -79,7 +79,7 @@ jobs:
                     for b in Build.objects.filter(release=r).order_by("platform")
                   ],
                   "jobs": [
-                    {"id":j.id,"type":j.type,"status":j.status,"progress":j.progress,"has_error":bool(j.error)}
+                    {"id":j.id,"type":j.type,"status":j.status,"progress":j.progress,"has_error":bool(j.error),"failed_error":j.error[-1800:] if j.status=="failed" else ""}
                     for j in Job.objects.filter(release=r).order_by("id")
                   ],
                   "submissions": [

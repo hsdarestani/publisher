@@ -1,7 +1,7 @@
 # FFM Aktuell: verified city discovery, matcher, events, editorial guides and new openings.
-# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39998654354
+# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/40000341128
 # Regression tests and PostgreSQL CI are required to pass first.
-# Source commit 86a5392e822ea7f98e755bc9aa12b7c3e5e1e662; PR is intentionally unmerged.
+# Source commit db6fe51f1f0f23e281e4a5299ce8580580195e58; PR is intentionally unmerged.
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:
@@ -25,7 +25,7 @@ jobs:
         run: |
           python3 - <<'PYCI'
           import json, os, time, urllib.request
-          sha='86a5392e822ea7f98e755bc9aa12b7c3e5e1e662'
+          sha='db6fe51f1f0f23e281e4a5299ce8580580195e58'
           url='https://api.github.com/repos/hsdarestani/ffm-aktuell/actions/runs?event=pull_request&head_sha='+sha
           for attempt in range(90):
               req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','User-Agent':'FFM-release-gate'})
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/ffm-aktuell
-          ref: 86a5392e822ea7f98e755bc9aa12b7c3e5e1e662
+          ref: db6fe51f1f0f23e281e4a5299ce8580580195e58
           path: ffm-src
       - uses: actions/setup-node@v4
         with:
@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ffm-src
-          test "$(git rev-parse HEAD)" = '86a5392e822ea7f98e755bc9aa12b7c3e5e1e662'
+          test "$(git rev-parse HEAD)" = 'db6fe51f1f0f23e281e4a5299ce8580580195e58'
           npm ci --no-audit --no-fund
           npm test
           npm run typecheck
@@ -252,7 +252,7 @@ jobs:
           systemctl start ffm-health.service
           systemctl is-active --quiet ffm-nightly-backup.timer ffm-health.timer
           echo "FFM daily private backup and five-minute health/freshness timers active."
-          echo "Deployed PR #50 source commit 86a5392e822ea7f98e755bc9aa12b7c3e5e1e662; FFM backups retained."
+          echo "Deployed PR #50 source commit db6fe51f1f0f23e281e4a5299ce8580580195e58; FFM backups retained."
           REMOTE
           ORIGIN=000
           for i in $(seq 1 14); do

@@ -1,7 +1,7 @@
 # FFM Aktuell: verified city discovery, matcher, events, editorial guides and new openings.
-# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39952724726
+# Verified CI: https://github.com/hsdarestani/ffm-aktuell/actions/runs/39958876057
 # Regression tests and PostgreSQL CI are required to pass first.
-# Source commit 716de6df7191433993e1e7584724017cfb017763; PR is intentionally unmerged.
+# Source commit 5f50b31c444507d37c5233327729f04ce8a4bc7c; PR is intentionally unmerged.
 name: FFM Aktuell — isolated STRATO deploy
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/ffm-aktuell
-          ref: 716de6df7191433993e1e7584724017cfb017763
+          ref: 5f50b31c444507d37c5233327729f04ce8a4bc7c
           path: ffm-src
       - uses: actions/setup-node@v4
         with:
@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           cd ffm-src
-          test "$(git rev-parse HEAD)" = '716de6df7191433993e1e7584724017cfb017763'
+          test "$(git rev-parse HEAD)" = '5f50b31c444507d37c5233327729f04ce8a4bc7c'
           npm ci --no-audit --no-fund
           npm test
           npm run typecheck
@@ -230,7 +230,7 @@ jobs:
           systemctl start ffm-health.service
           systemctl is-active --quiet ffm-nightly-backup.timer ffm-health.timer
           echo "FFM daily private backup and five-minute health/freshness timers active."
-          echo "Deployed PR #49 source commit 716de6df7191433993e1e7584724017cfb017763; FFM backups retained."
+          echo "Deployed PR #49 source commit 5f50b31c444507d37c5233327729f04ce8a4bc7c; FFM backups retained."
           REMOTE
           ORIGIN=000
           for i in $(seq 1 14); do

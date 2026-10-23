@@ -1,0 +1,116 @@
+name: BE DIFFERENT 1.3.1 replace obsolete Apple review
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bedifferent-131-replace-obsolete-apple-review-20261023.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 14
+    steps:
+      - name: Safely replace pending 1.3.0 with tested 1.3.1 Build 22
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-hotfix-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 12 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import time
+          from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug="be-different")
+          assert app.bundle_id=="com.smarbiz.bedifferent", "Wrong Apple app: refusing"
+          target=Release.objects.get(app=app,pk=27,version_name="1.3.1",build_number=22)
+          assert target.source_commit=="09edd21c51a6b302bac759489246619ace4f146e", "Unexpected hotfix source"
+          build=Build.objects.filter(release=target,platform="ios",status="succeeded").order_by("-id").first()
+          assert build and build.artifact and build.external_build_id, "No uploaded signed iOS Build 22"
+          assert not Submission.objects.filter(release=target,platform="ios",state__in=["in_review","approved","live"]).exists(),"Already submitted"
+          c=AppleStoreClient(app.apple_account)
+          record=c.find_app(app.bundle_id)
+          app_id=str(record["id"])
+          versions=c.list_versions(app_id)
+          target_version=next((v for v in versions if v.get("attributes",{}).get("versionString")=="1.3.1"),None)
+          old=next((v for v in versions if v.get("attributes",{}).get("versionString")=="1.3.0"),None)
+          print("APPLE_VERSIONS_BEFORE="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState")} for v in versions if v.get("attributes",{}).get("versionString") in ("1.3.0","1.3.1")]),flush=True)
+          if not target_version and old and old.get("attributes",{}).get("appStoreState") in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+              # Withdraw ONLY the obsolete 1.3.0 review containing exactly one item for its version.
+              matches=[]
+              for state in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                  for submission in c.list_review_submissions(app_id,state):
+                      item,items=c._review_submission_matches(submission,old["id"])
+                      if item:
+                          matches.append((submission,items))
+              assert len(matches)==1, "Expected exactly one obsolete review; refusing to alter other reviews"
+              submission,items=matches[0]
+              assert len(items)==1 and c._item_targets_version(items[0],old["id"]), "Review includes unrelated items: refusing cancellation"
+              c.cancel_review_submission(submission["id"])
+              print("OLD_REVIEW_WITHDRAWN="+str(submission["id"]),flush=True)
+              for _ in range(70):
+                  versions=c.list_versions(app_id)
+                  prior=next((v for v in versions if str(v["id"])==str(old["id"])),None)
+                  state=prior.get("attributes",{}).get("appStoreState") if prior else None
+                  if state not in ("WAITING_FOR_REVIEW","IN_REVIEW"):
+                      print("OLD_REVIEW_RELEASED_STATE="+str(state),flush=True)
+                      break
+                  time.sleep(3)
+              else:
+                  raise RuntimeError("Apple has not released the 1.3.0 review slot")
+          # Idempotent: rename Apple's editable old draft or reuse exact 1.3.1.
+          new=c.ensure_version(app_id,target.version_name)
+          assert new.get("attributes",{}).get("versionString")=="1.3.1", "Unable to prepare version 1.3.1"
+          print("APPLE_TARGET_VERSION_PREPARED="+str({"id":new["id"],"state":new.get("attributes",{}).get("appStoreState")}),flush=True)
+          old_record=Submission.objects.filter(app=app,platform="ios",release__version_name="1.3.0",state="in_review").first()
+          if old_record:
+              old_record.state="withdrawn"
+              old_record.save(update_fields=["state","updated_at"])
+          pending=Job.objects.filter(release=target,type="submit_apple",status__in=["queued","running","succeeded"]).order_by("-id").first()
+          if pending:
+              job=pending
+              print("APPLE_SUBMISSION_JOB_REUSED="+str(job.pk),flush=True)
+          else:
+              job=enqueue_job("submit_apple",app=app,release=target,build=build)
+              print("APPLE_SUBMISSION_JOB_QUEUED="+str(job.pk),flush=True)
+          for _ in range(85):
+              job.refresh_from_db()
+              if job.status in ("succeeded","failed","cancelled"):break
+              time.sleep(3)
+          job.refresh_from_db()
+          print("APPLE_SUBMISSION_FINAL="+str({"id":job.pk,"status":job.status,"error":(job.error or "")[-900:] if job.status=="failed" else ""}),flush=True)
+          assert job.status=="succeeded","iOS 1.3.1 submission still blocked"
+          submission=Submission.objects.filter(release=target,platform="ios").first()
+          assert submission and submission.state=="in_review","Apple submission not recorded"
+          print("APPLE_SUBMITTED_131="+str({"submission_id":submission.external_id,"state":submission.state}),flush=True)
+          PY
+          REMOTE

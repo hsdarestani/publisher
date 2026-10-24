@@ -60,7 +60,7 @@ jobs:
           config=app.build_config or {}
           print('BUILDER_CONFIG',str(config.get('ios_command'))[:100],str(config.get('android_command'))[:100])
           for a in BuildAgent.objects.all().order_by('-last_seen_at')[:12]:
-              print('AGENT',a.platform,'name',a.name,'status',a.status,'job',a.current_job_id,'last_seen',a.last_seen_at)
+              print('AGENT',a.platform,'name',a.name,'active_job',bool(a.current_job_id),'job',a.current_job_id,'last_seen',a.last_seen_at)
           for rel in Release.objects.filter(app=app).order_by('-created_at')[:12]:
               b={x.platform:(x.status, bool(x.external_build_id), x.commit_sha) for x in rel.builds.all()}
               subs={x.platform:(x.state,x.external_id) for x in Submission.objects.filter(release=rel)}

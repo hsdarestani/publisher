@@ -1,5 +1,5 @@
 name: PWYW on STRATO — isolated pilot deploy
-# Refresh PWYW merchant SMS landing from pwyw/main, 2026-10-24.
+# Release premium PWYW experience; browser CI 40126452611 passed.
 # Publish simplified everyday German merchant copy from pwyw commit 5a9be88, 24 Oct 2026.
 # PWYW full portal-first product UX eeb6d27a77b9e4fbcb2ffe900aab4b068b2d50a6 branch QA 39946033784 PASS and previous main QA 39945524792 PASS
 on:
@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hsdarestani/pwyw
-          ref: main
+          ref: 0a36b7b98b1c7522ff7a845395af6afe3181fa6e
           path: pwyw-src
 
       - name: Validate code and test tenant isolation

@@ -1,0 +1,82 @@
+name: A+ Esthetic SMS recovery read-only Publisher preflight 20261024
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/a-esthetic-sms-hotfix-preflight-20261024.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Prepare current Publisher SSH identity
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/a-esthetic-sms-preflight-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/a-esthetic-build46-inspect-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "PUBLISHER_SSH_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+
+      - name: Read current build, signing and upload status
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          PY_CODE=$(cat <<'PY'
+          from apps.publisher.models import MobileApp, Release, Submission, BuildAgent
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='a-esthetic')
+          print('APP_BUNDLE',app.bundle_id,'REPOSITORY',app.repository_url,'APPLE_CONFIGURED',bool(app.apple_account and app.apple_account.configured),'GOOGLE_CONFIGURED',bool(app.google_account and app.google_account.configured))
+          config=app.build_config or {}
+          print('BUILDER_CONFIG',str(config.get('ios_command'))[:100],str(config.get('android_command'))[:100])
+          for a in BuildAgent.objects.all().order_by('-last_seen_at')[:12]:
+              print('AGENT',a.platform,'name',a.name,'status',a.status,'job',a.current_job_id,'last_seen',a.last_seen_at)
+          for rel in Release.objects.filter(app=app).order_by('-created_at')[:12]:
+              b={x.platform:(x.status, bool(x.external_build_id), x.commit_sha) for x in rel.builds.all()}
+              subs={x.platform:(x.state,x.external_id) for x in Submission.objects.filter(release=rel)}
+              print('RELEASE',rel.pk,rel.version_name,rel.build_number,rel.status,'sha',rel.source_commit,'builds',b,'submissions',subs)
+              for kind in ['build_android','build_ios','upload_google','upload_apple','submit_apple']:
+                  j=rel.jobs.filter(type=kind).order_by('-pk').first()
+                  if j: print('JOB',kind,j.pk,j.status,(j.error or '')[:180] if j.status=='failed' else '')
+          if app.apple_account and app.apple_account.configured:
+              try:
+                  client=AppleStoreClient(app.apple_account)
+                  apple=client.find_app(app.bundle_id)
+                  for v in client.list_versions(apple['id'])[:8]:
+                      at=v.get('attributes') or {}
+                      print('APPLE_VERSION',at.get('versionString'),at.get('appStoreState'),at.get('appVersionState'))
+              except Exception as e: print('APPLE_QUERY_ERROR',type(e).__name__,str(e)[:250])
+          PY
+          )
+          ENCODED=$(printf '%s' "$PY_CODE" | base64 -w0)
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" "cd /opt/aplus-publisher && printf '%s' '$ENCODED' | base64 -d | docker compose exec -T web python manage.py shell"

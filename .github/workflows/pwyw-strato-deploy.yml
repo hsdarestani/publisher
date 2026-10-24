@@ -1,6 +1,6 @@
 name: PWYW on STRATO — isolated pilot deploy
 # Refresh PWYW merchant SMS landing from pwyw/main, 2026-10-24.
-# Final mobile QA passed: PWYW cb6de8c, October 24 2026.
+# PWYW business-value landing and return-visit demo commit 52ddaa3, 24 Oct 2026.
 # PWYW full portal-first product UX eeb6d27a77b9e4fbcb2ffe900aab4b068b2d50a6 branch QA 39946033784 PASS and previous main QA 39945524792 PASS
 on:
   push:

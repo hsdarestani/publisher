@@ -69,6 +69,30 @@ jobs:
           if record and record.state in ("in_review","approved","live"):
               print("APPLE_ALREADY_SUBMITTED="+str({"id":record.external_id,"state":record.state}),flush=True)
               raise SystemExit(0)
+          # Apple's Transporter has confirmed that bundle build 23 already exists.
+          # Find and reuse the precise processed iOS 1.3.2 build instead of uploading it again.
+          if not build.external_build_id:
+              candidates=client.list_builds(app_id,build_number=str(release.build_number),limit=50)
+              print("APPLE_CANDIDATE_BUILDS="+str([{"id":x.get("id"),"number":x.get("attributes",{}).get("version"),"state":x.get("attributes",{}).get("processingState")} for x in candidates]),flush=True)
+              verified=[]
+              for candidate in candidates:
+                  attrs=candidate.get("attributes",{})
+                  if str(attrs.get("version"))!=str(release.build_number) or attrs.get("processingState")!="VALID":
+                      continue
+                  prerelease=client.request("GET",f"/builds/{candidate['id']}/preReleaseVersion").get("data") or {}
+                  pre_version=prerelease.get("attributes",{}).get("version")
+                  print("APPLE_BUILD_VERSION="+str({"id":candidate["id"],"prerelease_version":pre_version,"number":attrs.get("version")}),flush=True)
+                  if str(pre_version)==release.version_name:
+                      verified.append(candidate)
+              if len(verified)==1:
+                  build.external_build_id=str(verified[0]["id"])
+                  build.metadata={**(build.metadata or {}),"apple_existing_build_adopted":True,"apple_processing_state":"VALID"}
+                  build.save(update_fields=["external_build_id","metadata","updated_at"])
+                  print("APPLE_EXISTING_BUILD_ADOPTED="+str(build.external_build_id),flush=True)
+              elif len(verified)>1:
+                  raise RuntimeError("Multiple valid Apple builds match; refusing ambiguous build choice")
+              elif candidates:
+                  raise RuntimeError("Apple already has build 23 but not a VALID iOS 1.3.2 build. Resolve processing/version before any re-upload.")
           if not build.external_build_id:
               job=Job.objects.filter(release=release,type="upload_apple",status__in=["queued","running"]).order_by("-id").first()
               if job:

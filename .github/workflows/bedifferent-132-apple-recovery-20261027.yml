@@ -1,0 +1,121 @@
+name: BE DIFFERENT 1.3.2 Apple Transporter and App Review recovery
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bedifferent-132-apple-recovery-20261027.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bd-132-apple-recovery
+  cancel-in-progress: false
+jobs:
+  recover-and-submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 64
+    steps:
+      - name: Verify exact successful iOS Build 23, upload with Transporter if needed, and submit App Review once
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/bd-ios-hotfix-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/bd-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          install -d -m 700 "$HOME/.ssh"
+          ssh-keyscan -T 12 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web python manage.py shell <<'PY'
+          import time
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug="be-different")
+          assert app.bundle_id=="com.smarbiz.bedifferent", "Unexpected bundle: refusing"
+          release=Release.objects.get(app=app,pk=29,version_name="1.3.2",build_number=23)
+          assert release.source_commit=="94c08f68756d3ec9186ff6a921fd45727311aa8a", "Unexpected source: refusing"
+          assert app.apple_account and app.apple_account.configured, "Apple account not configured"
+          build=Build.objects.filter(release=release,platform="ios",status="succeeded").order_by("-id").first()
+          assert build and build.artifact, "No successful iOS IPA; do not submit an unverified build"
+          print("TARGET="+str({"release_id":release.pk,"build_id":build.pk,"ios_release_type":release.ios_release_type,"source":release.source_commit[:12],"artifact_size":build.artifact_size}),flush=True)
+          client=AppleStoreClient(app.apple_account)
+          app_id=str(client.find_app(app.bundle_id)["id"])
+          versions=client.list_versions(app_id)
+          print("APPLE_VERSIONS="+str([{"version":v.get("attributes",{}).get("versionString"),"state":v.get("attributes",{}).get("appStoreState")} for v in versions if v.get("attributes",{}).get("versionString") in ("1.3.1","1.3.2")]),flush=True)
+          record=Submission.objects.filter(release=release,platform="ios").first()
+          if record and record.state in ("in_review","approved","live"):
+              print("APPLE_ALREADY_SUBMITTED="+str({"id":record.external_id,"state":record.state}),flush=True)
+              raise SystemExit(0)
+          if not build.external_build_id:
+              job=Job.objects.filter(release=release,type="upload_apple",status__in=["queued","running"]).order_by("-id").first()
+              if job:
+                  print("APPLE_UPLOAD_JOB_REUSED="+str(job.pk),flush=True)
+              else:
+                  job=enqueue_job("upload_apple",app=app,release=release,build=build,agent=True,platform="macos")
+                  print("APPLE_UPLOAD_JOB_QUEUED="+str(job.pk),flush=True)
+              for i in range(150):
+                  job.refresh_from_db()
+                  build.refresh_from_db()
+                  if build.external_build_id:
+                      print("APPLE_PROCESSED_BUILD_ID="+str(build.external_build_id),flush=True)
+                      break
+                  if job.status in ("failed","cancelled"):
+                      print("APPLE_UPLOAD_FAILED="+str({"job_id":job.pk,"error":(job.error or "")[-700:]}),flush=True)
+                      raise RuntimeError("Apple Transporter upload failed")
+                  if i%10==0:
+                      print("APPLE_UPLOAD_PROGRESS="+str({"job_id":job.pk,"status":job.status,"iteration":i}),flush=True)
+                  time.sleep(15)
+              build.refresh_from_db()
+              assert build.external_build_id, "Apple upload/processing not completed within guarded window"
+          else:
+              print("APPLE_PROCESSED_BUILD_ALREADY="+str(build.external_build_id),flush=True)
+          record=Submission.objects.filter(release=release,platform="ios").first()
+          if record and record.state in ("in_review","approved","live"):
+              print("APPLE_ALREADY_SUBMITTED="+str({"id":record.external_id,"state":record.state}),flush=True)
+              raise SystemExit(0)
+          submit=Job.objects.filter(release=release,type="submit_apple",status__in=["queued","running","succeeded"]).order_by("-id").first()
+          if submit and submit.status=="succeeded":
+              sub=Submission.objects.filter(release=release,platform="ios").first()
+              if sub and sub.state in ("in_review","approved","live"):
+                  print("APPLE_SUBMITTED="+str({"id":sub.external_id,"state":sub.state}),flush=True)
+                  raise SystemExit(0)
+              submit=None
+          if not submit:
+              submit=enqueue_job("submit_apple",app=app,release=release,build=build)
+              print("APPLE_SUBMIT_JOB_QUEUED="+str(submit.pk),flush=True)
+          else:
+              print("APPLE_SUBMIT_JOB_REUSED="+str(submit.pk),flush=True)
+          for i in range(120):
+              submit.refresh_from_db()
+              if submit.status in ("succeeded","failed","cancelled"):
+                  break
+              time.sleep(5)
+          submit.refresh_from_db()
+          sub=Submission.objects.filter(release=release,platform="ios").first()
+          print("APPLE_FINAL="+str({"job_id":submit.pk,"status":submit.status,"error":(submit.error or "")[-800:] if submit.status=="failed" else "","submission_id":sub.external_id if sub else None,"submission_state":sub.state if sub else None}),flush=True)
+          assert submit.status=="succeeded" and sub and sub.state in ("in_review","approved","live"), "iOS 1.3.2 review submission not complete"
+          PY
+          REMOTE

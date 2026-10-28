@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hsdarestani/pwyw
-          ref: 42e343e62878bf974eeaa9064934f1f335195171
+          ref: ef3353ae7903f2eaa1c89b30ab4e22297af2eaa0
           path: pwyw-src
 
       - name: Validate code and test tenant isolation

@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 env:
-  APLUS_COMMIT: '24739d78edb1867dbd1ebaf5049540601b19a7b1'
+  APLUS_COMMIT: '3a88d739c84e4c259098c949ed568396ee9daab3'
   STATUS_ISSUE: '125'
 
 jobs:

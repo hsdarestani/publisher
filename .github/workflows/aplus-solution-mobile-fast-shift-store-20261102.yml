@@ -28,6 +28,47 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass jq >/dev/null
 
+      - name: Configure existing GitHub Publisher SSH key
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          umask 077
+          install -d -m 700 "$HOME/.ssh"
+          KEY="$RUNNER_TEMP/aplus-publisher-deploy-key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+            ASKPASS="$RUNNER_TEMP/aplus-ssh-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          {
+            echo "Host $HOST"
+            echo "  IdentityFile $KEY"
+            echo "  IdentitiesOnly yes"
+            echo "  PreferredAuthentications publickey"
+            echo "  PubkeyAuthentication yes"
+          } >> "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+          PORT="${SSH_PORT:-22}"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo 'Publisher SSH key configured (private key not logged)'
+
       - name: Verify exact A+ production deployment
         shell: bash
         run: |
@@ -63,7 +104,7 @@ jobs:
           PORT="${SSH_PORT:-22}"
 
           read_publisher_password() {
-            sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell -c \"import base64; from apps.publisher.models import MobileApp; a=MobileApp.objects.get(slug='a-plus-solution'); assert a.review_username=='store-review@aplus-solution.de'; p=a.get_review_password(); assert p; print(base64.b64encode(p.encode()).decode())\"" \
               | tail -n 1 | tr -d '\r'
           }
@@ -104,7 +145,7 @@ jobs:
           REVIEW_B64="$(printf '%s' "$REVIEW_PASSWORD" | base64 -w0)"
           echo "::add-mask::$REVIEW_B64"
 
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T -e REVIEW_B64='$REVIEW_B64' web python manage.py shell -c \"import base64,os; from apps.publisher.models import MobileApp; p=base64.b64decode(os.environ['REVIEW_B64']).decode(); a=MobileApp.objects.get(slug='a-plus-solution'); a.requires_login=True; a.review_username='store-review@aplus-solution.de'; a.set_review_password(p); a.save(update_fields=['requires_login','review_username','review_password_blob','updated_at']); assert a.get_review_password()==p; print('publisher_review_credential=rotated')\""
 
           OIDC_JSON="$(curl --fail --silent --show-error \
@@ -144,10 +185,10 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue"
 
-          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+          OUT="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T -e APLUS_COMMIT='$APLUS_COMMIT' web python manage.py shell" <<'PY'
           import json, os, re
           from apps.integrations.apple_store import AppleStoreClient
@@ -299,7 +340,7 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 240); do
-            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
           import os, re
           from apps.publisher.models import Build, Job, Release
@@ -332,7 +373,7 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
           import os
           from apps.publisher.models import Job,Release
@@ -364,7 +405,7 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 180); do
-            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
           import os, re
           from apps.publisher.models import Job, Release
@@ -398,7 +439,7 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
-          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+          sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
             "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'PY'
           import os,time
           from apps.integrations.apple_store import AppleStoreClient
@@ -440,7 +481,7 @@ jobs:
           set -euo pipefail
           PORT="${SSH_PORT:-22}"
           for i in $(seq 1 120); do
-            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no root@"$HOST" \
+            STATE="$(sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=yes root@"$HOST" \
               "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' web python manage.py shell" <<'POLL'
           import os, re
           from apps.publisher.models import Job, Release, Submission

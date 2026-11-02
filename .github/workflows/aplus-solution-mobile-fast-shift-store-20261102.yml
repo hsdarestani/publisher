@@ -1,4 +1,4 @@
-name: A+ Solution mobile shift fast Save - signed Google Play and App Store
+name: A+ Solution fast-save mobile release to both stores
 
 on:
   workflow_dispatch:

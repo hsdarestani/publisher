@@ -99,7 +99,7 @@ class AgentChunkedArtifactTests(TestCase):
         self.assertEqual(missing.status_code, 422)
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, "running")
-        self.assertEqual(self._send(b"WRONG OUTPUT", 0, 1, len(data), sha).status_code, 400)
+        self.assertEqual(self._send(b"WRONG OUTPUT!", 0, 1, len(data), sha).status_code, 400)
         self.assertEqual(self._send(b"wrong output", 0, 1, len(data), sha).status_code, 200)
         mismatch = self._complete(meta)
         self.assertEqual(mismatch.status_code, 422)

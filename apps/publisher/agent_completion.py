@@ -42,7 +42,7 @@ def _refresh_release_state(job, status):
 
     builds = list(release.builds.all())
     if job.type in {"build_android", "build_ios"}:
-        if builds and all(build.status == "succeeded" for build in builds):
+        if builds and all(build.status == "succeeded" and bool(build.artifact) for build in builds):
             release.status = "ready"
         elif any(build.status == "failed" for build in builds):
             release.status = "failed"
@@ -92,6 +92,10 @@ def agent_complete(request, job_pk):
         ),
         pk=job_pk,
     )
+    # The upload may have succeeded server-side before a reverse proxy returned
+    # a timeout to the Mac. Replayed completion must be an idempotent receipt.
+    if job.status == "succeeded" and (job.type not in {"build_android", "build_ios"} or (job.build and job.build.artifact)):
+        return JsonResponse({"ok": True, "already_completed": True})
     if not agent or agent.current_job_id != job.pk:
         return JsonResponse({"error": "unauthorized"}, status=401)
 
@@ -101,10 +105,20 @@ def agent_complete(request, job_pk):
     metadata = json.loads(request.POST.get("metadata", "{}") or "{}")
     error = request.POST.get("error", "")
     build = job.build
+    staged_folder = None
 
     if build and job.type in {"build_android", "build_ios"}:
-        if artifact:
+        if succeeded and metadata.get("artifact_transfer") == "chunked":
+            from .artifact_transfer import finalise_staged_artifact
+            try:
+                staged_folder = finalise_staged_artifact(job, metadata)
+            except (TypeError, ValueError, OSError) as exc:
+                return JsonResponse({"error": "invalid or missing artifact", "detail": str(exc)}, status=422)
+        elif artifact:
             _save_build_artifact(build, artifact)
+        elif succeeded:
+            # Never persist a successful build without its native binary.
+            return JsonResponse({"error": "successful native build requires an artifact"}, status=422)
         build.external_build_id = metadata.get(
             "external_build_id",
             build.external_build_id,
@@ -224,4 +238,7 @@ def agent_complete(request, job_pk):
             )
 
     _refresh_release_state(job, status)
+    if staged_folder is not None:
+        from .artifact_transfer import cleanup_staged_artifact
+        cleanup_staged_artifact(staged_folder)
     return JsonResponse({"ok": True})

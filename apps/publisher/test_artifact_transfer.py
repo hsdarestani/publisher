@@ -35,6 +35,8 @@ class AgentChunkedArtifactTests(TestCase):
         )
         self.agent.current_job = self.job
         self.agent.save(update_fields=["current_job", "updated_at"])
+        self.build.agent = self.agent
+        self.build.save(update_fields=["agent", "updated_at"])
 
     def _send(self, data, index, total, full_size, sha):
         return self.client.post(

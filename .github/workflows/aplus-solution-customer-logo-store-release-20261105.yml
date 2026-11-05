@@ -1,4 +1,6 @@
 name: A+ Solution 2026-11-05 Customer Logos Store Release
+# Retry after Publisher artifact transport: chunked SHA256 uploads and idempotent completion.
+# Publisher CI deployment 41986652490 passed; source release preserves existing signing.
 
 on:
   workflow_dispatch:

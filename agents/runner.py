@@ -191,17 +191,80 @@ class Agent:
             print(f"log delivery failed: {exc}", flush=True)
         print(line, flush=True)
 
+    def upload_artifact_chunks(self, job_id, artifact, checksum):
+        """Send bounded requests to stay below Cloudflare's upload timeout.
+
+        Every request receives a fresh short-lived OIDC token through
+        requests.Session.auth. Individual chunks are idempotent and retried.
+        """
+        chunk_size = 2 * 1024 * 1024
+        total_size = artifact.stat().st_size
+        if total_size <= 0:
+            raise RuntimeError("Native build produced an empty artifact.")
+        total = (total_size + chunk_size - 1) // chunk_size
+        url = f"{self.server}/apps/agent-api/jobs/{job_id}/artifact-chunk/"
+        with artifact.open("rb") as source:
+            for index in range(total):
+                payload = source.read(chunk_size)
+                headers = {
+                    "Content-Type": "application/octet-stream",
+                    "X-Artifact-Index": str(index),
+                    "X-Artifact-Total": str(total),
+                    "X-Artifact-Size": str(total_size),
+                    "X-Artifact-Sha256": checksum,
+                }
+                last_error = None
+                for attempt in range(5):
+                    try:
+                        response = self.session.post(
+                            url, data=payload, headers=headers, timeout=(20, 75),
+                        )
+                        response.raise_for_status()
+                        if not response.json().get("ok"):
+                            raise RuntimeError("Publisher rejected an artifact chunk.")
+                        last_error = None
+                        break
+                    except requests.RequestException as exc:
+                        last_error = exc
+                        code = getattr(getattr(exc, "response", None), "status_code", None)
+                        if code not in (None, 408, 425, 429, 500, 502, 503, 504, 520, 522, 524):
+                            raise
+                        if attempt == 4:
+                            break
+                        time.sleep(min(2 ** attempt, 12))
+                if last_error:
+                    raise RuntimeError(f"Artifact chunk {index + 1}/{total} could not be delivered: {last_error}") from last_error
+                if index == 0 or index + 1 == total or (index + 1) % 12 == 0:
+                    print(f"Artifact upload: {index + 1}/{total} chunks accepted.", flush=True)
+        return total_size
+
     def complete(self, job_id, status, artifact, metadata, error):
+        metadata = dict(metadata or {})
+        if artifact and status == "succeeded":
+            checksum = metadata.get("sha256") or self.sha256(artifact)
+            size = self.upload_artifact_chunks(job_id, artifact, checksum)
+            metadata.update({
+                "sha256": checksum,
+                "artifact_transfer": "chunked",
+                "artifact_size": size,
+                "artifact_name": artifact.name,
+            })
         data = {"status": status, "metadata": json.dumps(metadata), "error": error}
-        files = None
-        handle = None
-        try:
-            if artifact:
-                handle = artifact.open("rb"); files = {"artifact": (artifact.name, handle, "application/octet-stream")}
-            response = self.session.post(f"{self.server}/apps/agent-api/jobs/{job_id}/complete/", data=data, files=files, timeout=600)
-            response.raise_for_status()
-        finally:
-            if handle: handle.close()
+        url = f"{self.server}/apps/agent-api/jobs/{job_id}/complete/"
+        # No binary in this request: completion should finish long before the
+        # proxy timeout. Retrying is safe because the server returns a receipt.
+        for attempt in range(5):
+            try:
+                response = self.session.post(url, data=data, timeout=(20, 75))
+                response.raise_for_status()
+                if not response.json().get("ok"):
+                    raise RuntimeError("Publisher did not acknowledge job completion.")
+                return
+            except requests.RequestException as exc:
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                if code not in (None, 408, 425, 429, 500, 502, 503, 504, 520, 522, 524) or attempt == 4:
+                    raise
+                time.sleep(min(2 ** attempt, 12))
 
     @staticmethod
     def authenticated_url(url, token):

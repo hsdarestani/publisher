@@ -1,5 +1,5 @@
 from django.urls import path
-from . import views, artifact_views, signing_agent_views, agent_completion, agent_lifecycle, review_credential_views, automation_views
+from . import views, artifact_views, artifact_transfer, signing_agent_views, agent_completion, agent_lifecycle, review_credential_views, automation_views
 urlpatterns = [
     path("automation/release/", automation_views.automation_release, name="automation_release"),
     path("", views.app_list, name="app_list"),
@@ -23,6 +23,7 @@ urlpatterns = [
     path("agents/<int:pk>/created/", views.agent_created, name="agent_created"),
     path("agent-api/claim/", agent_lifecycle.agent_claim, name="agent_claim"),
     path("agent-api/jobs/<int:job_pk>/log/", agent_lifecycle.agent_log, name="agent_log"),
+    path("agent-api/jobs/<int:job_pk>/artifact-chunk/", artifact_transfer.artifact_chunk, name="agent_artifact_chunk"),
     path("agent-api/jobs/<int:job_pk>/complete/", agent_completion.agent_complete, name="agent_complete"),
     path("agent-api/jobs/<int:job_pk>/ios-signing/", signing_agent_views.ios_signing_material, name="agent_ios_signing"),
     path("agent-api/a-bau-review-credentials/", review_credential_views.set_store_review_credentials, name="agent_a_bau_review_credentials"),

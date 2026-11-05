@@ -92,11 +92,17 @@ def agent_complete(request, job_pk):
         ),
         pk=job_pk,
     )
-    # The upload may have succeeded server-side before a reverse proxy returned
-    # a timeout to the Mac. Replayed completion must be an idempotent receipt.
-    if job.status == "succeeded" and (job.type not in {"build_android", "build_ios"} or (job.build and job.build.artifact)):
+    if not agent:
+        return JsonResponse({"error": "unauthorized"}, status=401)
+    # The upload may have succeeded server-side before the proxy returned a
+    # timeout. Replayed completion must be an authenticated, idempotent receipt.
+    if job.status == "succeeded" and job.type in {"build_android", "build_ios"} and job.build and job.build.artifact:
+        if job.build.agent_id != agent.pk:
+            return JsonResponse({"error": "unauthorized"}, status=401)
         return JsonResponse({"ok": True, "already_completed": True})
-    if not agent or agent.current_job_id != job.pk:
+    if job.status == "succeeded" and job.type == "upload_apple":
+        return JsonResponse({"ok": True, "already_completed": True})
+    if agent.current_job_id != job.pk:
         return JsonResponse({"error": "unauthorized"}, status=401)
 
     status = request.POST.get("status", "failed")

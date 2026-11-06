@@ -1,0 +1,173 @@
+name: A+ Esthetic iOS Build 48 — Publisher Apple upload and submission
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-ios-build48-finalize-20261106.yml'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-ios-build48-finalize
+  cancel-in-progress: false
+
+jobs:
+  upload-submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 85
+    env:
+      APP_SLUG: a-esthetic
+      SOURCE_COMMIT: dfbc39ac6daf447d01ec4fa34ffc53379a61fea5
+      RELEASE_ID: '35'
+      VERSION_NAME: '1.0.42'
+      BUILD_NUMBER: '48'
+    steps:
+      - name: Prepare existing Publisher SSH Agent (same as verified successful release)
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          KEY="$RUNNER_TEMP/aesthetic-ios-48-ssh"
+          umask 077
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "${SSH_KEY_PASSPHRASE:-}" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+            ASKPASS="$RUNNER_TEMP/aesthetic-ssh-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
+          fi
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "${SSH_HOST_FINGERPRINT:-}" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "SSH_PATH=$KEY" >> "$GITHUB_ENV"
+          echo "SSH_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "SSH_PORT=$PORT" >> "$GITHUB_ENV"
+
+      - name: Wait for exact signed iOS 1.0.42 Build 48
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in $(seq 1 90); do
+            STATE="$(ssh -i "$SSH_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" root@"$SSH_HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os, json
+          from apps.publisher.models import MobileApp, Release
+          app=MobileApp.objects.get(slug='a-esthetic')
+          r=Release.objects.get(pk=int(os.environ['RELEASE_ID']),app=app)
+          assert app.bundle_id=='de.aplusesthetic.app' and r.version_name=='1.0.42' and r.build_number==48 and r.source_commit==os.environ['SOURCE_COMMIT']
+          b=r.builds.get(platform='ios')
+          j=r.jobs.filter(type='build_ios').order_by('-pk').first()
+          print('BUILD_STATE_JSON='+json.dumps({'release':r.pk,'status':b.status,'artifact':bool(b.artifact),'job':j.status if j else None,'error':(j.error or '')[:450] if j else ''}))
+          PY
+            )"
+            printf '%s\n' "$STATE" | grep '^BUILD_STATE_JSON=' || true
+            JSON="$(printf '%s\n' "$STATE" | sed -n 's/^BUILD_STATE_JSON=//p' | tail -n1)"
+            test -n "$JSON"
+            if printf '%s' "$JSON" | jq -e '.status=="succeeded" and .artifact==true' >/dev/null; then exit 0; fi
+            if printf '%s' "$JSON" | jq -e '.status=="failed" or .job=="failed"' >/dev/null; then
+              echo "::error::Signed iOS build failed in Publisher"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Timed out waiting for signed iOS build."
+          exit 1
+
+      - name: Queue exact iOS upload to Apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$SSH_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" root@"$SSH_HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os
+          from apps.publisher.models import MobileApp, Release
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-esthetic')
+          r=Release.objects.get(pk=int(os.environ['RELEASE_ID']),app=app)
+          assert r.version_name=='1.0.42' and r.build_number==48 and r.source_commit==os.environ['SOURCE_COMMIT']
+          b=r.builds.get(platform='ios')
+          assert b.status=='succeeded' and b.artifact, "signed IPA missing"
+          j=r.jobs.filter(type='upload_apple').order_by('-pk').first()
+          if b.external_build_id:
+              print("APPLE_ALREADY_UPLOADED",b.external_build_id)
+          elif not j or j.status not in {'queued','running','succeeded'}:
+              j=enqueue_job('upload_apple',app=app,release=r,build=b,agent=True,platform='macos')
+              print("APPLE_UPLOAD_QUEUED",j.pk)
+          else:
+              print("APPLE_UPLOAD_EXISTING",j.pk,j.status)
+          PY
+
+      - name: Wake Publisher macOS Apple upload agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id:'cloud-macos.yml', ref:'main'
+            });
+
+      - name: Wait for Apple processing and queue iOS-only submission
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in $(seq 1 140); do
+            STATE="$(ssh -i "$SSH_PATH" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" root@"$SSH_HOST" \
+              "cd /opt/aplus-publisher && docker compose exec -T -e RELEASE_ID='$RELEASE_ID' -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import json,os
+          from apps.publisher.models import MobileApp,Release,Submission
+          from apps.publisher.tasks import enqueue_job
+          app=MobileApp.objects.get(slug='a-esthetic')
+          r=Release.objects.get(pk=int(os.environ['RELEASE_ID']),app=app)
+          assert r.version_name=='1.0.42' and r.build_number==48 and r.source_commit==os.environ['SOURCE_COMMIT']
+          b=r.builds.get(platform='ios')
+          def latest(kind): return r.jobs.filter(type=kind).order_by('-pk').first()
+          upload=latest('upload_apple')
+          sub=Submission.objects.filter(release=r,platform='ios').first()
+          submit=latest('submit_apple')
+          if b.external_build_id and upload and upload.status=='succeeded' and not sub and not (submit and submit.status in {'queued','running','succeeded'}):
+              submit=enqueue_job('submit_apple',app=app,release=r,build=b)
+              print('APPLE_SUBMIT_QUEUED',submit.pk)
+          failures={k:(j.error or '')[:450] for k,j in [('upload_apple',upload),('submit_apple',submit)] if j and j.status=='failed'}
+          print('APPLE_STATE_JSON='+json.dumps({'ios_build':b.status,'uploaded':bool(b.external_build_id),
+              'upload_job':upload.status if upload else 'none','submit_job':submit.status if submit else 'none',
+              'submission':sub.state if sub else 'pending','errors':failures}))
+          PY
+            )"
+            printf '%s\n' "$STATE" | grep -E 'APPLE_STATE_JSON=|APPLE_SUBMIT_QUEUED' || true
+            JSON="$(printf '%s\n' "$STATE" | sed -n 's/^APPLE_STATE_JSON=//p' | tail -n1)"
+            test -n "$JSON"
+            if printf '%s' "$JSON" | jq -e '.errors|length>0' >/dev/null; then
+              echo "::error::Publisher Apple upload or review submission failed"
+              exit 1
+            fi
+            if printf '%s' "$JSON" | jq -e '.submission=="in_review" or .submission=="approved" or .submission=="live"' >/dev/null; then
+              echo "PASS: A+ Esthetic iOS Build 48 submitted to Apple."
+              exit 0
+            fi
+            if [ $((n % 12)) -eq 0 ]; then
+              echo 'Nudging macOS queue for Apple upload'
+              gh workflow run cloud-macos.yml --repo "$GITHUB_REPOSITORY" --ref main || true
+            fi
+            sleep 20
+          done
+          echo "::error::Timed out waiting for Apple upload/submission."
+          exit 1

@@ -1,4 +1,4 @@
-name: A+ Solution 2026-11-05 Customer Logos Store Release
+name: A+ Solution 2026-11-06 Logos And Location Store Release
 # Retry after Publisher artifact transport: chunked SHA256 uploads and idempotent completion.
 # Publisher CI deployment 41986652490 passed; source release preserves existing signing.
 
@@ -16,7 +16,7 @@ permissions:
   id-token: write
 
 env:
-  APLUS_COMMIT: '6a614fd38408ee060836e75a3141bfcfd8b2c561'
+  APLUS_COMMIT: 'd71b15ab786fb1b616b8ea3be0254bce5813a2fa'
   STATUS_ISSUE: '126'
 
 jobs:
@@ -221,13 +221,13 @@ jobs:
           app.review_notes=(
               'A+ Solution is the workforce app of A+ Solution GmbH; access requires a provisioned company account. '
               'The verified App Review test account uses synthetic employee data and does not require two-factor authentication. '
-              'This version improves mobile Dienstplan by centering official client logos on every shift card, '
-              'without changing the employee or shift time information. No in-app purchases.'
+              'This version slightly enlarges the official customer logos centered on mobile shift cards, '
+              'and restores the location labels below shift times on the right. Employee and shift time information is unchanged. No in-app purchases.'
           )
           app.save(update_fields=['build_config','requires_login','review_notes','updated_at'])
           loc=app.localizations.filter(locale='de-DE').first()
           if loc:
-              loc.release_notes='Dienstplan: Die Original-Logos unserer Kunden werden übersichtlich in der Mitte jeder Schicht angezeigt. Verbesserte Erkennung des Stadthaus-Logos.'
+              loc.release_notes='Dienstplan: Kundenlogos sind etwas größer und mittig. Der Einsatzort wird wieder rechts unter der Uhrzeit angezeigt.'
               loc.save(update_fields=['release_notes','updated_at'])
 
           apple=AppleStoreClient(app.apple_account)
@@ -283,7 +283,7 @@ jobs:
           release.android_rollout=1
           release.ios_release_type='automatic'
           release.auto_submit=False
-          release.release_notes='Dienstplan: Original-Kundenlogos erscheinen mittig auf jeder Schichtkarte. Stadthaus-Logo und Darstellung verbessert.'
+          release.release_notes='Dienstplan: Kundenlogos mittig und größer dargestellt. Der Einsatzort erscheint wieder rechts unter der Uhrzeit.'
           release.save()
 
           queued=[]

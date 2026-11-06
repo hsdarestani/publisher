@@ -1,0 +1,26 @@
+name: A+ Solution Build 70 Store Status Check
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-build70-readonly-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - name: Inspect Publisher submission states (read only)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Release,Job,Submission; r=Release.objects.get(app__slug='a-plus-solution',build_number=70); print('VERSION',r.version_name,'RELEASE',r.status); print('JOBS',list(Job.objects.filter(release=r,type__in=['submit_google','submit_apple']).values_list('type','status'))); print('STORES',list(Submission.objects.filter(release=r).values_list('platform','state')))"

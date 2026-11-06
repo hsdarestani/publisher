@@ -1,0 +1,60 @@
+name: A+ Esthetic iPhone push fix Publisher release preflight 2026-11-06
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-iphone-push-preflight-20261106.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Inspect current Publisher Apple signing, build queue and store state
+        env:
+          HOST: ${{ secrets.HOST }}
+          PASS: ${{ secrets.PASS }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$PASS"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "${SSH_PORT:-22}" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          if [ -n "${SSH_HOST_FINGERPRINT:-}" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          sshpass -p "$PASS" ssh -p "${SSH_PORT:-22}" -o StrictHostKeyChecking=yes root@"$HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell" <<'PY'
+          from apps.publisher.models import MobileApp, Release, Submission, BuildAgent
+          from apps.integrations.apple_store import AppleStoreClient
+          app=MobileApp.objects.get(slug='a-esthetic')
+          print('APP',app.slug,app.bundle_id,'APPLE_ACCOUNT',bool(app.apple_account and app.apple_account.configured))
+          print('IOS_BUILD_CONFIG',repr((app.build_config or {}).get('ios_command')))
+          print('IOS_ARTIFACT',repr((app.build_config or {}).get('ios_artifact')))
+          for a in BuildAgent.objects.filter(platform='macos').order_by('-last_seen_at')[:3]:
+              print('MAC_AGENT',a.name,'active',bool(a.current_job_id),'last_seen',a.last_seen_at)
+          releases=list(Release.objects.filter(app=app).order_by('-build_number')[:6])
+          for r in releases:
+              print('RELEASE',r.version_name,r.build_number,r.status,'commit',r.source_commit,'created',r.created_at)
+              for b in r.builds.all():
+                  print('BUILD',b.platform,b.status,'external',bool(b.external_build_id),'artifact',bool(b.artifact))
+              for s in Submission.objects.filter(release=r):print('SUBMISSION',s.platform,s.state)
+          if app.apple_account and app.apple_account.configured:
+              client=AppleStoreClient(app.apple_account)
+              try:
+                  remote=client.find_app(app.bundle_id)
+                  for version in client.list_versions(remote['id'],limit=30):
+                      at=version.get('attributes') or {}
+                      print('APPLE_VERSION',at.get('versionString'),at.get('appStoreState') or at.get('appVersionState'))
+                  raw=client.list_builds(remote['id'],limit=30)
+                  print('APPLE_BUILD_CODES',sorted({(x.get('attributes') or {}).get('version','') for x in raw})[-12:])
+              except Exception as e:
+                  print('APPLE_API_ERROR',type(e).__name__,str(e)[:200])
+          PY

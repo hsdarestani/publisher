@@ -1,0 +1,78 @@
+name: A+ Esthetic iPhone APNs hotfix via Publisher API (iOS only)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/a-esthetic-iphone-apns-build48-20261106.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-esthetic-ios-push-hotfix-build48
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      SOURCE_COMMIT: 'dfbc39ac6daf447d01ec4fa34ffc53379a61fea5'
+      PUBLISHER_URL: 'https://publisher.smarbiz.sbs'
+    steps:
+      - name: Verify unchanged app scope and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/hsdarestani/a_esthetic.git esthetic
+          cd esthetic
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          node --check www/native-push.js
+          node --check www/admin-mode.js
+          node scripts/test_ios_push_registration.js
+          bash -n scripts/build-ios.sh
+          grep -q 'production APNs entitlement' scripts/build-ios.sh
+          grep -q 'scripts/configure_ios_push.py' scripts/build-ios.sh
+          echo "PASS: isolated iOS push and login patch at exact source commit"
+      - name: Queue only iOS build through Publisher automation API
+        env:
+          PUBLISHER_AUTOMATION_TOKEN: ${{ secrets.PUBLISHER_AUTOMATION_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PUBLISHER_AUTOMATION_TOKEN:-}" ]]; then
+            echo "::error::Publisher automation API credential is missing. Refusing to queue an unauthenticated release."
+            exit 2
+          fi
+          payload=$(jq -n --arg sha "$SOURCE_COMMIT" '{
+            app_identifier:"de.aplusesthetic.app",
+            version_name:"1.0.42",
+            build_number:48,
+            source_branch:"main",
+            source_commit:$sha,
+            platforms:["ios"],
+            auto_submit:true,
+            release_notes:"Stabilere Anmeldung und zuverlässigere Mitteilungen auf dem iPhone."
+          }')
+          code=$(curl --silent --show-error --connect-timeout 10 --max-time 90 \
+            -o /tmp/publisher-hotfix.json -w '%{http_code}' \
+            -X POST "$PUBLISHER_URL/apps/automation/release/" \
+            -H "Authorization: Bearer $PUBLISHER_AUTOMATION_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload")
+          echo "Publisher API HTTP: $code"
+          jq '{ok,app,release_id,version_name,build_number,queued,skipped,error,detail}' /tmp/publisher-hotfix.json
+          [[ "$code" = 200 ]]
+          jq -e '.ok == true and .app == "a-esthetic" and .build_number == 48' /tmp/publisher-hotfix.json
+      - name: Wake signed macOS Publisher builder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner:context.repo.owner, repo:context.repo.repo,
+              workflow_id:'cloud-macos.yml', ref:'main'
+            });

@@ -1,0 +1,73 @@
+name: A+ Solution 06 Nov 2026 Final Android and iOS Store Submission
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aplus-fast-save-publisher-submit-20261106.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: aplus-solution-current-store-submission
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    env:
+      PUBLISHER_URL: https://publisher.smarbiz.sbs
+      PUBLISHER_AUTOMATION_TOKEN: ${{ secrets.PUBLISHER_AUTOMATION_TOKEN }}
+      APLUS_SOURCE_COMMIT: e1fe0ac398ef2f7b0459aeeda6feaa5cd377d38c
+    steps:
+      - name: Verify fast-save fix is on current source branch
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://api.github.com/repos/hsdarestani/aplussolution/compare/$APLUS_SOURCE_COMMIT...main" |
+            python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] in ("ahead","identical")'
+      - name: Queue signed Android and iOS builds with automatic store submission
+        run: |
+          set -euo pipefail
+          test -n "$PUBLISHER_AUTOMATION_TOKEN"
+          python3 - <<'PY' > /tmp/aplus-release.json
+          import json,os
+          print(json.dumps({
+            "app_identifier":"de.aplussolution.workforce",
+            "version_name":"1.0.32",
+            "build_number":70,
+            "source_branch":"main",
+            "source_commit":os.environ["APLUS_SOURCE_COMMIT"],
+            "platforms":["android","ios"],
+            "android_track":"production",
+            "auto_submit":True,
+            "release_notes":"Dienstplan: Schnelleres und zuverlässiges Speichern von Schichten, sichtbare Fehlermeldungen sowie verbesserte Kundenlogos und Einsatzortanzeige."
+          }))
+          PY
+          code=$(curl -sS -o /tmp/aplus-release-response.json -w '%{http_code}' --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 5 \
+            -X POST "$PUBLISHER_URL/apps/automation/release/" \
+            -H "Authorization: Bearer $PUBLISHER_AUTOMATION_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/aplus-release.json)
+          echo "Publisher accepted release request with HTTP $code"
+          python3 - <<'PY'
+          import json
+          response=json.load(open('/tmp/aplus-release-response.json'))
+          print(json.dumps({k:v for k,v in response.items() if k in ('ok','error','detail','release_id','version_name','build_number','queued','skipped','release_url')}))
+          assert response.get('ok') is True
+          assert {x['platform'] for x in response.get('queued',[])+response.get('skipped',[])}=={'android','ios'}
+          PY
+          test "$code" = 200
+      - name: Wake secure Publisher Android and iOS cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner, repo: context.repo.repo,
+                workflow_id, ref: 'main'
+              });
+            }

@@ -1,0 +1,53 @@
+name: A+ Solution final shift save release
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-save-fix-store-20261106.yml']
+permissions:
+  contents: read
+  actions: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Queue final release in existing Publisher
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from apps.publisher.models import MobileApp, Release, Build
+            from apps.publisher.tasks import enqueue_job
+            app = MobileApp.objects.get(slug='a-plus-solution')
+            assert app.google_account.configured and app.apple_account.configured
+            previous = Release.objects.filter(app=app).order_by('-build_number').first()
+            assert previous
+            version = previous.version_name
+            build_number = previous.build_number + 1
+            release = Release.objects.create(
+                app=app, version_name=version, build_number=build_number,
+                source_branch='main', source_commit='e1fe0ac398ef2f7b0459aeeda6feaa5cd377d38c',
+                android_track='production', android_rollout=1,
+                ios_release_type='automatic', auto_submit=True,
+                release_notes='Dienstplan: Zuverlässiges Speichern und besser sichtbare Fehlermeldungen.',
+                status='building',
+            )
+            for platform in ('android', 'ios'):
+                build = Build.objects.create(release=release, platform=platform, status='queued')
+                enqueue_job('build_'+platform, app=app, release=release, build=build,
+                            agent=True, platform='macos' if platform=='ios' else 'linux')
+            print('QUEUED_RELEASE',release.version_name,release.build_number)
+            PY
+      - name: Wake Android and iOS cloud builders
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id,ref:'main'});
+            }

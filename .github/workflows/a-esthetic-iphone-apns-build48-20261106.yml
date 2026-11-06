@@ -1,30 +1,29 @@
-name: A+ Esthetic iPhone APNs hotfix via Publisher API (iOS only)
+name: A+ Esthetic iPhone Push & Admin Login — Publisher iOS Release
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
       - '.github/workflows/a-esthetic-iphone-apns-build48-20261106.yml'
-  workflow_dispatch:
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: a-esthetic-ios-push-hotfix-build48
+  group: a-esthetic-ios-apns-hotfix-20261106
   cancel-in-progress: false
 
 jobs:
-  queue:
+  queue-ios:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     environment: production
+    timeout-minutes: 20
     env:
-      SOURCE_COMMIT: 'dfbc39ac6daf447d01ec4fa34ffc53379a61fea5'
-      PUBLISHER_URL: 'https://publisher.smarbiz.sbs'
+      SOURCE_COMMIT: dfbc39ac6daf447d01ec4fa34ffc53379a61fea5
     steps:
-      - name: Verify unchanged app scope and source
+      - name: Verify exact A+ Esthetic iOS-only source
         shell: bash
         run: |
           set -euo pipefail
@@ -37,42 +36,106 @@ jobs:
           bash -n scripts/build-ios.sh
           grep -q 'production APNs entitlement' scripts/build-ios.sh
           grep -q 'scripts/configure_ios_push.py' scripts/build-ios.sh
-          echo "PASS: isolated iOS push and login patch at exact source commit"
-      - name: Queue only iOS build through Publisher automation API
+
+      - name: Configure existing Publisher production SSH key
         env:
-          PUBLISHER_AUTOMATION_TOKEN: ${{ secrets.PUBLISHER_AUTOMATION_TOKEN }}
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${PUBLISHER_AUTOMATION_TOKEN:-}" ]]; then
-            echo "::error::Publisher automation API credential is missing. Refusing to queue an unauthenticated release."
-            exit 2
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          PORT="${SSH_PORT:-22}"
+          umask 077
+          KEY="$RUNNER_TEMP/a-esthetic-publisher-ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          if [ -n "${SSH_KEY_PASSPHRASE:-}" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            ASKPASS="$RUNNER_TEMP/ssh-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$ASKPASS"
+            chmod 700 "$ASKPASS"
+            DISPLAY=:0 SSH_ASKPASS="$ASKPASS" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
           fi
-          payload=$(jq -n --arg sha "$SOURCE_COMMIT" '{
-            app_identifier:"de.aplusesthetic.app",
-            version_name:"1.0.42",
-            build_number:48,
-            source_branch:"main",
-            source_commit:$sha,
-            platforms:["ios"],
-            auto_submit:true,
-            release_notes:"Stabilere Anmeldung und zuverlässigere Mitteilungen auf dem iPhone."
-          }')
-          code=$(curl --silent --show-error --connect-timeout 10 --max-time 90 \
-            -o /tmp/publisher-hotfix.json -w '%{http_code}' \
-            -X POST "$PUBLISHER_URL/apps/automation/release/" \
-            -H "Authorization: Bearer $PUBLISHER_AUTOMATION_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "$payload")
-          echo "Publisher API HTTP: $code"
-          jq '{ok,app,release_id,version_name,build_number,queued,skipped,error,detail}' /tmp/publisher-hotfix.json
-          [[ "$code" = 200 ]]
-          jq -e '.ok == true and .app == "a-esthetic" and .build_number == 48' /tmp/publisher-hotfix.json
-      - name: Wake signed macOS Publisher builder
+          mkdir -p "$HOME/.ssh"
+          ssh-keyscan -T 10 -p "$PORT" -H "$HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          test -s "$HOME/.ssh/known_hosts"
+          if [ -n "${SSH_HOST_FINGERPRINT:-}" ]; then
+            ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          echo "PUBLISHER_SSH_KEY_PATH=$KEY" >> "$GITHUB_ENV"
+          echo "PUBLISHER_SSH_HOST=$HOST" >> "$GITHUB_ENV"
+          echo "PUBLISHER_SSH_PORT=$PORT" >> "$GITHUB_ENV"
+
+      - name: Check SSH authorization before any release changes
+        run: |
+          set -euo pipefail
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -p "$PUBLISHER_SSH_PORT" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 root@"$PUBLISHER_SSH_HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python -c "print(\"PUBLISHER_READY\")"' \
+            | grep -q PUBLISHER_READY
+
+      - name: Queue only A+ Esthetic iOS build — no Android and no other apps
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$PUBLISHER_SSH_KEY_PATH" -p "$PUBLISHER_SSH_PORT" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            root@"$PUBLISHER_SSH_HOST" \
+            "cd /opt/aplus-publisher && docker compose exec -T -e SOURCE_COMMIT='$SOURCE_COMMIT' web python manage.py shell" <<'PY'
+          import os, re
+          from apps.publisher.models import MobileApp, Release, Build, Job
+          from apps.publisher.tasks import enqueue_job
+          from apps.integrations.apple_store import AppleStoreClient
+
+          source = os.environ["SOURCE_COMMIT"]
+          app = MobileApp.objects.get(slug="a-esthetic")
+          assert app.bundle_id == "de.aplusesthetic.app"
+          assert app.apple_account and app.apple_account.configured, "Apple account is not connected"
+          assert "scripts/build-ios.sh" in str((app.build_config or {}).get("ios_command") or ""), "Unexpected iOS build command"
+
+          apple = AppleStoreClient(app.apple_account)
+          remote = apple.find_app(app.bundle_id)
+          versions = apple.list_versions(remote["id"], limit=40)
+          def sv(s):
+              parts = [int(v) for v in re.findall(r"\d+", str(s or "1.0.0"))[:3]]
+              return tuple((parts + [0,0,0])[:3])
+
+          db_versions = list(Release.objects.filter(app=app).values_list("version_name", flat=True))
+          remote_versions = [(v.get("attributes") or {}).get("versionString", "") for v in versions]
+          newest = max([*db_versions, *remote_versions, "1.0.41"], key=sv)
+          major, minor, patch = sv(newest)
+          version = f"{major}.{minor}.{patch + 1}"
+          max_db = max(Release.objects.filter(app=app).values_list("build_number", flat=True), default=47)
+          builds = apple.list_builds(remote["id"], limit=50)
+          max_apple = max([int((b.get("attributes") or {}).get("version")) for b in builds
+                           if str((b.get("attributes") or {}).get("version", "")).isdigit()] or [0])
+          number = max(47, max_db, max_apple) + 1
+          print("IOS_ONLY_RELEASE_VERSION", version, "BUILD", number, "SOURCE", source)
+
+          # Strictly prepare this one app and one iOS build. No Android changes.
+          release = Release.objects.create(
+              app=app, version_name=version, build_number=number,
+              status="building", source_branch="main", source_commit=source,
+              ios_release_type="manual", auto_submit=False,
+              release_notes="Zuverlässigere Push-Mitteilungen und stabilere Anmeldung auf dem iPhone.",
+          )
+          app.latest_commit_sha = source
+          app.save(update_fields=["latest_commit_sha", "updated_at"])
+          build = Build.objects.create(release=release, platform="ios", status="queued", commit_sha=source)
+          job = enqueue_job("build_ios", app=app, release=release, build=build, agent=True, platform="macos")
+          print("PUBLISHER_QUEUED", "release", release.pk, "ios_job", job.pk)
+          PY
+
+      - name: Wake real Publisher Mac signing agent
         uses: actions/github-script@v7
         with:
           script: |
             await github.rest.actions.createWorkflowDispatch({
-              owner:context.repo.owner, repo:context.repo.repo,
-              workflow_id:'cloud-macos.yml', ref:'main'
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'cloud-macos.yml', ref: 'main'
             });

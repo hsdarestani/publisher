@@ -134,21 +134,31 @@ jobs:
               directory.name == "gradle-plugin" && directory.parentFile?.name == "@react-native"
           }
           def addVerifiedCompiler = { repositories ->
-              repositories.maven {
+              def compiler = repositories.maven {
                   name = "bedifferentVerifiedKotlin"
                   url = new File(System.getenv("BD_KOTLIN_MAVEN_DIR")).toURI()
                   content { includeVersion("org.jetbrains.kotlin", "kotlin-compiler-embeddable", "2.0.21") }
                   metadataSources { mavenPom() }
               }
+              repositories.remove(compiler)
+              repositories.addFirst(compiler)
           }
+          def usesProjectRepositories = true
           gradle.beforeSettings { settings ->
+              addVerifiedCompiler(settings.dependencyResolutionManagement.repositories)
               if (isReactNativePlugin(settings.settingsDir)) {
                   addVerifiedCompiler(settings.pluginManagement.repositories)
               }
           }
+          gradle.settingsEvaluated { settings ->
+              usesProjectRepositories = settings.dependencyResolutionManagement.repositoriesMode.get() ==
+                  org.gradle.api.initialization.resolve.RepositoriesMode.PREFER_PROJECT
+          }
           gradle.beforeProject { project ->
               addVerifiedCompiler(project.buildscript.repositories)
-              if (isReactNativePlugin(project.rootProject.projectDir)) {
+          }
+          gradle.afterProject { project ->
+              if (usesProjectRepositories && !project.repositories.isEmpty()) {
                   addVerifiedCompiler(project.repositories)
               }
           }

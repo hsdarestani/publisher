@@ -109,7 +109,7 @@ jobs:
           fi
           mv "$archive" "$gradle_cache/gradle-8.13-bin.zip"
 
-      - name: Prepare the verified Kotlin compiler for React Native
+      - name: Prepare the verified Kotlin compiler for Android
         shell: bash
         run: |
           set -euo pipefail
@@ -147,8 +147,8 @@ jobs:
               }
           }
           gradle.beforeProject { project ->
+              addVerifiedCompiler(project.buildscript.repositories)
               if (isReactNativePlugin(project.rootProject.projectDir)) {
-                  addVerifiedCompiler(project.buildscript.repositories)
                   addVerifiedCompiler(project.repositories)
               }
           }

@@ -6,6 +6,8 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
+  statuses: write
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -100,3 +102,27 @@ jobs:
               except Exception as exc:
                   report("BD_APPLE_READ_ERROR", {"type": type(exc).__name__})
           PY
+
+      - name: Read the recent dedicated Android agent runs
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          data="$(curl -fsS --max-time 18 -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/be-different-cloud-linux.yml/runs?per_page=6")"
+          printf 'BD_ANDROID_AGENT_RUNS=%s\n' "$(jq -c '[.workflow_runs[]|{id,head_sha,status,conclusion}]' <<< "$data")"
+
+      - name: Link the observation run to its source commit
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATE: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          state=failure
+          if [ "$JOB_STATE" = success ]; then state=success; fi
+          data="$(jq -nc --arg state "$state" --arg target "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state:$state,context:"be-different/store-observation",description:"BE DIFFERENT build 24 status",target_url:$target}')"
+          curl -fsS --max-time 18 -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/json' \
+            -X POST "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -d "$data" -o /dev/null

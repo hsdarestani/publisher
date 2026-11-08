@@ -109,29 +109,48 @@ jobs:
           fi
           mv "$archive" "$gradle_cache/gradle-8.13-bin.zip"
 
-      - name: Use the alternate Maven Central HTTPS endpoint
+      - name: Prepare the verified Kotlin compiler for React Native
         shell: bash
         run: |
           set -euo pipefail
+          compiler_repo="$RUNNER_TEMP/bedifferent-kotlin-maven"
+          coordinate="org/jetbrains/kotlin/kotlin-compiler-embeddable/2.0.21"
+          compiler="kotlin-compiler-embeddable-2.0.21"
+          directory="$compiler_repo/$coordinate"
           init_dir="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
-          mkdir -p "$init_dir"
-          cat > "$init_dir/be-different-central.gradle" <<'GRADLE'
-          import org.gradle.api.artifacts.repositories.MavenArtifactRepository
-
-          def useCentralEndpoint = { repositories ->
-              repositories.withType(MavenArtifactRepository).configureEach { repository ->
-                  if (repository.url?.host == "repo.maven.apache.org") {
-                      repository.setUrl("https://repo1.maven.org" + repository.url.path)
-                  }
+          mkdir -p "$directory" "$init_dir"
+          for extension in jar pom; do
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --connect-timeout 20 --max-time 120 --retry 3 --retry-all-errors \
+              "https://maven-central.storage-download.googleapis.com/maven2/$coordinate/$compiler.$extension" \
+              -o "$directory/$compiler.$extension"
+          done
+          printf '%s  %s\n' \
+            9fa8cdd1de0dccffe154c997d423ec6b5f53cd6d9177e3a77a9b0de03fb1bc81 "$directory/$compiler.jar" \
+            bd4656a46ec418252e5bc5e1c20eb2029fb2a8e0e3cc94eeddfac7e87c8cd5b6 "$directory/$compiler.pom" | sha256sum -c -
+          printf 'BD_KOTLIN_MAVEN_DIR=%s\n' "$compiler_repo" >> "$GITHUB_ENV"
+          cat > "$init_dir/be-different-kotlin.gradle" <<'GRADLE'
+          def isReactNativePlugin = { File directory ->
+              directory.name == "gradle-plugin" && directory.parentFile?.name == "@react-native"
+          }
+          def addVerifiedCompiler = { repositories ->
+              repositories.maven {
+                  name = "bedifferentVerifiedKotlin"
+                  url = new File(System.getenv("BD_KOTLIN_MAVEN_DIR")).toURI()
+                  content { includeVersion("org.jetbrains.kotlin", "kotlin-compiler-embeddable", "2.0.21") }
+                  metadataSources { mavenPom() }
               }
           }
           gradle.beforeSettings { settings ->
-              useCentralEndpoint(settings.pluginManagement.repositories)
-              useCentralEndpoint(settings.dependencyResolutionManagement.repositories)
+              if (isReactNativePlugin(settings.settingsDir)) {
+                  addVerifiedCompiler(settings.pluginManagement.repositories)
+              }
           }
           gradle.beforeProject { project ->
-              useCentralEndpoint(project.buildscript.repositories)
-              useCentralEndpoint(project.repositories)
+              if (isReactNativePlugin(project.rootProject.projectDir)) {
+                  addVerifiedCompiler(project.buildscript.repositories)
+                  addVerifiedCompiler(project.repositories)
+              }
           }
           GRADLE
 

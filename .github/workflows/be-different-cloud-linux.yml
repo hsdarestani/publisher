@@ -109,6 +109,32 @@ jobs:
           fi
           mv "$archive" "$gradle_cache/gradle-8.13-bin.zip"
 
+      - name: Use the alternate Maven Central HTTPS endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          init_dir="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
+          mkdir -p "$init_dir"
+          cat > "$init_dir/be-different-central.gradle" <<'GRADLE'
+          import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+          def useCentralEndpoint = { repositories ->
+              repositories.withType(MavenArtifactRepository).configureEach { repository ->
+                  if (repository.url?.host == "repo.maven.apache.org") {
+                      repository.setUrl("https://repo1.maven.org" + repository.url.path)
+                  }
+              }
+          }
+          gradle.beforeSettings { settings ->
+              useCentralEndpoint(settings.pluginManagement.repositories)
+              useCentralEndpoint(settings.dependencyResolutionManagement.repositories)
+          }
+          gradle.beforeProject { project ->
+              useCentralEndpoint(project.buildscript.repositories)
+              useCentralEndpoint(project.repositories)
+          }
+          GRADLE
+
       - name: Build and deliver BE DIFFERENT Android
         env:
           PYTHONUNBUFFERED: '1'

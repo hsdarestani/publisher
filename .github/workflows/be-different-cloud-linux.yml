@@ -88,6 +88,27 @@ jobs:
             --connect-timeout 10 --max-time 20 \
             https://publisher.smarbiz.sbs/healthz/
 
+      - name: Prepare verified Gradle 8.13 for the Android wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The cache key is the wrapper hash of the Expo Gradle distribution URL.
+          gradle_cache="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists/gradle-8.13-bin/5xuhj0ry160q40clulazy9h7d"
+          mkdir -p "$gradle_cache"
+          archive="$(mktemp "$gradle_cache/.gradle-8.13.XXXXXX")"
+          trap 'rm -f "$archive"' EXIT
+          download_args=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https'
+            --connect-timeout 20 --max-time 120 --retry 3 --retry-all-errors --retry-max-time 240)
+          fetch_gradle() {
+            curl "${download_args[@]}" "$@" -o "$archive" &&
+              printf '%s  %s\n' 20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78 "$archive" | sha256sum -c -
+          }
+          if ! fetch_gradle -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/gradle/gradle-distributions/releases/assets/232373824; then
+            fetch_gradle https://services.gradle.org/distributions/gradle-8.13-bin.zip
+          fi
+          mv "$archive" "$gradle_cache/gradle-8.13-bin.zip"
+
       - name: Build and deliver BE DIFFERENT Android
         env:
           PYTHONUNBUFFERED: '1'

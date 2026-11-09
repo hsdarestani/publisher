@@ -1,0 +1,212 @@
+name: A+ Solution Dienstplan Store Release
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-dienstplan-swipe-store-release-20261109.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: aplus-solution-current-store-submission
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 105
+    env:
+      APLUS_SOURCE_COMMIT: 38b4def7d81c680ae7e4f6ea7c126d56492c44cf
+    steps:
+      - name: Verify exact A+ Solution source is on main
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://api.github.com/repos/hsdarestani/aplussolution/compare/$APLUS_SOURCE_COMMIT...main" |
+            python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] in ("ahead","identical")'
+          curl -fsSL --retry 3 https://app.aplus-solution.de/health/ >/dev/null
+
+      - name: Check live store versions and queue signed Android and iOS builds
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          envs: APLUS_SOURCE_COMMIT
+          command_timeout: 8m
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue
+            docker compose exec -T -e APLUS_SOURCE_COMMIT="$APLUS_SOURCE_COMMIT" web python manage.py shell <<'PY'
+            import json, os, urllib.request
+            from django.db import transaction
+            from django.db.models import Max
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            from apps.publisher.models import Build, Job, MobileApp, Release
+            from apps.publisher.tasks import enqueue_job
+
+            source = os.environ["APLUS_SOURCE_COMMIT"]
+            slug = "a-plus-solution"
+            notes = "Dienstplan: Schichtkarten bleiben beim Wochenwechsel sichtbar. Kundenlogos werden beim Wischen stabil angezeigt."
+            app = MobileApp.objects.get(slug=slug)
+            assert app.bundle_id == "de.aplussolution.workforce" and app.package_name == app.bundle_id
+            assert app.google_account and app.google_account.configured
+            assert app.apple_account and app.apple_account.configured
+            assert app.review_username and app.get_review_password()
+            base = "https://app.aplus-solution.de/api/"
+            login = urllib.request.Request(base + "auth/login/", data=json.dumps({
+                "email": app.review_username, "password": app.get_review_password(),
+            }).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(login, timeout=30) as response:
+                access = json.load(response)["access"]
+            profile = urllib.request.Request(base + "auth/me/", headers={"Authorization": "Bearer " + access})
+            with urllib.request.urlopen(profile, timeout=30) as response:
+                assert json.load(response)["email"] == app.review_username
+            print("REVIEW_LOGIN_OK")
+
+            apple = AppleStoreClient(app.apple_account)
+            app_id = apple.find_app(app.bundle_id)["id"]
+            versions = [item["attributes"] for item in apple.list_versions(app_id)]
+            def version_key(attrs):
+                parts = [int(part) for part in attrs["versionString"].split(".")]
+                return tuple((parts + [0, 0, 0])[:3])
+            current = max(versions, key=version_key)
+            state = current.get("appStoreState") or current.get("appVersionState")
+            editable = {
+                "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "DEVELOPER_REJECTED",
+                "METADATA_REJECTED", "REJECTED", "INVALID_BINARY", "WAITING_FOR_REVIEW", "IN_REVIEW",
+            }
+            major, minor, patch = version_key(current)
+            version = current["versionString"] if state in editable else f"{major}.{minor}.{patch + 1}"
+            def build_code(value):
+                return int(value) if str(value).isdigit() else 0
+            apple_max = max((build_code(item["attributes"].get("version")) for item in apple.list_builds(app_id)), default=0)
+            google = GooglePlayClient(app.google_account)
+            edit = google._open_edit(app.package_name)
+            try:
+                prefix = f"/applications/{google._q(app.package_name)}/edits/{edit.edit_id}"
+                tracks = google._edit_request(edit, "GET", prefix + "/tracks").get("tracks", [])
+                bundles = google._edit_request(edit, "GET", prefix + "/bundles").get("bundles", [])
+            finally:
+                google._safe_delete_edit(edit)
+            google_max = max(
+                [build_code(code) for track in tracks for rel in track.get("releases", []) for code in map(str, rel.get("versionCodes", []))]
+                + [build_code(bundle.get("versionCode")) for bundle in bundles],
+                default=0,
+            )
+
+            with transaction.atomic():
+                app = MobileApp.objects.select_for_update().get(pk=app.pk)
+                release = Release.objects.filter(app=app, source_commit=source).first()
+                if release is None:
+                    db_max = Release.objects.filter(app=app).aggregate(number=Max("build_number"))["number"] or 0
+                    release = Release.objects.create(
+                        app=app, version_name=version, build_number=max(db_max, apple_max, google_max) + 1,
+                        source_branch="main", source_commit=source, android_track="production",
+                        android_rollout=1, ios_release_type="automatic", auto_submit=True,
+                        release_notes=notes, status="building",
+                    )
+                    app.localizations.filter(locale="de-DE").update(release_notes=notes)
+                    app.localizations.filter(locale__in=["en-GB", "en-US"]).update(
+                        release_notes="Duty planner: Shift cards stay visible when switching weeks. Customer logos remain stable during the transition."
+                    )
+                assert release.auto_submit and release.android_track == "production"
+                for platform, runner in (("android", "linux"), ("ios", "macos")):
+                    build, _ = Build.objects.get_or_create(release=release, platform=platform)
+                    job_type = f"build_{platform}"
+                    if not Job.objects.filter(build=build, type=job_type, status__in=["queued", "running", "succeeded"]).exists():
+                        build.status = "queued"
+                        build.save(update_fields=["status", "updated_at"])
+                        enqueue_job(job_type, app=app, release=release, build=build, agent=True, platform=runner)
+            print("RELEASE", release.pk, release.version_name, release.build_number, source, "previous_apple_state", state)
+            PY
+
+      - name: Wake Android and iOS Publisher build agents
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml', 'cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner: context.repo.owner, repo: context.repo.repo, workflow_id, ref: 'main'});
+            }
+
+      - name: Verify both store submissions for the exact build
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          envs: APLUS_SOURCE_COMMIT
+          command_timeout: 90m
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T -e APLUS_SOURCE_COMMIT="$APLUS_SOURCE_COMMIT" web python manage.py shell <<'PY'
+            import os, re, time
+            from django.db import close_old_connections
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            from apps.publisher.models import Job, Release, Submission
+
+            release = Release.objects.get(app__slug="a-plus-solution", source_commit=os.environ["APLUS_SOURCE_COMMIT"])
+            kinds = ("build_android", "build_ios", "upload_apple", "submit_apple", "submit_google")
+            deadline = time.monotonic() + 5100
+            ready = {"in_review", "approved", "live"}
+            last_state = None
+            while time.monotonic() < deadline:
+                close_old_connections()
+                jobs = {kind: Job.objects.filter(release=release, type=kind).order_by("-created_at").first() for kind in kinds}
+                stores = dict(Submission.objects.filter(release=release).values_list("platform", "state"))
+                state = ([(kind, job.status, job.progress) for kind, job in jobs.items() if job], stores)
+                if state != last_state:
+                    print("PUBLISHER_STATE", state, flush=True)
+                    last_state = state
+                for kind, job in jobs.items():
+                    if job and job.status in {"failed", "cancelled"}:
+                        error = re.sub(r"\s+", " ", str(job.error or ""))[:300]
+                        raise RuntimeError(f"Publisher {kind} {job.status}: {error}")
+                if stores.get("android") == "ready_for_review":
+                    raise RuntimeError("Google Play accepted the release but requires Send for review in Play Console")
+                if all(stores.get(platform) in ready for platform in ("android", "ios")) and all(
+                    jobs[kind] and jobs[kind].status == "succeeded" for kind in ("submit_google", "submit_apple")
+                ):
+                    break
+                time.sleep(20)
+            else:
+                raise RuntimeError("Timed out waiting for both Publisher submission jobs")
+
+            app = release.app
+            apple = AppleStoreClient(app.apple_account)
+            app_id = apple.find_app(app.bundle_id)["id"]
+            version = apple.find_editable_version(app_id, release.version_name)
+            attrs = version["attributes"]
+            apple_state = attrs.get("appStoreState") or attrs.get("appVersionState")
+            attached = apple.request("GET", f"/appStoreVersions/{version['id']}/relationships/build")["data"]["id"]
+            ios = release.builds.get(platform="ios")
+            assert attached == ios.external_build_id, "App Store Connect has a different attached build"
+            assert apple_state in {
+                "WAITING_FOR_REVIEW", "IN_REVIEW", "PENDING_DEVELOPER_RELEASE",
+                "PENDING_APPLE_RELEASE", "PROCESSING_FOR_APP_STORE", "READY_FOR_SALE", "READY_FOR_DISTRIBUTION",
+            }, apple_state
+            google = GooglePlayClient(app.google_account)
+            edit = google._open_edit(app.package_name)
+            try:
+                path = f"/applications/{google._q(app.package_name)}/edits/{edit.edit_id}/tracks/production"
+                production = google._edit_request(edit, "GET", path)
+            finally:
+                google._safe_delete_edit(edit)
+            matching = [rel for rel in production.get("releases", []) if str(release.build_number) in map(str, rel.get("versionCodes", []))]
+            assert matching, "Google Play Production has no matching version code"
+            assert all(rel.get("status") != "draft" for rel in matching), matching
+            print("STORE_SUBMISSIONS_VERIFIED", release.version_name, release.build_number, "APPLE", apple_state, "GOOGLE", [rel.get("status") for rel in matching])
+            PY

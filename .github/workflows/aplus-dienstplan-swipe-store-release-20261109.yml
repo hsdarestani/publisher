@@ -45,7 +45,7 @@ jobs:
             cd /opt/aplus-publisher
             docker compose exec -T web python manage.py provision_ios_signing a-plus-solution --no-queue
             docker compose exec -T -e APLUS_SOURCE_COMMIT="$APLUS_SOURCE_COMMIT" web python manage.py shell <<'PY'
-            import json, os, urllib.request
+            import json, os, subprocess
             from django.db import transaction
             from django.db.models import Max
             from apps.integrations.apple_store import AppleStoreClient
@@ -61,15 +61,16 @@ jobs:
             assert app.google_account and app.google_account.configured
             assert app.apple_account and app.apple_account.configured
             assert app.review_username and app.get_review_password()
-            base = "https://app.aplus-solution.de/api/"
-            login = urllib.request.Request(base + "auth/login/", data=json.dumps({
-                "email": app.review_username, "password": app.get_review_password(),
-            }).encode(), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(login, timeout=30) as response:
-                access = json.load(response)["access"]
-            profile = urllib.request.Request(base + "auth/me/", headers={"Authorization": "Bearer " + access})
-            with urllib.request.urlopen(profile, timeout=30) as response:
-                assert json.load(response)["email"] == app.review_username
+            login = subprocess.run(
+                ["curl", "--silent", "--show-error", "--fail", "--max-time", "30",
+                 "--header", "Content-Type: application/json", "--data-binary", "@-",
+                 "https://app.aplus-solution.de/api/auth/login/"],
+                input=json.dumps({"email": app.review_username, "password": app.get_review_password()}),
+                text=True, stdout=subprocess.PIPE, check=True,
+            )
+            result = json.loads(login.stdout)
+            assert result.get("access") and result.get("refresh")
+            assert result["user"]["email"] == app.review_username and result["user"]["role"] == "worker"
             print("REVIEW_LOGIN_OK")
 
             apple = AppleStoreClient(app.apple_account)

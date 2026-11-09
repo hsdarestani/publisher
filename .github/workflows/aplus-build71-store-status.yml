@@ -1,0 +1,65 @@
+name: A+ Solution Build 71 Store Status
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-build71-store-status.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    steps:
+      - name: Check the exact release without changing store state
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            from apps.publisher.models import Job, Release, Submission
+
+            release = Release.objects.get(app__slug="a-plus-solution", source_commit="38b4def7d81c680ae7e4f6ea7c126d56492c44cf")
+            print("RELEASE", release.version_name, release.build_number, release.status)
+            for job in Job.objects.filter(release=release).order_by("created_at"):
+                print("JOB", job.pk, job.type, job.status, job.progress)
+                for line in job.logs.splitlines()[-5:]:
+                    if line.startswith(("Apple accepted the binary upload", "Waiting for App Store", "App Store Connect", "Signed AAB ready")):
+                        print(line)
+            print("SUBMISSIONS", list(Submission.objects.filter(release=release).values_list("platform", "state")))
+            app = release.app
+            apple = AppleStoreClient(app.apple_account)
+            app_id = apple.find_app(app.bundle_id)["id"]
+            build = release.builds.filter(platform="ios").first()
+            binaries = apple.list_builds(app_id, release.build_number)
+            print("APPLE_BINARY", [item["attributes"].get("processingState") for item in binaries])
+            version = apple.find_editable_version(app_id, release.version_name)
+            if version:
+                attrs = version["attributes"]
+                state = attrs.get("appStoreState") or attrs.get("appVersionState")
+                attached = apple.request("GET", f"/appStoreVersions/{version['id']}/build").get("data") if build and build.external_build_id else None
+                print("APPLE_VERSION", state, "EXACT_BUILD_ATTACHED", bool(attached and attached["id"] == build.external_build_id))
+            google = GooglePlayClient(app.google_account)
+            edit = google._open_edit(app.package_name)
+            try:
+                path = f"/applications/{google._q(app.package_name)}/edits/{edit.edit_id}/tracks/production"
+                production = google._edit_request(edit, "GET", path)
+                print("GOOGLE_PRODUCTION", [
+                    item.get("status") for item in production.get("releases", [])
+                    if str(release.build_number) in map(str, item.get("versionCodes", []))
+                ])
+            finally:
+                google._safe_delete_edit(edit)
+            PY

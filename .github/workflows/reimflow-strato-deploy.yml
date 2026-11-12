@@ -17,7 +17,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 20
+    timeout-minutes: 38
     steps:
       - name: Checkout current Reimflow
         uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile reimflow-src/rhyme_jobs.py reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py reimflow-src/style_intelligence.py reimflow-src/lyrics_import_lrclib.py
+          python3 -m py_compile reimflow-src/rhyme_jobs.py reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py reimflow-src/style_intelligence.py reimflow-src/lyrics_import_lrclib.py reimflow-src/lyrics_import_expanded.py
           cd reimflow-src
           python3 -m unittest discover -s tests -p "test_platform_api.py"
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
@@ -42,10 +42,11 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           python3 -m unittest discover -s tests -p "test_style_intelligence.py"
           python3 -m unittest discover -s tests -p "test_lyrics_import_lrclib.py"
+          python3 -m unittest discover -s tests -p "test_lyrics_import_expanded.py"
           python3 -m unittest discover -s tests -p "test_corpus_routes.py"
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -61,6 +62,7 @@ jobs:
           REIMFLOW_SMTP_PASSWORD: ${{ secrets.REIMFLOW_SMTP_PASSWORD }}
           REIMFLOW_SMTP_FROM: ${{ secrets.REIMFLOW_SMTP_FROM }}
           CORPUS_IMPORT_ONCE: ${{ contains(github.event.head_commit.message, '[reimflow-corpus-import]') }}
+          CORPUS_EXPAND_ONCE: ${{ contains(github.event.head_commit.message, '[reimflow-corpus-expand]') }}
         run: |
           set -euo pipefail
           test "$DEPLOY_HOST" = "82.165.187.14" || { echo "::error::Publisher HOST must point to the new STRATO 82.165.187.14"; exit 1; }
@@ -102,6 +104,9 @@ jobs:
           if [ "$CORPUS_IMPORT_ONCE" = "true" ]; then
             printf 'REIMFLOW_ONE_TIME_CORPUS_IMPORT=1\n' >> "$ENVFILE"
           fi
+          if [ "$CORPUS_EXPAND_ONCE" = "true" ]; then
+            printf 'REIMFLOW_ONE_TIME_CORPUS_EXPAND=1\n' >> "$ENVFILE"
+          fi
           chmod 600 "$ENVFILE"
           scp -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -P "$PORT" "$RUNNER_TEMP/reimflow-strato.tar.gz" "$ENVFILE" root@"$DEPLOY_HOST":/tmp/
           ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$DEPLOY_HOST" 'bash -se' <<'REMOTE'
@@ -135,8 +140,9 @@ jobs:
           mv /opt/reimflow/site/rhyme-intent.py /opt/reimflow/rhyme-intent.py
           mv /opt/reimflow/site/style_intelligence.py /opt/reimflow/style_intelligence.py
           mv /opt/reimflow/site/lyrics_import_lrclib.py /opt/reimflow/lyrics_import_lrclib.py
+          mv /opt/reimflow/site/lyrics_import_expanded.py /opt/reimflow/lyrics_import_expanded.py
           chmod 644 /opt/reimflow/platform_api.py /opt/reimflow/rhyme_jobs.py /opt/reimflow/role_admin.py
-          chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py /opt/reimflow/rhyme-intent.py /opt/reimflow/style_intelligence.py /opt/reimflow/lyrics_import_lrclib.py
+          chmod 644 /opt/reimflow/api.py /opt/reimflow/rap-flow-analysis.py /opt/reimflow/rhyme-quality.py /opt/reimflow/rhyme-intent.py /opt/reimflow/style_intelligence.py /opt/reimflow/lyrics_import_lrclib.py /opt/reimflow/lyrics_import_expanded.py
           cp /tmp/reimflow-strato.env /opt/reimflow/.env
           chmod 600 /opt/reimflow/.env
           printf 'PUBLISHER_NETWORK=%s\n' "$PUBLISHER_NETWORK" >> /opt/reimflow/.env
@@ -228,6 +234,7 @@ jobs:
                 - ./rhyme-intent.py:/app/rhyme-intent.py:ro
                 - ./style_intelligence.py:/app/style_intelligence.py:ro
                 - ./lyrics_import_lrclib.py:/app/lyrics_import_lrclib.py:ro
+                - ./lyrics_import_expanded.py:/app/lyrics_import_expanded.py:ro
                 - ./data:/var/lib/reimflow
               read_only: true
               tmpfs:
@@ -266,6 +273,19 @@ jobs:
               --review-due "$RIGHTS_REVIEW_DUE" \
               --rights-confirmed --source-terms-confirmed --max-per-artist 20
             sed -i '/^REIMFLOW_ONE_TIME_CORPUS_IMPORT=1$/d' /opt/reimflow/.env
+          fi
+          if grep -qx 'REIMFLOW_ONE_TIME_CORPUS_EXPAND=1' /opt/reimflow/.env; then
+            echo "Expanding nine-artist licensed lyric analysis with track-level catalog discovery; existing data preserved."
+            RIGHTS_REVIEW_DUE="$(date -u -d '+90 days' +%F)"
+            # Preserve DB on every failure and never publish raw lyric text.
+            docker compose exec -T api python /app/lyrics_import_expanded.py \
+              --db /var/lib/reimflow/reimflow.sqlite3 \
+              --rights-ref "user-attested-direct-artist-consent-2026-11-12" \
+              --review-due "$RIGHTS_REVIEW_DUE" \
+              --rights-confirmed --source-terms-confirmed \
+              --target-total 350 --max-candidates-per-artist 140 \
+              --time-budget-seconds 1120
+            sed -i '/^REIMFLOW_ONE_TIME_CORPUS_EXPAND=1$/d' /opt/reimflow/.env
           fi
           for i in $(seq 1 20); do
             if docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8787/api/health',timeout=3).read().decode())" </dev/null; then

@@ -287,6 +287,11 @@ jobs:
               --time-budget-seconds 1120
             sed -i '/^REIMFLOW_ONE_TIME_CORPUS_EXPAND=1$/d' /opt/reimflow/.env
           fi
+          # Source statistics are accessible from inside the private container,
+          # never via a publicly reachable website or API endpoint.
+          docker compose exec -T api python /app/style_intelligence.py status \
+            --db /var/lib/reimflow/reimflow.sqlite3 | \
+            python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["licensed_tracks"]>=85, j; assert j["artists_covered"]==9, j; print("PRIVATE_CORPUS_VERIFIED", {k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed")})'
           for i in $(seq 1 20); do
             if docker compose exec -T api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8787/api/health',timeout=3).read().decode())" </dev/null; then
               break
@@ -338,29 +343,17 @@ jobs:
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
       # User-authorized one-time corpus ingestion; the deploy step records only aggregate data.
-      - name: Verify licensed context endpoint and nine-artist backend
+      - name: Verify artist metadata and corpus internals are not public
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL --max-time 20 'https://reimflow.smarbiz.sbs/api/rhymes/context-status' > "$RUNNER_TEMP/reimflow-context.json"
-          python3 - "$RUNNER_TEMP/reimflow-context.json" <<'PY'
-          import json,sys
-          j=json.load(open(sys.argv[1],encoding="utf8"))
-          assert j.get("ok") is True and j.get("method")=="rights_cleared_aggregate_features"
-          assert j.get("lyrics_included") is False
-          for key in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count","public_research_profiles"):
-              assert isinstance(j.get(key),int) and j[key]>=0,(key,j)
-          assert j["public_research_profiles"]==9,"All nine public artist research profiles must be deployed"
-          print("Licensed context status checked:",{k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count","public_research_profiles")})
-          PY
-      - name: Verify mobile diagnostic URLs resolve instead of 404
-        shell: bash
-        run: |
-          set -euo pipefail
-          for ROUTE in '/api/rhymes/context-status/' '/api/rhymes/context-status?source=mobile' '/api/corpus/status'; do
-            curl -fsSL --max-time 20 "https://reimflow.smarbiz.sbs$ROUTE" | python3 -c 'import json,sys;j=json.load(sys.stdin);assert j["ok"] and j["public_research_profiles"]==9'
-            echo "Live diagnostic route OK: $ROUTE"
+          for ROUTE in '/api/rhymes/context-status' '/api/rhymes/context-status/' '/api/rhymes/context-status?source=mobile' '/api/corpus/status'; do
+            STATUS="$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://reimflow.smarbiz.sbs$ROUTE")"
+            test "$STATUS" = "404" || { echo "::error::Internal source details leaked at $ROUTE (HTTP $STATUS)"; exit 1; }
+            echo "Public source metadata blocked: $ROUTE"
           done
+          curl -fsSL --max-time 20 'https://reimflow.smarbiz.sbs/api/health' | \
+            python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["ok"] and j["ai"] and "model" not in j'
       - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash
         run: |
@@ -396,21 +389,13 @@ jobs:
           query=sys.argv[2]
           items=data.get("rhymes") or []
           print("Review:",query,"candidates approved:",len(items),
-                "timing_ms:",data.get("timing_ms"),
-                "generator:",data.get("model"),"reviewer:",data.get("review_model"),
                 "accepted words:",", ".join(str(x.get("word")) for x in items))
           assert data.get("ok") is True and data.get("quality_reviewed") is True
-          assert data.get("review_model"),"Second model must judge every result"
+          for private_field in ("knowledge","context_revision","model","review_model","timing_ms","quality_method","intent"):
+              assert private_field not in data,(query,private_field)
           assert all(x.get("strength") in ("stark","brauchbar") for x in items)
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
           assert all(x.get("german_valid") is True for x in items),"Non-German or unverified rhyme passed the language gate"
-          if query=="Abendhimmel":
-              times=data.get("timing_ms") or {}
-              assert all(isinstance(times.get(stage),int) and times[stage]>=0
-                         for stage in ("generation","review")),"Missing cold AI latency measurements"
-              print("COLD GERMAN RHYME GENERATION ms:",times["generation"],
-                    "INDEPENDENT REVIEW ms:",times["review"],
-                    "TOTAL ms:",times["generation"]+times["review"])
           assert all(x.get("register")!="Englisch/Code-Switch" for x in items),"English code-switch escaped into German-only suggestions"
           # Foreign input is allowed, but German-only mode may have zero legitimate rhymes.
           # Never force English suggestions to satisfy a result-count assertion.

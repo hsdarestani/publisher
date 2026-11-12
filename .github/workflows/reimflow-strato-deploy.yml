@@ -38,7 +38,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rhyme_timeout_fallback.py"
           python3 -m unittest discover -s tests -p "test_rhyme_quality.py"
           python3 -m unittest discover -s tests -p "test_german_only.py"
-          grep -q 'max_output_tokens":8500' api.py
+          grep -q 'max_output_tokens":max_output_tokens' api.py
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           python3 -m unittest discover -s tests -p "test_style_intelligence.py"
           python3 -m unittest discover -s tests -p "test_lyrics_import_lrclib.py"

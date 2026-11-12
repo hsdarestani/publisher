@@ -356,6 +356,7 @@ jobs:
           done
           curl -fsSL --max-time 20 'https://reimflow.smarbiz.sbs/api/health' | \
             python3 -c 'import json,sys; j=json.load(sys.stdin); assert j["ok"] and j["ai"] and "model" not in j'
+      # Fast candidate generation, standard-tier independent review, bounded rate-limit retry.
       - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash
         run: |

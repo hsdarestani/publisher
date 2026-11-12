@@ -342,6 +342,7 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
+      # Second bounded catalog pass prioritizes lesser-covered artists first.
       # Controlled expansion of the pre-cleared artist corpus; provenance audited on server.
       # User-authorized one-time corpus ingestion; the deploy step records only aggregate data.
       - name: Verify artist metadata and corpus internals are not public

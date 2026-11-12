@@ -42,6 +42,7 @@ jobs:
           python3 -m unittest discover -s tests -p "test_rhyme_intent.py"
           python3 -m unittest discover -s tests -p "test_style_intelligence.py"
           python3 -m unittest discover -s tests -p "test_lyrics_import_lrclib.py"
+          python3 -m unittest discover -s tests -p "test_corpus_routes.py"
           cd ..
           cd reimflow-src
           tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py
@@ -332,6 +333,14 @@ jobs:
           assert j["public_research_profiles"]==9,"All nine public artist research profiles must be deployed"
           print("Licensed context status checked:",{k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count","public_research_profiles")})
           PY
+      - name: Verify mobile diagnostic URLs resolve instead of 404
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ROUTE in '/api/rhymes/context-status/' '/api/rhymes/context-status?source=mobile' '/api/corpus/status'; do
+            curl -fsSL --max-time 20 "https://reimflow.smarbiz.sbs$ROUTE" | python3 -c 'import json,sys;j=json.load(sys.stdin);assert j["ok"] and j["public_research_profiles"]==9'
+            echo "Live diagnostic route OK: $ROUTE"
+          done
       - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash
         run: |

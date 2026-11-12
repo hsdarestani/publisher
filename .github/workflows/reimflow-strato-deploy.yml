@@ -305,9 +305,10 @@ jobs:
           j=json.load(open(sys.argv[1],encoding="utf8"))
           assert j.get("ok") is True and j.get("method")=="rights_cleared_aggregate_features"
           assert j.get("lyrics_included") is False
-          for key in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count"):
+          for key in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count","public_research_profiles"):
               assert isinstance(j.get(key),int) and j[key]>=0,(key,j)
-          print("Licensed context status checked:",{k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count")})
+          assert j["public_research_profiles"]==9,"All nine public artist research profiles must be deployed"
+          print("Licensed context status checked:",{k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count","public_research_profiles")})
           PY
       - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash

@@ -295,6 +295,20 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
+      - name: Verify licensed context endpoint and nine-artist backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 20 'https://reimflow.smarbiz.sbs/api/rhymes/context-status' > "$RUNNER_TEMP/reimflow-context.json"
+          python3 - "$RUNNER_TEMP/reimflow-context.json" <<'PY'
+          import json,sys
+          j=json.load(open(sys.argv[1],encoding="utf8"))
+          assert j.get("ok") is True and j.get("method")=="rights_cleared_aggregate_features"
+          assert j.get("lyrics_included") is False
+          for key in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count"):
+              assert isinstance(j.get(key),int) and j[key]>=0,(key,j)
+          print("Licensed context status checked:",{k:j[k] for k in ("licensed_tracks","artists_covered","lines_analyzed","feedback_count")})
+          PY
       - name: Require independently reviewed German-only rhyme candidates for real searches
         shell: bash
         run: |

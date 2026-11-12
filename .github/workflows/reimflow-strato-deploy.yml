@@ -88,7 +88,7 @@ jobs:
             ssh-keygen -lf "$HOME/.ssh/known_hosts" | grep -F -- "$EXPECTED_FINGERPRINT" >/dev/null
           fi
           ENVFILE="$RUNNER_TEMP/reimflow-strato.env"
-          printf 'OPENAI_MODEL=gpt-5.6-sol\nRHYME_REVIEW_MODEL=gpt-5.6-terra\nREIMFLOW_RHYME_EFFORT=low\n' > "$ENVFILE"
+          printf 'OPENAI_MODEL=gpt-5.6-sol\nRHYME_REVIEW_MODEL=gpt-5.6-terra\nREIMFLOW_RHYME_EFFORT=low\nREIMFLOW_RHYME_SERVICE_TIER=fast\n' > "$ENVFILE"
           if [ -n "$OPENAI_API_KEY" ]; then
             printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> "$ENVFILE"
           fi

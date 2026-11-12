@@ -535,7 +535,7 @@ jobs:
               fi
               echo "Recording WAV duration and robust HTTP analysis errors: verified"
               OFFLINE_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-fallback.js?v=20261019-de1')"
-              if [[ "$SITE" != *'rhyme-fallback.js?v=20261019-de1'* ]] || [[ "$APP_JS" != *'Vorschläge ohne KI-Prüfung'* ]] || [[ "$OFFLINE_JS" != *'ReimflowOfflineRhymes'* ]]; then
+              if [[ "$SITE" != *'rhyme-fallback.js?v=20261019-de1'* ]] || [[ "$APP_JS" != *'Noch ungeprüfte Vorschläge'* ]] || [[ "$OFFLINE_JS" != *'ReimflowOfflineRhymes'* ]]; then
                 echo "::error::Rhyme search offline recovery is not deployed."
                 exit 1
               fi

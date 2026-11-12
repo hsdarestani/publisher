@@ -316,6 +316,7 @@ jobs:
           rm -f /tmp/reimflow-strato.tar.gz /tmp/reimflow-strato.env /tmp/reimflow-publisher-network
           echo "Reimflow containers healthy and Publisher Caddy reloaded."
           REMOTE
+      # User-authorized one-time corpus ingestion; the deploy step records only aggregate data.
       - name: Verify licensed context endpoint and nine-artist backend
         shell: bash
         run: |

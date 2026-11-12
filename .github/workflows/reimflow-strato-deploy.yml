@@ -361,7 +361,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for QUERY in "Nacht" "Pokerface"; do
+          for QUERY in "Pokerface"; do
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \

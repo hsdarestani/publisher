@@ -283,7 +283,7 @@ jobs:
               --rights-ref "user-attested-direct-artist-consent-2026-11-12" \
               --review-due "$RIGHTS_REVIEW_DUE" \
               --rights-confirmed --source-terms-confirmed \
-              --target-total 350 --max-candidates-per-artist 140 \
+              --target-total 9999 --max-candidates-per-artist 220 \
               --time-budget-seconds 1120
             sed -i '/^REIMFLOW_ONE_TIME_CORPUS_EXPAND=1$/d' /opt/reimflow/.env
           fi

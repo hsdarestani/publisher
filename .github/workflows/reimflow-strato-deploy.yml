@@ -541,8 +541,8 @@ jobs:
                 exit 1
               fi
               echo "Rhyme search offline recovery: verified"
-              PREVIEW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-previews.js?v=20261019-de1')"
-              if [[ "$SITE" != *'rhyme-previews.js?v=20261019-de1'* ]] || [[ "$PREVIEW_JS" != *'ReimflowRhymePreviews'* ]] || [[ "$APP_JS" != *'Sofort-Ideen fürs Endwort'* ]]; then
+              PREVIEW_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/rhyme-previews.js?v=20261112-near1')"
+              if [[ "$SITE" != *'rhyme-previews.js?v=20261112-near1'* ]] || [[ "$PREVIEW_JS" != *'ReimflowRhymePreviews'* ]] || [[ "$APP_JS" != *'Sofort-Ideen fürs Endwort'* ]]; then
                 echo "::error::Immediate phrase and anchor rhyme previews are not deployed."
                 exit 1
               fi

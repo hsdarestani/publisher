@@ -1,0 +1,68 @@
+name: Verify BE DIFFERENT 1.3.4 Build 25 final store status
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/bedifferent-1-3-4-release38-status.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read the exact BE DIFFERENT release and store records
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          port="${SSH_PORT:-22}"
+          umask 077
+          key="$RUNNER_TEMP/bedifferent-status-key"
+          known="$RUNNER_TEMP/bedifferent-status-known-hosts"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$key"
+          ssh-keyscan -T 12 -p "$port" -H "$HOST" > "$known" 2>/dev/null
+          test -s "$known"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$known" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            askpass="$RUNNER_TEMP/bedifferent-status-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$askpass"
+            chmod 700 "$askpass"
+            DISPLAY=:0 SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$key" </dev/null
+          fi
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$known" -o ConnectTimeout=15 -p "$port" root@"$HOST" \
+            'cd /opt/aplus-publisher && docker compose exec -T web python manage.py shell' <<'PY'
+          import json
+          from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+          app = MobileApp.objects.get(slug='be-different', bundle_id='com.smarbiz.bedifferent')
+          release = Release.objects.get(app=app, pk=38, version_name='1.3.4', build_number=25)
+          assert release.source_commit == 'fcde10bbca9e3e036d2854d837ad8957a84a91e3', 'Unexpected source commit for release 38'
+          def out(name, value):
+              print(name+'='+json.dumps(value, default=str, sort_keys=True), flush=True)
+          out('BD134_RELEASE', {'id':release.id,'version':release.version_name,'build':release.build_number,'source':release.source_commit,'status':release.status,'auto_submit':release.auto_submit,'android_track':release.android_track})
+          out('BD134_BUILDS', list(Build.objects.filter(release=release).values('platform','status','external_build_id','artifact_size','finished_at')))
+          out('BD134_JOBS', [{'id':j.id,'type':j.type,'status':j.status,'progress':j.progress,'last_error':(j.error or '')[-900:]} for j in Job.objects.filter(release=release).order_by('id')])
+          out('BD134_SUBMISSIONS', list(Submission.objects.filter(release=release).values('platform','state','external_id','submitted_at','last_error')))
+          try:
+              from apps.integrations.apple_store import AppleStoreClient
+              if app.apple_account and app.apple_account.configured:
+                  apple=AppleStoreClient(app.apple_account)
+                  app_id=str(apple.find_app(app.bundle_id)['id'])
+                  matched=apple.list_builds(app_id,build_number='25')
+                  out('BD134_APPLE_BUILD', [{'id':v.get('id'),'number':v.get('attributes',{}).get('version'),'processing':v.get('attributes',{}).get('processingState')} for v in matched])
+                  versions=apple.list_versions(app_id)
+                  out('BD134_APPLE_VERSION',[{'id':v.get('id'),'version':v.get('attributes',{}).get('versionString'),'state':v.get('attributes',{}).get('appStoreState')} for v in versions if v.get('attributes',{}).get('versionString')=='1.3.4'])
+          except Exception as exc:
+              out('BD134_APPLE_READ_ERROR',type(exc).__name__)
+          PY

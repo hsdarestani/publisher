@@ -186,7 +186,10 @@ def github_release_automation(request) -> bool:
         logger.warning("Rejected BE DIFFERENT release OIDC token: %s", exc)
         return False
 
-    if claims.get("repository") != "hsdarestani/aymantraining":
+    # Accept only the two authorized, pinned source repositories. Other
+    # repos cannot request builds through the release automation endpoint.
+    allowed_repos = {"hsdarestani/aymantraining", "hsdarestani/gtacheat"}
+    if claims.get("repository") not in allowed_repos:
         return False
     if claims.get("ref") != "refs/heads/main":
         return False

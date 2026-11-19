@@ -197,7 +197,9 @@ def ensure_ios_app_store_profile(app) -> IOSProvisioningProfile:
 
     distribution = ensure_ios_distribution_signing(app.apple_account)
     client = AppleStoreClient(app.apple_account)
-    bundle = _find_apple_bundle_id(client, app.bundle_id)
+    # First-time store registrations do not yet have an Apple Bundle ID.
+    # Reuse an existing identifier, or create it once via the same Apple API.
+    bundle = _ensure_apple_bundle_id(client, app.bundle_id, app.name)
     # Fresh Publisher installations must not recreate the old generic profile
     # name: Apple may still retain multiple profiles with that exact name.
     # Bind the deterministic name to the actual managed distribution certificate

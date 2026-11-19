@@ -29,6 +29,13 @@ jobs:
         with:
           node-version: '22'
 
+      # Vice Codes is a native Flutter app; Xcode alone cannot compile it.
+      - name: Set up Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

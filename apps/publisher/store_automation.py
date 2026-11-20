@@ -42,7 +42,7 @@ def vice_codes_store(request):
         return JsonResponse({"ok": False, "error": "store_safety_gate", "reason": "Only internal testing with auto_submit off is supported."}, status=409)
 
     mode = body.get("mode", "preflight")
-    if mode not in {"preflight", "upload_test", "status", "submit_public", "fix_apple_metadata", "set_apple_free_price"}:
+    if mode not in {"preflight", "upload_test", "status", "submit_public", "submit_google_only", "fix_apple_metadata", "set_apple_free_price"}:
         return JsonResponse({"ok": False, "error": "unsupported_mode"}, status=400)
     builds = {b.platform: b for b in release.builds.all()}
     check = {
@@ -255,7 +255,7 @@ def vice_codes_store(request):
                     job = enqueue_job("upload_google", app=app, release=release, build=builds[platform])
                 queued.append({"platform": platform, "job": _compact_job(job)})
 
-    if mode == "submit_public":
+    if mode in {"submit_public", "submit_google_only"}:
         # A user authorized publication of this specific already-uploaded app.
         # Explicit hard gates prevent accidental submission of another release
         # or of a listing lacking essential legal/store material.
@@ -274,7 +274,7 @@ def vice_codes_store(request):
             and app.localizations.filter(locale="de-DE").exclude(full_description="").exists()
             and app.assets.filter(kind="icon", platform__in=("shared", "ios", "android")).exists()
         )
-        for platform in ("ios", "android"):
+        for platform in (("android",) if mode == "submit_google_only" else ("ios", "android")):
             missing = []
             if not common_ready:
                 missing.append("Legal URLs, German description or original app icon missing.")
@@ -368,6 +368,6 @@ def vice_codes_store(request):
         "submissions": submissions,
         "apple_processed_build_id": (builds["ios"].external_build_id if builds.get("ios") else ""),
         "android_track": release.android_track,
-        "public_submission_queued": mode == "submit_public" and bool(queued),
+        "public_submission_queued": mode in {"submit_public", "submit_google_only"} and bool(queued),
         "apple_metadata": metadata_result,
     })

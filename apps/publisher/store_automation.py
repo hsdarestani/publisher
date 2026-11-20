@@ -199,6 +199,12 @@ def vice_codes_store(request):
         "queued": queued,
         "skipped": skipped,
         "prior_jobs": prior,
+        "public_jobs": [
+            _compact_job(job)
+            for job in Job.objects.filter(
+                release=release, type__in=("submit_apple", "submit_google")
+            ).order_by("-created_at")[:12]
+        ],
         "submissions": submissions,
         "apple_processed_build_id": (builds["ios"].external_build_id if builds.get("ios") else ""),
         "android_track": release.android_track,

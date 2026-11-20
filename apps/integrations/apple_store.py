@@ -54,7 +54,7 @@ class AppleStoreClient:
         headers.update({"Authorization": f"Bearer {self.token()}", "Content-Type": "application/json"})
         response = requests.request(method, f"{BASE_URL}{path}", headers=headers, timeout=90, **kwargs)
         if not response.ok:
-            raise IntegrationError(f"Apple API {response.status_code}: {response.text[:1000]}")
+            raise IntegrationError(f"Apple API {response.status_code}: {response.text[:6000]}")
         if response.status_code == 204:
             return {}
         return response.json()

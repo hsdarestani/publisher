@@ -93,6 +93,9 @@ STORAGES = {
 MEDIA_URL = "/media/"
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", BASE_DIR / "media"))
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+# Real 13-inch iPad PNG screenshots exceed Django's 2.5 MB default after base64 encoding.
+# The screenshot endpoint independently enforces an 11 MB limit and validates the PNG.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 11_000_000
 
 AUTHENTICATION_BACKENDS = ["apps.core.auth.EmailOrUsernameBackend"]
 LOGIN_URL = "login"

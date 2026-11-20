@@ -42,7 +42,7 @@ def vice_codes_store(request):
         return JsonResponse({"ok": False, "error": "store_safety_gate", "reason": "Only internal testing with auto_submit off is supported."}, status=409)
 
     mode = body.get("mode", "preflight")
-    if mode not in {"preflight", "upload_test", "status", "submit_public", "fix_apple_metadata"}:
+    if mode not in {"preflight", "upload_test", "status", "submit_public", "fix_apple_metadata", "set_apple_free_price"}:
         return JsonResponse({"ok": False, "error": "unsupported_mode"}, status=400)
     builds = {b.platform: b for b in release.builds.all()}
     check = {
@@ -167,6 +167,70 @@ def vice_codes_store(request):
             metadata_result["copyright"] = "2026 A+ Solution GmbH"
         else:
             metadata_result["copyright"] = "already_set"
+
+    if mode == "set_apple_free_price":
+        # One-time free 0.00 app price. Never modify existing schedules or
+        # chargeable tiers, and never affect another application.
+        if not statuses["ios"]["linked"] or not preflight.get("ios", {}).get("ok"):
+            return JsonResponse({"ok": False, "error": "apple_preflight_required"}, status=409)
+        from apps.integrations.apple_store import AppleStoreClient
+        client = AppleStoreClient(app.apple_account)
+        app_id = str(preflight["ios"]["record_id"])
+        existing_schedule = None
+        try:
+            existing_schedule = client.request("GET", f"/apps/{app_id}/appPriceSchedule").get("data")
+        except Exception as exc:
+            if "404" not in str(exc):
+                raise
+        if existing_schedule:
+            metadata_result["free_price"] = "existing_price_schedule_not_modified"
+        else:
+            price_points = client.request(
+                "GET", f"/apps/{app_id}/appPricePoints?filter[territory]=DEU&limit=200"
+            ).get("data", [])
+            free_point = next(
+                (point for point in price_points
+                 if str(point.get("attributes", {}).get("customerPrice", "")).strip()
+                 in {"0", "0.0", "0.00", "0.0000"}),
+                None,
+            )
+            if free_point is None:
+                return JsonResponse({
+                    "ok": False, "error": "no_verified_free_price_point",
+                    "points_sample": [
+                        {"id": p.get("id"), "customerPrice": p.get("attributes", {}).get("customerPrice")}
+                        for p in price_points[:5]
+                    ],
+                }, status=409)
+            ref = "${newprice-0}"
+            payload = {
+                "data": {
+                    "type": "appPriceSchedules",
+                    "attributes": {},
+                    "relationships": {
+                        "app": {"data": {"type": "apps", "id": app_id}},
+                        "baseTerritory": {"data": {"type": "territories", "id": "DEU"}},
+                        "manualPrices": {"data": [{"type": "appPrices", "id": ref}]},
+                    },
+                },
+                "included": [{
+                    "type": "appPrices", "id": ref,
+                    "attributes": {"startDate": None, "endDate": None},
+                    "relationships": {
+                        "appPricePoint": {"data": {
+                            "type": "appPricePoints", "id": str(free_point["id"])
+                        }},
+                    },
+                }],
+            }
+            result = client.request(
+                "POST", "/appPriceSchedules", data=json.dumps(payload)
+            )
+            metadata_result["free_price"] = {
+                "schedule_id": result["data"]["id"],
+                "base_country": "DEU",
+                "amount": "0.00",
+            }
 
     queued = []
     skipped = []

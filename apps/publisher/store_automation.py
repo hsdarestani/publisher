@@ -42,7 +42,7 @@ def vice_codes_store(request):
         return JsonResponse({"ok": False, "error": "store_safety_gate", "reason": "Only internal testing with auto_submit off is supported."}, status=409)
 
     mode = body.get("mode", "preflight")
-    if mode not in {"preflight", "upload_test", "status", "submit_public"}:
+    if mode not in {"preflight", "upload_test", "status", "submit_public", "fix_apple_metadata"}:
         return JsonResponse({"ok": False, "error": "unsupported_mode"}, status=400)
     builds = {b.platform: b for b in release.builds.all()}
     check = {
@@ -96,6 +96,77 @@ def vice_codes_store(request):
                 preflight["android"] = {"ok": False, "error": str(exc)[:1800]}
         else:
             preflight["android"] = {"ok": False, "error": "Google account is not linked to this app."}
+
+    metadata_result = {}
+    if mode == "fix_apple_metadata":
+        # Only verified missing metadata for this exact app, and only after
+        # comparing current Apple values. Do not touch price, privacy survey,
+        # screenshots, or other developer applications.
+        if not statuses["ios"]["linked"] or not preflight.get("ios", {}).get("ok"):
+            return JsonResponse({"ok": False, "error": "apple_preflight_required"}, status=409)
+        from apps.integrations.apple_store import AppleStoreClient
+        client = AppleStoreClient(app.apple_account)
+        app_id = str(preflight["ios"]["record_id"])
+        infos = client.request("GET", f"/apps/{app_id}/appInfos?limit=10").get("data", [])
+        if not infos:
+            return JsonResponse({"ok": False, "error": "apple_app_info_missing"}, status=409)
+        info = infos[0]
+        info_id = str(info["id"])
+        categories = client.request("GET", "/appCategories?limit=200").get("data", [])
+        entertainment = next(
+            (str(row["id"]) for row in categories
+             if str(row.get("id", "")).upper() == "ENTERTAINMENT"
+             or str(row.get("attributes", {}).get("name", "")).lower() == "entertainment"),
+            None,
+        )
+        primary = client.request("GET", f"/appInfos/{info_id}/relationships/primaryCategory").get("data")
+        if not primary:
+            if not entertainment:
+                metadata_result["category"] = "Entertainment category ID not found; no change made"
+            else:
+                client.request(
+                    "PATCH", f"/appInfos/{info_id}",
+                    data=json.dumps({"data": {
+                        "type": "appInfos", "id": info_id,
+                        "relationships": {"primaryCategory": {
+                            "data": {"type": "appCategories", "id": entertainment}
+                        }},
+                    }}),
+                )
+                metadata_result["category"] = entertainment
+        else:
+            metadata_result["category"] = "already:" + str(primary.get("id", ""))
+        locs = client.request(
+            "GET", f"/appInfos/{info_id}/appInfoLocalizations?limit=200"
+        ).get("data", [])
+        for loc in locs:
+            if loc.get("attributes", {}).get("locale") != "de-DE":
+                continue
+            current = loc.get("attributes", {}).get("privacyPolicyUrl")
+            if not current:
+                client.request(
+                    "PATCH", f"/appInfoLocalizations/{loc['id']}",
+                    data=json.dumps({"data": {
+                        "type": "appInfoLocalizations", "id": str(loc["id"]),
+                        "attributes": {"privacyPolicyUrl": app.privacy_policy_url},
+                    }}),
+                )
+                metadata_result["privacy_policy"] = app.privacy_policy_url
+            else:
+                metadata_result["privacy_policy"] = "already_set"
+        version = client.ensure_version(app_id, release.version_name)
+        attrs = version.get("attributes", {})
+        if not attrs.get("copyright"):
+            client.request(
+                "PATCH", f"/appStoreVersions/{version['id']}",
+                data=json.dumps({"data": {
+                    "type": "appStoreVersions", "id": str(version["id"]),
+                    "attributes": {"copyright": "2026 A+ Solution GmbH"},
+                }}),
+            )
+            metadata_result["copyright"] = "2026 A+ Solution GmbH"
+        else:
+            metadata_result["copyright"] = "already_set"
 
     queued = []
     skipped = []
@@ -234,4 +305,5 @@ def vice_codes_store(request):
         "apple_processed_build_id": (builds["ios"].external_build_id if builds.get("ios") else ""),
         "android_track": release.android_track,
         "public_submission_queued": mode == "submit_public" and bool(queued),
+        "apple_metadata": metadata_result,
     })

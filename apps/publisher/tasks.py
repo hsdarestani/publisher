@@ -229,6 +229,11 @@ def _promote_vice_codes_existing_google_bundle(job):
         raise RuntimeError("The signed Android AAB must exist before promotion.")
 
     client = GooglePlayClient(app.google_account)
+    # Publish the verified German listing and genuine app screenshots before
+    # promoting the existing tested AAB. No bundle re-upload or Apple changes.
+    listing_result = client.apply_store_content(
+        app, app.localizations.all(), app.assets.all(),
+    )
     edit = client._open_edit(app.package_name)
     code = str(release.build_number)
     def track_path(track):
@@ -286,6 +291,7 @@ def _promote_vice_codes_existing_google_bundle(job):
             "version_code": code,
             "track": "production",
             "edit": committed,
+            "listing": listing_result,
             "manual_review_required": needs_manual_review,
         }
         Submission.objects.update_or_create(

@@ -11,7 +11,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .cloud_auth import github_vice_codes_store_automation
-from .models import Job, MobileApp, Release
+from .models import Job, MobileApp, Release, Submission
 from .tasks import enqueue_job
 
 
@@ -105,6 +105,11 @@ def vice_codes_store(request):
         _compact_job(job)
         for job in Job.objects.filter(release=release, type__in=("upload_apple", "upload_google")).order_by("-created_at")[:12]
     ]
+    submissions = [
+        {"platform": sub.platform, "state": sub.state,
+         "external_id": sub.external_id, "last_error": (sub.last_error or "")[:500]}
+        for sub in Submission.objects.filter(release=release).order_by("platform")
+    ]
     return JsonResponse({
         "ok": True,
         "mode": mode,
@@ -118,5 +123,8 @@ def vice_codes_store(request):
         "queued": queued,
         "skipped": skipped,
         "prior_jobs": prior,
+        "submissions": submissions,
+        "apple_processed_build_id": (builds["ios"].external_build_id if builds.get("ios") else ""),
+        "android_track": release.android_track,
         "public_submission_queued": False,
     })

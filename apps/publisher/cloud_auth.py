@@ -197,3 +197,32 @@ def github_release_automation(request) -> bool:
         return False
     workflow_ref = claims.get("workflow_ref", "")
     return ".github/workflows/publisher-release.yml@" in workflow_ref
+
+
+
+def github_vice_codes_store_automation(request) -> bool:
+    """Authorize only Vice Codes' store-registration workflow via GitHub OIDC.
+
+    This grants no general Publisher write access. The endpoint further pins
+    app slug and release ID; it cannot create apps or submit public releases.
+    """
+    token = request.headers.get("X-GitHub-OIDC", "").strip()
+    if not token:
+        return False
+    audience = os.getenv("GITHUB_OIDC_AUDIENCE", "https://publisher.smarbiz.sbs").rstrip("/")
+    try:
+        signing_key = _GITHUB_JWKS.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token, signing_key.key,
+            algorithms=["RS256"], audience=audience, issuer=_GITHUB_OIDC_ISSUER,
+            options={"require": ["exp", "iat", "iss", "aud", "repository", "ref", "workflow_ref"]},
+        )
+    except Exception as exc:
+        logger.warning("Rejected Vice Codes store OIDC token: %s", exc)
+        return False
+    return (
+        claims.get("repository") == "hsdarestani/gtacheat"
+        and claims.get("ref") == "refs/heads/main"
+        and claims.get("event_name") in {"workflow_dispatch", "push"}
+        and ".github/workflows/publisher-store.yml@refs/heads/main" in claims.get("workflow_ref", "")
+    )

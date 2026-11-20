@@ -43,7 +43,13 @@ def receive_vice_codes_screenshot(request):
         width, height = image.size
         if image.format != "PNG" or not (750 <= width <= 2500 and 1300 <= height <= 5000):
             return JsonResponse({"ok": False, "error": "invalid_screenshot_dimensions"}, status=422)
-        if height / width < 1.7 or height / width > 2.6:
+        requested_device = str(body.get("device_type") or "")
+        if requested_device == "APP_IPAD_PRO_3GEN_129":
+            if platform != "ios" or index != 4 or (width, height) not in {
+                (2048, 2732), (2064, 2752),
+            }:
+                return JsonResponse({"ok": False, "error": "invalid_13_inch_ipad_screenshot"}, status=422)
+        elif height / width < 1.7 or height / width > 2.6:
             return JsonResponse({"ok": False, "error": "invalid_portrait_aspect"}, status=422)
         img = image.convert("RGB")
         normalized = io.BytesIO()
@@ -68,7 +74,7 @@ def receive_vice_codes_screenshot(request):
             status=409,
         )
 
-    device_type = "phone" if platform == "android" else ("APP_IPHONE_67" if width >= 1260 else "APP_IPHONE_61")
+    device_type = ("APP_IPAD_PRO_3GEN_129" if requested_device == "APP_IPAD_PRO_3GEN_129" else ("phone" if platform == "android" else ("APP_IPHONE_67" if width >= 1260 else "APP_IPHONE_61")))
     asset = AppAsset(
         app=app, kind="screenshot", platform=platform,
         locale="de-DE", device_type=device_type,

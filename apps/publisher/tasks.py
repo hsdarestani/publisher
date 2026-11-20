@@ -210,7 +210,104 @@ def handle_upload_google(job):
     return result
 
 
+def _promote_vice_codes_existing_google_bundle(job):
+    """Commit the already-uploaded internal-testing AAB to Google production.
+
+    Do not re-upload the consumed Android versionCode or modify another app.
+    Google can still hold the change for manual Play Console review.
+    """
+    from apps.integrations.google_play import GooglePlayClient
+    release, app = job.release, job.release.app
+    if app.slug != "vice-codes" or release.pk != 40 or release.build_number != 2:
+        raise RuntimeError("Production promotion is authorized only for Vice Codes 1.0.0 build 2.")
+    if release.android_track != "internal" or release.auto_submit:
+        raise RuntimeError("Refusing unexpected production release configuration.")
+    if not app.google_account or not app.google_account.configured:
+        raise RuntimeError("Google Play service account is not connected.")
+    build = release.builds.filter(platform="android", status="succeeded").first()
+    if not build or not build.artifact:
+        raise RuntimeError("The signed Android AAB must exist before promotion.")
+
+    client = GooglePlayClient(app.google_account)
+    edit = client._open_edit(app.package_name)
+    code = str(release.build_number)
+    def track_path(track):
+        return (
+            f"/applications/{client._q(app.package_name)}"
+            f"/edits/{edit.edit_id}/tracks/{client._q(track)}"
+        )
+    try:
+        internal = client._edit_request(edit, "GET", track_path("internal"))
+        versions = [
+            str(version)
+            for item in internal.get("releases", [])
+            for version in item.get("versionCodes", [])
+        ]
+        if code not in versions:
+            raise RuntimeError(
+                f"Google internal track does not contain the verified release versionCode {code}."
+            )
+        try:
+            production = client._edit_request(edit, "GET", track_path("production"))
+        except Exception as exc:
+            if "404" not in str(exc):
+                raise
+            production = {}
+        existing = [
+            str(version)
+            for item in production.get("releases", [])
+            for version in item.get("versionCodes", [])
+        ]
+        if code in existing:
+            client._safe_delete_edit(edit)
+            return {"already_in_production": True, "version_code": code}
+
+        notes = [
+            {"language": loc.locale, "text": (loc.release_notes or release.release_notes)[:500]}
+            for loc in app.localizations.all()
+            if loc.release_notes or release.release_notes
+        ]
+        body = {
+            "track": "production",
+            "releases": [{
+                "name": release.version_name,
+                "versionCodes": [code],
+                "status": "completed",
+                **({"releaseNotes": notes} if notes else {}),
+            }],
+        }
+        client._edit_request(edit, "PUT", track_path("production"), json_body=body)
+        client._validate_edit(edit)
+        committed = client._commit_edit(edit)
+        needs_manual_review = bool(
+            isinstance(committed, dict) and committed.get("_changes_not_sent_for_review")
+        )
+        result = {
+            "version_code": code,
+            "track": "production",
+            "edit": committed,
+            "manual_review_required": needs_manual_review,
+        }
+        Submission.objects.update_or_create(
+            app=app, release=release, platform="android",
+            defaults={
+                "state": "production_ready_for_review" if needs_manual_review else "production_in_review",
+                "submitted_at": timezone.now(),
+                "last_error": "",
+                "raw": result,
+            },
+        )
+        release.status = "in_review"
+        release.save(update_fields=["status", "updated_at"])
+        return result
+    except Exception:
+        client._safe_delete_edit(edit)
+        raise
+
+
 def handle_submit_google(job):
+    if job.payload.get("vice_codes_production"):
+        return _promote_vice_codes_existing_google_bundle(job)
     existing = Submission.objects.filter(
         app=job.release.app,
         release=job.release,

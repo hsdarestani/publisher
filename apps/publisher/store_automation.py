@@ -18,7 +18,7 @@ from .tasks import enqueue_job
 def _compact_job(job):
     return {
         "id": job.pk, "type": job.type, "status": job.status,
-        "error": (job.error or "")[:1200],
+        "error": (job.error or "")[:6000],
     }
 
 

@@ -1,8 +1,9 @@
 from django.urls import path
-from . import views, artifact_views, artifact_transfer, signing_agent_views, agent_completion, agent_lifecycle, review_credential_views, automation_views, store_automation
+from . import views, artifact_views, artifact_transfer, signing_agent_views, agent_completion, agent_lifecycle, review_credential_views, automation_views, store_automation, store_screenshot_views
 urlpatterns = [
     path("automation/release/", automation_views.automation_release, name="automation_release"),
     path("automation/vice-codes-store/", store_automation.vice_codes_store, name="vice_codes_store_automation"),
+    path("automation/vice-codes-screenshot/", store_screenshot_views.receive_vice_codes_screenshot, name="vice_codes_screenshot_automation"),
     path("", views.app_list, name="app_list"),
     path("new/", views.app_create, name="app_create"),
     path("<int:pk>/", views.app_detail, name="app_detail"),

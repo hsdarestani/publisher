@@ -20,6 +20,13 @@ APPLE_REVIEW_CONTACTS = {
         "contactPhone": "+491727779721",
         "contactEmail": "info@aplus-solution.de",
     },
+    # Use the same A+ Solution GmbH App Review contact already used for its other apps.
+    "vice-codes": {
+        "contactFirstName": "Ashkan",
+        "contactLastName": "Asadian",
+        "contactPhone": "+491727779721",
+        "contactEmail": "info@aplus-solution.de",
+    },
 }
 
 

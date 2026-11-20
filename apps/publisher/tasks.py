@@ -264,8 +264,16 @@ def _promote_vice_codes_existing_google_bundle(job):
             for version in item.get("versionCodes", [])
         ]
         if code in existing:
+            prior = next((item for item in production.get("releases", []) if code in [
+                str(v) for v in item.get("versionCodes", [])
+            ]), {})
             client._safe_delete_edit(edit)
-            return {"already_in_production": True, "version_code": code}
+            return {
+                "already_in_production": True, "version_code": code,
+                "track": "production",
+                "release_status": prior.get("status", "unknown"),
+                "manual_review_required": prior.get("status") == "draft",
+            }
 
         notes = [
             {"language": loc.locale, "text": (loc.release_notes or release.release_notes)[:500]}
@@ -277,19 +285,21 @@ def _promote_vice_codes_existing_google_bundle(job):
             "releases": [{
                 "name": release.version_name,
                 "versionCodes": [code],
-                "status": "completed",
+                # Google forbids completed production releases while the app
+                # itself is still Draft (first publication). Commit an official
+                # draft release; the initial rollout then requires Play Console.
+                "status": "draft",
                 **({"releaseNotes": notes} if notes else {}),
             }],
         }
         client._edit_request(edit, "PUT", track_path("production"), json_body=body)
         client._validate_edit(edit)
         committed = client._commit_edit(edit)
-        needs_manual_review = bool(
-            isinstance(committed, dict) and committed.get("_changes_not_sent_for_review")
-        )
+        needs_manual_review = True  # First production release remains a Google Play draft.
         result = {
             "version_code": code,
             "track": "production",
+            "release_status": "draft",
             "edit": committed,
             "listing": listing_result,
             "manual_review_required": needs_manual_review,

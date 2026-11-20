@@ -1,0 +1,106 @@
+name: TaskService prerequisite capacity inspection
+on:
+  push:
+    branches: ['codex/taskservice-readonly-capacity']
+    paths: ['.github/workflows/taskservice-readonly-capacity.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 6
+    steps:
+      - name: Collect Publisher VPS measurements over pinned SSH
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$HOST" || -z "$SSH_PRIVATE_KEY" ]]; then
+            printf 'Publisher SSH identity or host is unavailable in the production environment.\n'
+            exit 1
+          fi
+          if [[ "$SSH_HOST_FINGERPRINT" != SHA256:* ]]; then
+            printf 'An independently recorded SHA256 Publisher SSH host fingerprint is required.\n'
+            exit 1
+          fi
+          port="${SSH_PORT:-22}"
+          umask 077
+          temp="$(mktemp -d "$RUNNER_TEMP/publisher-taskservice.XXXXXXXX")"
+          trap 'if [[ -n "${SSH_AGENT_PID:-}" ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$temp"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$temp/key"
+          unset SSH_PRIVATE_KEY
+          if [[ -n "$SSH_KEY_PASSPHRASE" ]]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$temp/askpass"
+            chmod 700 "$temp/askpass"
+            DISPLAY=:0 SSH_ASKPASS="$temp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$temp/key" </dev/null
+          fi
+          unset SSH_KEY_PASSPHRASE
+          ssh-keyscan -T 8 -p "$port" -H "$HOST" > "$temp/scanned" 2>/dev/null
+          while IFS= read -r candidate; do
+            printf '%s\n' "$candidate" > "$temp/candidate"
+            fingerprint="$(ssh-keygen -lf "$temp/candidate" 2>/dev/null | awk '{print $2}')"
+            if [[ "$fingerprint" == "$SSH_HOST_FINGERPRINT" ]]; then
+              printf '%s\n' "$candidate" >> "$temp/known_hosts"
+            fi
+          done < "$temp/scanned"
+          if [[ ! -s "$temp/known_hosts" ]]; then
+            printf 'The current SSH host key did not match the configured Publisher fingerprint.\n'
+            exit 1
+          fi
+          ssh -i "$temp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$temp/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o ConnectTimeout=10 -p "$port" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          export LC_ALL=C
+          cd /opt/aplus-publisher
+          printf 'audit_utc='
+          date -u '+%Y-%m-%dT%H:%M:%SZ'
+          printf 'available_vcpu='
+          nproc
+          lscpu | awk -F: '/^(CPU\(s\)|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core):/ {print}'
+          awk '{print "load_1_5_15=" $1 "," $2 "," $3}' /proc/loadavg
+          free -m
+          swapon --show=TYPE,SIZE,USED,PRIO
+          df -h --output=size,used,avail,pcent,target / /opt
+          df -i --output=itotal,iused,iavail,ipcent,target / /opt
+          for resource in cpu memory io; do
+            if [[ -r "/proc/pressure/$resource" ]]; then
+              printf 'psi_%s\n' "$resource"
+              cut -d' ' -f1-4 "/proc/pressure/$resource"
+            fi
+          done
+          if command -v vmstat >/dev/null; then vmstat 1 4; fi
+          docker ps --format '{{.Status}}' | awk '{total++; if ($0 ~ /unhealthy/) unhealthy++} END {print "running_containers=" total+0 ",unhealthy=" unhealthy+0}'
+          docker compose ps --format 'table {{.Service}}\t{{.State}}\t{{.Health}}'
+          docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}} {{.BlockIO}}' | awk '{print "container_" NR, $0}'
+          printf 'tcp_listener_count='
+          ss -H -ltn | wc -l
+          printf 'udp_listener_count='
+          ss -H -lun | wc -l
+          printf 'http_tls_and_db_ports_bound='
+          ss -H -lnt | awk '{n=split($4,a,":"); if (a[n] ~ /^(80|443|5432|8000|8080)$/) print a[n]}' | sort -un | paste -sd, -
+          printf 'publisher_local_http='
+          curl -sS --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/ || true
+          docker compose exec -T db sh -c 'PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=5000" psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At' <<'SQL'
+          SELECT 'pg_connections=' || count(*) || ',active=' || count(*) FILTER (WHERE state='active') ||
+            ',max=' || current_setting('max_connections') FROM pg_stat_activity WHERE datname=current_database();
+          SELECT 'pg_commits=' || xact_commit || ',rollbacks=' || xact_rollback || ',disk_reads=' || blks_read ||
+            ',cache_hits=' || blks_hit FROM pg_stat_database WHERE datname=current_database();
+          SQL
+          count=0
+          for dir in /opt/aplus-publisher/backups /var/backups/aplus-publisher; do
+            if [[ -d "$dir" ]]; then
+              printf 'backup_candidate_ages_bytes\n'
+              find "$dir" -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM UTC %s\n' | sort -r | sed -n '1,5p'
+              count=$((count + 1))
+            fi
+          done
+          printf 'known_backup_directories_present=%s\n' "$count"
+          REMOTE

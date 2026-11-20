@@ -42,7 +42,7 @@ def vice_codes_store(request):
         return JsonResponse({"ok": False, "error": "store_safety_gate", "reason": "Only internal testing with auto_submit off is supported."}, status=409)
 
     mode = body.get("mode", "preflight")
-    if mode not in {"preflight", "upload_test", "status"}:
+    if mode not in {"preflight", "upload_test", "status", "submit_public"}:
         return JsonResponse({"ok": False, "error": "unsupported_mode"}, status=400)
     builds = {b.platform: b for b in release.builds.all()}
     check = {
@@ -101,6 +101,82 @@ def vice_codes_store(request):
                     job = enqueue_job("upload_google", app=app, release=release, build=builds[platform])
                 queued.append({"platform": platform, "job": _compact_job(job)})
 
+    if mode == "submit_public":
+        # A user authorized publication of this specific already-uploaded app.
+        # Explicit hard gates prevent accidental submission of another release
+        # or of a listing lacking essential legal/store material.
+        from urllib.parse import urlparse
+        from .review_contacts import apple_review_contact
+        from .store_compliance import (
+            apple_age_rating_profile,
+            apple_content_rights_declaration,
+            apple_uses_non_exempt_encryption,
+        )
+        privacy = urlparse(app.privacy_policy_url or "")
+        support = urlparse(app.support_url or "")
+        common_ready = bool(
+            privacy.scheme == "https" and privacy.netloc
+            and support.scheme == "https" and support.netloc
+            and app.localizations.filter(locale="de-DE").exclude(full_description="").exists()
+            and app.assets.filter(kind="icon", platform__in=("shared", "ios", "android")).exists()
+        )
+        for platform in ("ios", "android"):
+            missing = []
+            if not common_ready:
+                missing.append("Legal URLs, German description or original app icon missing.")
+            if not statuses[platform]["linked"] or not statuses[platform]["build_ready"]:
+                missing.append("Signed artifact or linked store account missing.")
+            if not preflight.get(platform, {}).get("ok"):
+                missing.append("Official store API preflight failed.")
+            if shots[platform] < 3:
+                missing.append("At least three genuine app screenshots required.")
+            if platform == "ios":
+                if not builds["ios"].external_build_id:
+                    missing.append("Processed App Store Connect build ID missing.")
+                contact = apple_review_contact(app)
+                if not all(contact.get(field) for field in (
+                    "contactFirstName", "contactLastName", "contactPhone", "contactEmail"
+                )):
+                    missing.append("Real App Review contact missing.")
+                if (
+                    apple_age_rating_profile(app) is None
+                    or apple_content_rights_declaration(app) is None
+                    or apple_uses_non_exempt_encryption(app) is None
+                ):
+                    missing.append("Reviewed App Store compliance declaration missing.")
+            else:
+                if not app.assets.filter(kind="feature_graphic", platform="android").exists():
+                    missing.append("Original Google Play feature graphic missing.")
+                internal = Submission.objects.filter(
+                    app=app, release=release, platform="android",
+                    state__in=("in_review", "ready_for_review", "production_in_review",
+                               "production_ready_for_review", "approved", "live"),
+                ).exists()
+                if not internal:
+                    missing.append("No successful internal Google Play handoff to promote.")
+            if missing:
+                skipped.append({"platform": platform, "reason": missing})
+                continue
+
+            job_type = "submit_apple" if platform == "ios" else "submit_google"
+            with transaction.atomic():
+                active = Job.objects.select_for_update().filter(
+                    release=release, type=job_type,
+                    status__in=("queued", "running", "succeeded"),
+                )
+                if platform == "android":
+                    active = active.filter(payload__vice_codes_production=True)
+                active = active.order_by("-created_at").first()
+                if active:
+                    skipped.append({"platform": platform, "existing": _compact_job(active)})
+                    continue
+                payload = {"vice_codes_production": True} if platform == "android" else {}
+                job = enqueue_job(
+                    job_type, app=app, release=release, build=builds[platform],
+                    payload=payload,
+                )
+                queued.append({"platform": platform, "job": _compact_job(job)})
+
     prior = [
         _compact_job(job)
         for job in Job.objects.filter(release=release, type__in=("upload_apple", "upload_google")).order_by("-created_at")[:12]
@@ -126,5 +202,5 @@ def vice_codes_store(request):
         "submissions": submissions,
         "apple_processed_build_id": (builds["ios"].external_build_id if builds.get("ios") else ""),
         "android_track": release.android_track,
-        "public_submission_queued": False,
+        "public_submission_queued": mode == "submit_public" and bool(queued),
     })

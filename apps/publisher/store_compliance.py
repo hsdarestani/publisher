@@ -17,6 +17,8 @@ APPLE_USES_NON_EXEMPT_ENCRYPTION = {
     # A+ Esthetic is likewise a Capacitor client using ordinary platform HTTPS/TLS
     # for its Customer Club and booking APIs; it does not ship custom crypto.
     "a-esthetic": False,
+    # Vice Codes uses no custom cryptography; only platform HTTPS links to guide/legal sources.
+    "vice-codes": False,
 }
 
 
@@ -35,6 +37,8 @@ APPLE_CONTENT_RIGHTS = {
     # Smarbiz users create, upload, review and publish brand/content assets and AI
     # output, so conservatively declare that third-party content may be present.
     "smarbiz": "USES_THIRD_PARTY_CONTENT",
+    # The independent GTA VI reference guide names third-party game/source material.
+    "vice-codes": "USES_THIRD_PARTY_CONTENT",
 }
 
 
@@ -91,6 +95,15 @@ APPLE_AGE_RATING_PROFILES = {
     # content, but it has no unrestricted browser, mature-content feature,
     # gambling, weapons, advertising or medical/treatment functionality.
     "smarbiz": dict(_BASE_BUSINESS_AGE_RATING),
+    # No user content, ads, social feed or playable violent game scenes.
+    # Descriptive text mentions a drunkenness code and ammunition/weapon cheats.
+    # Declare infrequent substance and weapon references rather than NONE.
+    "vice-codes": {
+        **_BASE_BUSINESS_AGE_RATING,
+        "userGeneratedContent": False,
+        "alcoholTobaccoOrDrugUseOrReferences": "INFREQUENT",
+        "gunsOrOtherWeapons": "INFREQUENT",
+    },
 }
 
 

@@ -71,8 +71,27 @@ def vice_codes_store(request):
         if statuses["android"]["linked"]:
             from apps.integrations.google_play import GooglePlayClient
             try:
-                result = GooglePlayClient(app.google_account).test(app.package_name)
+                client = GooglePlayClient(app.google_account)
+                result = client.test(app.package_name)
                 preflight["android"] = {"ok": result.ok, "message": str(result.message)[:1800]}
+                # The publisher's own assets folder can be empty even when the
+                # developer populated genuine screenshots directly in Play Console.
+                # Read the official store listing before blocking publication.
+                if result.ok:
+                    edit = None
+                    try:
+                        edit = client._open_edit(app.package_name)
+                        imgs = client._edit_request(
+                            edit, "GET",
+                            f"/applications/{client._q(app.package_name)}/edits/"
+                            f"{edit.edit_id}/listings/{client._q('de-DE')}/phoneScreenshots",
+                        )
+                        preflight["android"]["official_phone_screenshots"] = len(imgs.get("images", []))
+                    except Exception as screenshot_exc:
+                        preflight["android"]["official_screenshot_check_error"] = str(screenshot_exc)[:900]
+                    finally:
+                        if edit:
+                            client._safe_delete_edit(edit)
             except Exception as exc:
                 preflight["android"] = {"ok": False, "error": str(exc)[:1800]}
         else:
@@ -128,8 +147,14 @@ def vice_codes_store(request):
                 missing.append("Signed artifact or linked store account missing.")
             if not preflight.get(platform, {}).get("ok"):
                 missing.append("Official store API preflight failed.")
-            if shots[platform] < 3:
-                missing.append("At least three genuine app screenshots required.")
+            verified_screens = shots[platform]
+            if platform == "android":
+                verified_screens = max(
+                    verified_screens,
+                    preflight.get("android", {}).get("official_phone_screenshots", 0),
+                )
+            if verified_screens < 3:
+                missing.append("At least three genuine app screenshots required in Publisher or official store.")
             if platform == "ios":
                 if not builds["ios"].external_build_id:
                     missing.append("Processed App Store Connect build ID missing.")

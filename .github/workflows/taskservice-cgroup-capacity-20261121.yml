@@ -1,0 +1,62 @@
+name: TaskService cgroup safety readiness (read-only)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/taskservice-cgroup-capacity-20261121.yml']
+permissions: { contents: read }
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read cgroup safety metadata without host changes
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$KEY"
+          port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
+          address="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$address" && test "$address" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 --resolve "reimflow.smarbiz.sbs:443:$address" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          tmp="$(mktemp -d "$RUNNER_TEMP/publisher-cgroup.XXXXXXXX")"
+          trap 'if [ -n "$SSH_AGENT_PID" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
+          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
+          chmod 600 "$tmp/key"; unset KEY
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
+            chmod 700 "$tmp/askpass"
+            SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null
+          fi
+          unset PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$address" > "$tmp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$tmp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$tmp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then mv "$tmp/candidate" "$tmp/known_hosts"; break; fi
+          done < "$tmp/scanned"
+          test -s "$tmp/known_hosts"
+          ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port" root@"$address" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          printf 'UTC='; date -u '+%Y-%m-%dT%H:%M:%SZ'
+          printf 'CGROUP_DRIVER='; docker info --format '{{.CgroupDriver}}'
+          printf 'CGROUP_VERSION='; docker info --format '{{.CgroupVersion}}'
+          printf 'CGROUP_FSTYPE='; stat -fc '%T' /sys/fs/cgroup
+          printf 'DOCKER_SYSTEMD_DELEGATE='; systemctl show docker.service -p Delegate --value
+          printf 'DOCKER_SYSTEMD_CGROUP='; systemctl show docker.service -p ControlGroup --value
+          printf 'SYSTEMD_VERSION='; systemctl --version | head -1
+          printf 'TASKSERVICE_DIR_EXISTS='; if test -d /opt/taskservice; then echo yes; else echo no; fi
+          printf 'MEM_AVAILABLE_KIB='; awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+          printf 'SWAP_TOTAL_KIB='; awk '/^SwapTotal:/ {print $2}' /proc/meminfo
+          printf 'DISK_AVAIL_KIB='; df -Pk /opt | awk 'NR==2 {print $4}'
+          printf 'PUBLISHER_RUNNING='; cd /opt/aplus-publisher && docker compose ps -q web | xargs -r docker inspect -f '{{.State.Running}}'
+          REMOTE

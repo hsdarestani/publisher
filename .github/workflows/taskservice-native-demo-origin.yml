@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: hsdarestani/taskservice
-          ref: 2af1c9c6115f095c436ad46425b1174c63be66f8
+          ref: f457d8a022e02afe1cccf8ebaf32a1658e928d5f
           persist-credentials: false
       - name: Prepare Chromium and origin CA trust
         run: |

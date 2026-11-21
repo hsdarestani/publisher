@@ -78,90 +78,13 @@ jobs:
             -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519
             -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null
             -o ConnectTimeout=10 -p "$port" root@"$addr")
-          "${ssh_publisher[@]}" 'bash -se' <<'ORIGIN'
+          "${ssh_publisher[@]}" 'bash -se' <<'VERIFY_ORIGIN'
           set -euo pipefail
-          umask 077
           cd /opt/aplus-publisher
-          caddy="$(docker compose ps -q caddy)"
-          test -n "$caddy"
-          file=/opt/aplus-publisher/Caddyfile
-          test -f "$file" && test ! -L "$file"
-          if grep -q '^taskservice\.smarbiz\.sbs[[:space:]]*{' "$file"; then
-            printf 'An existing TaskService origin route needs reconciliation.\n' >&2
-            exit 1
-          fi
-          install -d -m 0700 /opt/taskservice/backups
-          backup="$(mktemp -d /opt/taskservice/backups/pre-demo-caddy.XXXXXXXX)"
-          cp -- "$file" "$backup/Caddyfile"
-          tmp="$(mktemp -d /opt/taskservice/.caddy-demo.XXXXXXXX)"
-          changed=no
-          rollback() {
-            status=$?
-            if [[ "$status" != 0 && "$changed" == yes ]]; then
-              cat "$backup/Caddyfile" > "$file"
-              docker exec "$caddy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile </dev/null
-              printf 'Previous Caddy configuration restored.\n'
-            fi
-            rm -rf -- "$tmp"
-          }
-          trap rollback EXIT
-          docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
-          test "$(curl -sS -H 'Host: localhost' --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/health/ready)" = 200
-          cat > "$tmp/origin.pem" <<'CERT'
-          -----BEGIN CERTIFICATE-----
-          MIIDHzCCAsWgAwIBAgIUIj9kljJ4SUtyb7ZngFoYx1iGXpgwCgYIKoZIzj0EAwIw
-          gY8xCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1T
-          YW4gRnJhbmNpc2NvMRkwFwYDVQQKExBDbG91ZEZsYXJlLCBJbmMuMTgwNgYDVQQL
-          Ey9DbG91ZEZsYXJlIE9yaWdpbiBTU0wgRUNDIENlcnRpZmljYXRlIEF1dGhvcml0
-          eTAeFw0yNjExMjExOTI2MDBaFw0yNzExMjExOTI2MDBaMGIxGTAXBgNVBAoTEENs
-          b3VkRmxhcmUsIEluYy4xHTAbBgNVBAsTFENsb3VkRmxhcmUgT3JpZ2luIENBMSYw
-          JAYDVQQDEx1DbG91ZEZsYXJlIE9yaWdpbiBDZXJ0aWZpY2F0ZTBZMBMGByqGSM49
-          AgEGCCqGSM49AwEHA0IABDrhdPdzPrh6yoCQGggMhxquFHnOmEoPZ1x5Sn7qtDHx
-          +7hApPCLCGSwsfjp8zRbCK7U64Z2tVidHzBY6vujxpKjggEpMIIBJTAOBgNVHQ8B
-          Af8EBAMCBaAwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMAwGA1UdEwEB
-          /wQCMAAwHQYDVR0OBBYEFPjlKOjo1uX1adHxLS86uatT9F0eMB8GA1UdIwQYMBaA
-          FIUwXTsqcNTt1ZJnB/3rObQaDjinMEQGCCsGAQUFBwEBBDgwNjA0BggrBgEFBQcw
-          AYYoaHR0cDovL29jc3AuY2xvdWRmbGFyZS5jb20vb3JpZ2luX2VjY19jYTAiBgNV
-          HREEGzAZghd0YXNrc2VydmljZS5zbWFyYml6LnNiczA8BgNVHR8ENTAzMDGgL6At
-          hitodHRwOi8vY3JsLmNsb3VkZmxhcmUuY29tL29yaWdpbl9lY2NfY2EuY3JsMAoG
-          CCqGSM49BAMCA0gAMEUCIQDIGqEJjRx1g1jECC+Ar7G139JqEd3s2ps/b9jOE5EO
-          fQIgLhSYFSruhqIh4vEIqZIrYyt5n07rlyx36uPIeWxbDMA=
-          -----END CERTIFICATE-----
-          CERT
-          openssl x509 -noout -checkhost taskservice.smarbiz.sbs -in "$tmp/origin.pem" | grep -q 'does match'
-          test "$(openssl x509 -in "$tmp/origin.pem" -pubkey -noout | openssl sha256)" = \
-            "$(openssl pkey -in /opt/taskservice/demo-private/origin.key -pubout | openssl sha256)"
-          docker exec "$caddy" mkdir -p /data/taskservice-demo </dev/null
-          docker exec "$caddy" chmod 0700 /data/taskservice-demo </dev/null
-          docker cp "$tmp/origin.pem" "$caddy:/data/taskservice-demo/origin.pem"
-          docker cp /opt/taskservice/demo-private/origin.key "$caddy:/data/taskservice-demo/origin.key"
-          docker exec "$caddy" chmod 0600 /data/taskservice-demo/origin.pem /data/taskservice-demo/origin.key </dev/null
-          
-          cat "$backup/Caddyfile" > "$tmp/Caddyfile"
-          cat >> "$tmp/Caddyfile" <<'CADDY'
-          
-          taskservice.smarbiz.sbs {
-            tls /data/taskservice-demo/origin.pem /data/taskservice-demo/origin.key
-            @cloudflare remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
-            handle @cloudflare {
-              reverse_proxy taskservice-demo-api:8080 {
-                header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
-              }
-            }
-            handle {
-              reverse_proxy taskservice-demo-api:8080
-            }
-          }
-          CADDY
-          docker cp "$tmp/Caddyfile" "$caddy:/tmp/taskservice-demo-Caddyfile"
-          docker exec "$caddy" caddy validate --config /tmp/taskservice-demo-Caddyfile --adapter caddyfile </dev/null
-          cmp -s "$backup/Caddyfile" "$file"
-          changed=yes
-          docker exec "$caddy" caddy reload --config /tmp/taskservice-demo-Caddyfile --adapter caddyfile </dev/null
-          cat "$tmp/Caddyfile" > "$file"
-          docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
-          printf 'CADDY_TASKSERVICE_ORIGIN=staged\nPUBLISHER_HTTP=200\n'
-          ORIGIN
+          grep -q '^taskservice\.smarbiz\.sbs {' Caddyfile
+          grep -q 'reverse_proxy taskservice-demo-api:8080' Caddyfile
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          VERIFY_ORIGIN
           curl -fsS --max-time 20 --proto '=https' 'https://developers.cloudflare.com/ssl/static/origin_ca_ecc_root.pem' -o "$tmp/origin-ca.pem"
           openssl x509 -in "$tmp/origin-ca.pem" -noout -checkend 0 >/dev/null
           curl -fsS --max-time 12 --noproxy '*' --cacert "$tmp/origin-ca.pem" \
@@ -173,7 +96,7 @@ jobs:
             tar -C "$tmp/qa" -xf -
           export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/demo-chromium"
           export TASKSERVICE_DEMO_QA_CREDENTIALS="$tmp/qa" TASKSERVICE_DEMO_ORIGIN_IP="$addr"
-          HOME="$tmp/browser-home" python - <<'PY'
+          PYTHONPATH="$(python -m site --user-site)${PYTHONPATH:+:$PYTHONPATH}" HOME="$tmp/browser-home" python - <<'PY'
           import runpy
           import sys
           import traceback

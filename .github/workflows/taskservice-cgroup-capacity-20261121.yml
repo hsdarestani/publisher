@@ -59,4 +59,18 @@ jobs:
           printf 'SWAP_TOTAL_KIB='; awk '/^SwapTotal:/ {print $2}' /proc/meminfo
           printf 'DISK_AVAIL_KIB='; df -Pk /opt | awk 'NR==2 {print $4}'
           printf 'PUBLISHER_RUNNING='; cd /opt/aplus-publisher && docker compose ps -q web | xargs -r docker inspect -f '{{.State.Running}}'
+          printf '\n=== TASKSERVICE PILOT STATE ===\n'
+          if [ -f /opt/taskservice/compose.yaml ]; then
+            cd /opt/taskservice
+            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice ps -a
+            printf 'TASKSERVICE_SECRETS_PRESENT='
+            if [ -f secrets/db.env ] && [ -f secrets/migrate.env ] && [ -f secrets/api.env ] && [ -f secrets/worker.env ]; then echo yes; else echo no; fi
+            printf 'TASKSERVICE_SLICE_MEMORY_MAX='; systemctl show taskservice.slice -p MemoryMax --value
+            printf 'TASKSERVICE_SCHEMA_EXISTS='
+            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('ts.tenants') IS NOT NULL" || echo unavailable
+            printf 'TASKSERVICE_MIGRATION_TABLE_EXISTS='
+            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('public.__EFMigrationsHistory') IS NOT NULL" || echo unavailable
+            printf 'TASKSERVICE_OOM='
+            docker inspect taskservice-db-1 -f '{{.State.OOMKilled}}' || true
+          fi
           REMOTE

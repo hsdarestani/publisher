@@ -73,4 +73,23 @@ jobs:
             printf 'TASKSERVICE_OOM='
             docker inspect taskservice-db-1 -f '{{.State.OOMKilled}}' || true
           fi
+            printf "\n=== TaskService live runtime (read-only) ===\n"
+            docker stats --no-stream --format "MEM {{.Name}} {{.MemUsage}} {{.CPUPerc}}" | grep -E "taskservice-|aplus-publisher-" || true
+            for svc in taskservice-db-1 taskservice-api-1 taskservice-worker-1 taskservice-scanner-1; do
+              printf "STATE_%s=" "$svc"
+              docker inspect "$svc" --format '{{.State.Running}}|{{.State.Status}}|oom={{.State.OOMKilled}}|restarts={{.RestartCount}}' || true
+            done
+            printf "PILOT_API_HEALTH_HTTP="
+            curl -sS --max-time 5 -o /dev/null -w "%{http_code}\n" -H "Host: localhost" http://127.0.0.1:18081/health/live || true
+            printf "PILOT_READY_HTTP="
+            curl -sS --max-time 5 -o /dev/null -w "%{http_code}\n" -H "Host: localhost" http://127.0.0.1:18081/health/ready || true
+            printf "SCANNER_PING="
+            docker exec taskservice-scanner-1 sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' </dev/null || true
+            printf "TASKSERVICE_SLICE_CGROUP="
+            systemctl show taskservice.slice -p ControlGroup --value
+            printf "HOST_AVAILABLE_AT_END_KIB="
+            awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+            cd /opt/aplus-publisher
+            printf "PUBLISHER_HEALTH_HTTP="
+            docker compose exec -T web curl -sS -o /dev/null -w "%{http_code}\n" --max-time 6 http://127.0.0.1:8000/healthz/ </dev/null
           REMOTE

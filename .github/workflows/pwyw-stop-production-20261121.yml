@@ -1,0 +1,93 @@
+name: Stop PWYW only on Publisher (preserve data)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/pwyw-stop-production-20261121.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pwyw-isolated-strato
+  cancel-in-progress: false
+
+jobs:
+  stop-pwyw:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Verify Publisher origin and stop only PWYW web
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          port="$SSH_PORT"
+          if [ -z "$port" ]; then port=22; fi
+          address="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$address" && test "$address" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 \
+            --resolve "reimflow.smarbiz.sbs:443:$address" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          temp="$(mktemp -d "$RUNNER_TEMP/pwyw-stop.XXXXXXXX")"
+          trap 'if [ -n "$SSH_AGENT_PID" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$temp"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$temp/key"
+          chmod 600 "$temp/key"
+          unset SSH_PRIVATE_KEY
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$SSH_KEY_PASSPHRASE"' > "$temp/askpass"
+            chmod 700 "$temp/askpass"
+            SSH_ASKPASS="$temp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$temp/key" </dev/null
+          fi
+          unset SSH_KEY_PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$address" > "$temp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$temp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$temp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$temp/candidate" "$temp/known_hosts"
+              break
+            fi
+          done < "$temp/scanned"
+          test -s "$temp/known_hosts"
+          ssh -i "$temp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no \
+            -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 \
+            -o UserKnownHostsFile="$temp/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port" root@"$address" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          test -f /opt/pwyw/compose.yaml
+          test -f /opt/pwyw/.env
+          cd /opt/pwyw
+          docker compose -p pwyw config --quiet
+          id="$(docker compose -p pwyw ps -a -q web)"
+          test -n "$id"
+          test "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id")" = pwyw
+          test "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$id")" = web
+          printf 'BEFORE_PWYW_RUNNING=%s\n' "$(docker inspect -f '{{.State.Running}}' "$id")"
+          printf 'MEM_AVAILABLE_BEFORE_KIB=%s\n' "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          docker compose -p pwyw stop -t 20 web
+          test "$(docker inspect -f '{{.State.Running}}' "$id")" = false
+          printf 'AFTER_PWYW_RUNNING=false\n'
+          printf 'MEM_AVAILABLE_AFTER_KIB=%s\n' "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ >/dev/null
+          test "$(docker inspect -f '{{.State.Running}}' "$(docker compose ps -q caddy)")" = true
+          printf 'PUBLISHER_HEALTH=ok\n'
+          printf 'PWYW_STOPPED_DATA_PRESERVED=yes\n'
+          REMOTE
+          status="$(curl -L -sS --connect-timeout 6 --max-time 10 -o /dev/null -w '%{http_code}' https://pwyw.smarbiz.sbs/api/health || true)"
+          printf 'PUBLIC_PWYW_HEALTH_HTTP=%s\n' "$status"
+          if [ "$status" = 200 ]; then
+            echo 'PWYW public endpoint still returns 200; investigate routing or caching before declaring completed.'
+            exit 1
+          fi

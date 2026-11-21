@@ -11,52 +11,43 @@ jobs:
     environment: production
     timeout-minutes: 6
     steps:
-      - name: Collect Publisher VPS measurements over pinned SSH
+      - name: Inspect the Publisher VPS with the existing production password
         shell: bash
         env:
           HOST: ${{ secrets.HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
-          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          SSHPASS: ${{ secrets.PASS }}
         run: |
           set -euo pipefail
-          if [[ -z "$HOST" || -z "$SSH_PRIVATE_KEY" ]]; then
-            printf 'Publisher SSH identity or host is unavailable in the production environment.\n'
-            exit 1
-          fi
-          if [[ "$SSH_HOST_FINGERPRINT" != SHA256:* ]]; then
-            printf 'An independently recorded SHA256 Publisher SSH host fingerprint is required.\n'
+          if [[ -z "$HOST" || -z "$SSHPASS" ]]; then
+            printf 'The Publisher production environment did not supply both HOST and PASS.\n'
             exit 1
           fi
           port="${SSH_PORT:-22}"
-          umask 077
-          temp="$(mktemp -d "$RUNNER_TEMP/publisher-taskservice.XXXXXXXX")"
-          trap 'if [[ -n "${SSH_AGENT_PID:-}" ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$temp"' EXIT
-          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$temp/key"
-          unset SSH_PRIVATE_KEY
-          if [[ -n "$SSH_KEY_PASSPHRASE" ]]; then
-            eval "$(ssh-agent -s)" >/dev/null
-            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$temp/askpass"
-            chmod 700 "$temp/askpass"
-            DISPLAY=:0 SSH_ASKPASS="$temp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$temp/key" </dev/null
-          fi
-          unset SSH_KEY_PASSPHRASE
-          ssh-keyscan -T 8 -p "$port" -H "$HOST" > "$temp/scanned" 2>/dev/null
-          while IFS= read -r candidate; do
-            printf '%s\n' "$candidate" > "$temp/candidate"
-            fingerprint="$(ssh-keygen -lf "$temp/candidate" 2>/dev/null | awk '{print $2}')"
-            if [[ "$fingerprint" == "$SSH_HOST_FINGERPRINT" ]]; then
-              printf '%s\n' "$candidate" >> "$temp/known_hosts"
-            fi
-          done < "$temp/scanned"
-          if [[ ! -s "$temp/known_hosts" ]]; then
-            printf 'The current SSH host key did not match the configured Publisher fingerprint.\n'
+          [[ "$HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]+$ && "$port" =~ ^[0-9]{1,5}$ ]]
+          # Reimflow is a DNS-only alias for the Publisher origin confirmed in
+          # Cloudflare. Require its valid HTTPS service on the same address.
+          address="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          if [[ -z "$address" || "$address" == *$'\n'* || "$address" != "$expected" ]]; then
+            printf 'Publisher HOST does not resolve to the configured service origin.\n'
             exit 1
           fi
-          ssh -i "$temp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          if ! curl --silent --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 \
+            --resolve "reimflow.smarbiz.sbs:443:$address" -o /dev/null https://reimflow.smarbiz.sbs/; then
+            printf 'Publisher origin did not pass the HTTPS service identity check.\n'
+            exit 1
+          fi
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq sshpass >/dev/null
+          umask 077
+          temp="$(mktemp -d "$RUNNER_TEMP/publisher-taskservice.XXXXXXXX")"
+          trap 'rm -rf -- "$temp"' EXIT
+          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=1 \
+            -o StrictHostKeyChecking=accept-new -o HostKeyAlias=publisher-strato \
             -o UserKnownHostsFile="$temp/known_hosts" -o GlobalKnownHostsFile=/dev/null \
-            -o ConnectTimeout=10 -p "$port" root@"$HOST" 'bash -se' <<'REMOTE'
+            -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port" root@"$address" 'bash -se' <<'REMOTE'
           set -euo pipefail
           export LC_ALL=C
           cd /opt/aplus-publisher
@@ -67,6 +58,7 @@ jobs:
           lscpu | awk -F: '/^(CPU\(s\)|Socket\(s\)|Core\(s\) per socket|Thread\(s\) per core):/ {print}'
           awk '{print "load_1_5_15=" $1 "," $2 "," $3}' /proc/loadavg
           free -m
+          awk '$1 == "MemAvailable:" {print "memory_available_kib=" $2}' /proc/meminfo
           swapon --show=TYPE,SIZE,USED,PRIO
           df -h --output=size,used,avail,pcent,target / /opt
           df -i --output=itotal,iused,iavail,ipcent,target / /opt

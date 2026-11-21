@@ -67,9 +67,9 @@ jobs:
             if [ -f secrets/db.env ] && [ -f secrets/migrate.env ] && [ -f secrets/api.env ] && [ -f secrets/worker.env ]; then echo yes; else echo no; fi
             printf 'TASKSERVICE_SLICE_MEMORY_MAX='; systemctl show taskservice.slice -p MemoryMax --value
             printf 'TASKSERVICE_SCHEMA_EXISTS='
-            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('ts.tenants') IS NOT NULL" || echo unavailable
+            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('ts.tenants') IS NOT NULL" </dev/null || echo unavailable
             printf 'TASKSERVICE_MIGRATION_TABLE_EXISTS='
-            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('public.__EFMigrationsHistory') IS NOT NULL" || echo unavailable
+            docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice exec -T db psql -X -U postgres -d taskservice -At -c "SELECT to_regclass('public.__EFMigrationsHistory') IS NOT NULL" </dev/null || echo unavailable
             printf 'TASKSERVICE_OOM='
             docker inspect taskservice-db-1 -f '{{.State.OOMKilled}}' || true
           fi

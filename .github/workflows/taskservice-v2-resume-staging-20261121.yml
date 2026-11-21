@@ -1,0 +1,103 @@
+name: Resume TaskService V2 isolated pilot after migration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/taskservice-v2-resume-staging-20261121.yml']
+permissions:
+  contents: read
+concurrency:
+  group: taskservice-publisher-stage
+  cancel-in-progress: false
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Complete TaskService schema, roles and capped containers without public routing
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$KEY"
+          port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
+          addr="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$addr" && test "$addr" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 --resolve "reimflow.smarbiz.sbs:443:$addr" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          tmp="$(mktemp -d "$RUNNER_TEMP/ts-resume.XXXXXXXX")"
+          trap 'if [ -n "$SSH_AGENT_PID" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
+          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
+          chmod 600 "$tmp/key"
+          unset KEY
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
+            chmod 700 "$tmp/askpass"
+            SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null
+          fi
+          unset PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$addr" > "$tmp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$tmp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$tmp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$tmp/candidate" "$tmp/known_hosts"; break
+            fi
+          done < "$tmp/scanned"
+          test -s "$tmp/known_hosts"
+          ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -p "$port" root@"$addr" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/taskservice
+          test -f .env && test -f secrets/db.env && test -f compose-lowmem.experimental.yaml
+          compose() { docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice "$@"; }
+          stop_on_failure() {
+            result=$?
+            if [ "$result" -ne 0 ]; then
+              echo 'TaskService staging failed; stopping only TaskService containers.'
+              compose stop api worker scanner db >/dev/null 2>&1 || true
+            fi
+            return "$result"
+          }
+          trap stop_on_failure EXIT
+          test "$(systemctl show taskservice.slice -p MemoryMax --value)" = 1610612736
+          compose config --quiet
+          compose ps -a
+          # -T and stdin redirection prevent Docker Compose from consuming the remainder of the SSH script.
+          compose run --rm -T migrate </dev/null
+          compose exec -T db psql -X -v ON_ERROR_STOP=1 -U postgres -d taskservice < postgres/grants.sql
+          compose exec -T db psql -X -v ON_ERROR_STOP=1 -U postgres -d taskservice <<'SQL'
+          INSERT INTO ts.tenants(id,slug,name,accent,active)
+          VALUES ('4ca46aa9-4c46-4f25-b183-445db1b83f23','pilot','TaskService Pilot','#1064e8',true)
+          ON CONFLICT (id) DO NOTHING;
+          SQL
+          compose up -d api worker scanner
+          for attempt in $(seq 1 45); do
+            if curl -fsS -H 'Host: localhost' --connect-timeout 2 --max-time 4 http://127.0.0.1:18081/health/live >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS -H 'Host: localhost' --max-time 8 http://127.0.0.1:18081/health/live >/dev/null
+          for attempt in $(seq 1 60); do
+            if compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' 2>/dev/null | grep -q PONG; then break; fi
+            sleep 2
+          done
+          compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' | grep -q PONG
+          test "$(docker inspect -f '{{.State.Running}}' taskservice-worker-1)" = true
+          printf 'PILOT_API_SCANNER_WORKER_DB=running\n'
+          compose ps
+          docker stats --no-stream --format 'CONTAINER {{.Name}} | {{.MemUsage}}'
+          available="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+          printf 'HOST_MEM_AVAILABLE_KIB=%s\n' "$available"
+          test "$available" -ge 350000
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ >/dev/null
+          printf 'PUBLISHER_HEALTH=ok\n'
+          printf 'PUBLIC_CUTOVER=not_attempted\n'
+          printf 'PRODUCTION_OIDC_SMTP=still_required\n'
+          REMOTE

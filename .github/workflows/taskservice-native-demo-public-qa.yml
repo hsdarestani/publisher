@@ -1,0 +1,101 @@
+name: Verify the public TaskService demo in Chromium
+on:
+  push:
+    branches: [codex/taskservice-readonly-capacity]
+    paths: ['.github/workflows/taskservice-native-demo-public-qa.yml']
+permissions: { contents: read }
+concurrency:
+  group: taskservice-demo-live-qa
+  cancel-in-progress: false
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/taskservice
+          ref: 2e3813812447553a7b1cd98179a99d8966714fc5
+          persist-credentials: false
+      - name: Install Chromium off the VPS
+        run: |
+          python -m pip install 'playwright==1.62.0'
+          python -m playwright install --with-deps chromium
+      - name: Exercise all demo roles on the public hostname
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$KEY"
+          port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
+          addr="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$addr" && test "$addr" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 --resolve "reimflow.smarbiz.sbs:443:$addr" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          tmp="$(mktemp -d "$RUNNER_TEMP/ts-resume.XXXXXXXX")"
+          trap 'if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
+          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
+          chmod 600 "$tmp/key"
+          unset KEY
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
+            chmod 700 "$tmp/askpass"
+            SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null
+          fi
+          unset PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$addr" > "$tmp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$tmp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$tmp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$tmp/candidate" "$tmp/known_hosts"; break
+            fi
+          done < "$tmp/scanned"
+          test -s "$tmp/known_hosts"
+          ssh_publisher=(ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no
+            -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519
+            -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null
+            -o ConnectTimeout=10 -p "$port" root@"$addr")
+          curl -fsS --max-time 15 https://taskservice.smarbiz.sbs/health/ready | jq -e '.status == "ready"'
+          mkdir -m 700 "$tmp/qa"
+          "${ssh_publisher[@]}" 'tar -C /opt/taskservice/demo-private -cf - platform.json company.json technician.json reviewer.json other.json' </dev/null |
+            tar -C "$tmp/qa" -xf -
+          export TASKSERVICE_DEMO_QA_CREDENTIALS="$tmp/qa"
+          python - <<'PY'
+          import re
+          import runpy
+          import sys
+          import traceback
+          try:
+              runpy.run_path('v2/tests/demo_live_browser.py', run_name='__main__')
+          except Exception as failure:
+              if isinstance(failure, AssertionError) and re.fullmatch(r'[A-Za-z0-9-]+ HTTP [0-9]{3}, expected [0-9]{3}', str(failure)):
+                  print(str(failure), file=sys.stderr)
+              for frame in traceback.extract_tb(failure.__traceback__):
+                  if frame.filename.endswith("demo_live_browser.py"):
+                      print("QA failure location:", frame.name, frame.lineno, type(failure).__name__, file=sys.stderr)
+              sys.exit(1)
+          PY
+          "${ssh_publisher[@]}" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null
+          for name in api worker db scanner; do
+            container="taskservice-$name-1"
+            test "$(docker inspect -f '{{.State.Running}}|{{.State.OOMKilled}}|{{.RestartCount}}' "$container")" = 'true|false|0'
+          done
+          docker stats --no-stream --format 'DEMO_MEMORY {{.Name}} {{.MemUsage}} {{.CPUPerc}}' \
+            taskservice-api-1 taskservice-worker-1 taskservice-db-1 taskservice-scanner-1
+          awk '/^MemAvailable:/ {print "HOST_MEM_AVAILABLE_KIB=" $2; if ($2 < 400000) exit 1}' /proc/meminfo
+          docker exec taskservice-db-1 psql -X -qAt -v ON_ERROR_STOP=1 -U postgres -d taskservice </dev/null \
+            -c "SELECT 'held_demo_mail=' || count(*) FROM ts.outbox WHERE kind='mail_held';"
+          printf 'PUBLISHER_HEALTH=200\n'
+          REMOTE

@@ -1,0 +1,76 @@
+name: Publisher VPS live memory per service
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publisher-memory-breakdown-20261121.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read container memory without changing services
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          DEPLOY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$DEPLOY_KEY"
+          port="${SSH_PORT:-22}"
+          address="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$address" && test "$address" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 \
+            --resolve "reimflow.smarbiz.sbs:443:$address" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          temp="$(mktemp -d "$RUNNER_TEMP/publisher-memory.XXXXXXXX")"
+          trap 'if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$temp"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$temp/key"
+          chmod 600 "$temp/key"
+          unset DEPLOY_KEY
+          if [ -n "${DEPLOY_PASSPHRASE:-}" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$DEPLOY_PASSPHRASE"' > "$temp/askpass"
+            chmod 700 "$temp/askpass"
+            SSH_ASKPASS="$temp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$temp/key" </dev/null
+          fi
+          unset DEPLOY_PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$address" > "$temp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$temp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$temp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$temp/candidate" "$temp/known_hosts"
+              break
+            fi
+          done < "$temp/scanned"
+          test -s "$temp/known_hosts"
+          ssh -i "$temp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no \
+            -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 \
+            -o UserKnownHostsFile="$temp/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port" root@"$address" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/aplus-publisher
+          printf 'UTC_TIME='; date -u '+%Y-%m-%dT%H:%M:%SZ'
+          printf '\n=== HOST MEMORY MB ===\n'; free -m
+          printf '\n=== ACTIVE CONTAINER STATS BY PROJECT ===\n'
+          printf 'PROJECT | SERVICE | CONTAINER | MEMORY_USED / LIMIT | CPU_PERCENT\n'
+          while IFS='|' read -r container mem cpu; do
+            [ -n "$container" ] || continue
+            project="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$container")"
+            service="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$container")"
+            printf '%s | %s | %s | %s | %s\n' "$project" "$service" "$container" "$mem" "$cpu"
+          done < <(docker stats --no-stream --format '{{.Name}}|{{.MemUsage}}|{{.CPUPerc}}')
+          printf '\n=== STOPPED PWYW CONTAINER ===\n'
+          docker ps -a --filter label=com.docker.compose.project=pwyw --format '{{.Names}} | {{.Status}}'
+          printf '\n=== HOST MEMORY AFTER SAMPLING ===\n'; free -m
+          printf '\n=== PUBLISHER READ-ONLY HEALTH ===\n'
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ >/dev/null
+          printf 'PUBLISHER_HEALTH=ok\n'
+          REMOTE

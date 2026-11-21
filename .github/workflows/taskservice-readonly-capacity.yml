@@ -11,16 +11,17 @@ jobs:
     environment: production
     timeout-minutes: 6
     steps:
-      - name: Inspect the Publisher VPS with the existing production password
+      - name: Inspect the Publisher VPS with the existing deployment key
         shell: bash
         env:
           HOST: ${{ secrets.HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
-          SSHPASS: ${{ secrets.PASS }}
+          DEPLOY_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          DEPLOY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
         run: |
           set -euo pipefail
-          if [[ -z "$HOST" || -z "$SSHPASS" ]]; then
-            printf 'The Publisher production environment did not supply both HOST and PASS.\n'
+          if [[ -z "$HOST" || -z "$DEPLOY_KEY" ]]; then
+            printf 'The Publisher production environment did not supply its host and deployment key.\n'
             exit 1
           fi
           port="${SSH_PORT:-22}"
@@ -38,19 +39,29 @@ jobs:
             printf 'Publisher origin did not pass the HTTPS service identity check.\n'
             exit 1
           fi
-          sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq sshpass >/dev/null
           umask 077
           temp="$(mktemp -d "$RUNNER_TEMP/publisher-taskservice.XXXXXXXX")"
-          trap 'rm -rf -- "$temp"' EXIT
-          sshpass -e ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-            -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=1 \
+          trap 'if [[ -n "${SSH_AGENT_PID:-}" ]]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf -- "$temp"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" | tr -d '\r' > "$temp/key"
+          unset DEPLOY_KEY
+          if [[ -n "$DEPLOY_PASSPHRASE" ]]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$DEPLOY_PASSPHRASE"' > "$temp/askpass"
+            chmod 0700 "$temp/askpass"
+            SSH_ASKPASS="$temp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$temp/key" </dev/null
+          fi
+          unset DEPLOY_PASSPHRASE
+          ssh -i "$temp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no \
             -o StrictHostKeyChecking=accept-new -o HostKeyAlias=publisher-strato \
             -o UserKnownHostsFile="$temp/known_hosts" -o GlobalKnownHostsFile=/dev/null \
             -o LogLevel=ERROR -o ConnectTimeout=10 -p "$port" root@"$address" 'bash -se' <<'REMOTE'
           set -euo pipefail
           export LC_ALL=C
           cd /opt/aplus-publisher
+          printf 'authenticated_publisher_vps=yes\n'
+          if [[ -r /etc/ssh/ssh_host_ed25519_key.pub ]]; then
+            ssh-keygen -E sha256 -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print "ssh_ed25519_fingerprint=" $2}'
+          fi
           printf 'audit_utc='
           date -u '+%Y-%m-%dT%H:%M:%SZ'
           printf 'available_vcpu='

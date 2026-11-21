@@ -1,0 +1,152 @@
+name: Refresh only the isolated TaskService pilot
+on:
+  push:
+    branches: [codex/taskservice-readonly-capacity]
+    paths: ['.github/workflows/taskservice-pilot-refresh.yml']
+permissions: { contents: read }
+concurrency:
+  group: taskservice-publisher-stage
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/taskservice
+          ref: 5d3a527dba358ea10969248a77975af13dad82b1
+          persist-credentials: false
+      - name: Build the verified candidate on GitHub
+        run: docker build -f v2/Dockerfile -t taskservice:pilot-5d3a527 .
+      - name: Update only TaskService API and worker with rollback checks
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$KEY"
+          port="$SSH_PORT"; if [ -z "$port" ]; then port=22; fi
+          addr="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$addr" && test "$addr" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 --resolve "reimflow.smarbiz.sbs:443:$addr" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          tmp="$(mktemp -d "$RUNNER_TEMP/ts-resume.XXXXXXXX")"
+          trap 'if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
+          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
+          chmod 600 "$tmp/key"
+          unset KEY
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
+            chmod 700 "$tmp/askpass"
+            SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null
+          fi
+          unset PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$addr" > "$tmp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$tmp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$tmp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$tmp/candidate" "$tmp/known_hosts"; break
+            fi
+          done < "$tmp/scanned"
+          test -s "$tmp/known_hosts"
+          ssh_publisher=(ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no
+            -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519
+            -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null
+            -o ConnectTimeout=10 -p "$port" root@"$addr")
+          "${ssh_publisher[@]}" '
+            set -eu
+            awk '\''/^MemAvailable:/ {if ($2 < 512000) exit 1; seen=1} END {if (!seen) exit 1}'\'' /proc/meminfo
+            test "$(systemctl show taskservice.slice -p MemoryMax --value)" = 1610612736
+            test "$(df --output=avail /var/lib/docker | tail -1)" -ge 3145728
+            test "$(sha256sum /opt/taskservice/compose-lowmem.experimental.yaml | cut -d" " -f1)" = a0adbc671b78ef4fd2951f559dcbe74e3c558105527648ba4ba4f48d0b51132c
+          '
+          docker save taskservice:pilot-5d3a527 | gzip -1 | "${ssh_publisher[@]}" 'docker load >/dev/null'
+          "${ssh_publisher[@]}" 'bash -se -- taskservice:pilot-5d3a527 a0adbc671b78ef4fd2951f559dcbe74e3c558105527648ba4ba4f48d0b51132c' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/taskservice
+          [[ "$#" == 2 && "$1" =~ ^taskservice:pilot-[0-9a-f]{7,40}$ && "$2" =~ ^[0-9a-f]{64}$ ]]
+          new_image="$1"
+          expected_profile="$2"
+          profile=compose-lowmem.experimental.yaml
+          compose() { docker compose -f compose.yaml -f "$profile" -p taskservice "$@"; }
+          publisher_health() {
+            (cd /opt/aplus-publisher && docker compose exec -T web curl -fsS --max-time 5 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null)
+          }
+          api_live() {
+            curl -fsS -H 'Host: localhost' --connect-timeout 2 --max-time 4 http://127.0.0.1:18081/health/live >/dev/null
+          }
+          headroom() {
+            available="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+            [[ "$available" =~ ^[0-9]+$ && "$available" -ge 512000 ]]
+          }
+          [[ "$(systemctl show taskservice.slice -p MemoryMax --value)" == 1610612736 ]]
+          [[ "$(sha256sum "$profile" | awk '{print $1}')" == "$expected_profile" ]]
+          [[ "$(stat -c %a .env)" == 600 && ! -L .env && ! -L "$profile" ]]
+          test "$(grep -c '^TASKSERVICE_IMAGE=' .env)" = 1
+          publisher_health
+          api_live
+          headroom
+          docker image inspect "$new_image" >/dev/null
+          compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' </dev/null | grep -qx PONG
+          scanner_zone="$(compose exec -T scanner date +%z </dev/null)"
+          [[ "$scanner_zone" == +0000 ]]
+          
+          umask 077
+          state="$(mktemp -d /opt/taskservice/.pilot-release.XXXXXXXX)"
+          cp -- .env "$state/old-env"
+          cp -- "$profile" "$state/old-profile"
+          rollback() {
+            status=$?
+            if (( status != 0 )); then
+              mv -fT -- "$state/old-env" .env
+              mv -fT -- "$state/old-profile" "$profile"
+              compose up -d --no-deps api worker </dev/null
+              printf 'Restored the previous TaskService environment and image tag.\n'
+            fi
+            rm -rf -- "$state"
+            return "$status"
+          }
+          trap rollback EXIT
+          sed "s|^TASKSERVICE_IMAGE=.*|TASKSERVICE_IMAGE=$new_image|" "$state/old-env" > "$state/new-env"
+          # Insert the freshness setting for the two replaced app containers. Keep
+          # the scanner and its existing validated configuration running.
+          awk '
+            /^  [a-z]+:/ { service=$1 }
+            /DOTNET_gcServer:/ && (service=="api:" || service=="worker:") {
+              print
+              print "      ClamAv__MaxSignatureAgeHours: '\''72'\''"
+              inserted++
+              next
+            }
+            { print }
+            END { if (inserted!=2) exit 1 }
+          ' "$state/old-profile" > "$state/new-profile"
+          mv -fT -- "$state/new-env" .env
+          mv -fT -- "$state/new-profile" "$profile"
+          compose config --quiet </dev/null
+          compose up -d --no-deps api worker </dev/null
+          for attempt in {1..20}; do
+            if api_live; then break; fi
+            sleep 2
+          done
+          api_live
+          compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' </dev/null | grep -qx PONG
+          for service in api worker; do
+            container="$(compose ps -q "$service" </dev/null)"
+            [[ "$(docker inspect -f '{{.Config.Image}}|{{.State.Running}}|{{.State.OOMKilled}}' "$container")" == "$new_image|true|false" ]]
+          done
+          publisher_health
+          headroom
+          printf 'PILOT_RELEASE_IMAGE=%s\n' "$new_image"
+          printf 'PILOT_LIVENESS_HTTP=200\nPUBLISHER_HEALTH_HTTP=200\nHOST_MEM_AVAILABLE_KIB=%s\n' "$available"
+          printf 'PILOT_READINESS_HTTP=%s\n' "$(curl -sS -H 'Host: localhost' --max-time 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/health/ready)"
+          REMOTE

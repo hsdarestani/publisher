@@ -118,3 +118,37 @@ jobs:
           done
           printf 'known_backup_directories_present=%s\n' "$count"
           REMOTE
+      - name: Verify existing transactional SMTP access without sending mail
+        env:
+          TASKSERVICE_SMTP_HOST: ${{ secrets.TASKSERVICE_SMTP_HOST }}
+          TASKSERVICE_SMTP_PORT: ${{ secrets.TASKSERVICE_SMTP_PORT }}
+          TASKSERVICE_SMTP_USER: ${{ secrets.TASKSERVICE_SMTP_USER }}
+          TASKSERVICE_SMTP_PASSWORD: ${{ secrets.TASKSERVICE_SMTP_PASSWORD }}
+          TASKSERVICE_SMTP_FROM: ${{ secrets.TASKSERVICE_SMTP_FROM }}
+          REIMFLOW_SMTP_HOST: ${{ secrets.REIMFLOW_SMTP_HOST }}
+          REIMFLOW_SMTP_PORT: ${{ secrets.REIMFLOW_SMTP_PORT }}
+          REIMFLOW_SMTP_USER: ${{ secrets.REIMFLOW_SMTP_USER }}
+          REIMFLOW_SMTP_PASSWORD: ${{ secrets.REIMFLOW_SMTP_PASSWORD }}
+          REIMFLOW_SMTP_FROM: ${{ secrets.REIMFLOW_SMTP_FROM }}
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          import ssl
+          for name in ("TASKSERVICE", "REIMFLOW"):
+              def value(f):
+                  return os.environ.get(name + "_SMTP_" + f, "")
+              if not all(value(field) for field in ("HOST", "USER", "PASSWORD", "FROM")):
+                  print(name + ": complete settings unavailable")
+                  continue
+              try:
+                  with smtplib.SMTP(value("HOST"), int(value("PORT") or "587"), timeout=8) as smtp:
+                      smtp.ehlo()
+                      smtp.starttls(context=ssl.create_default_context())
+                      smtp.ehlo()
+                      smtp.login(value("USER"), value("PASSWORD"))
+                      result = smtp.noop()[0] == 250
+                  print(name + (": authenticated STARTTLS session" if result else ": SMTP availability check failed"))
+              except Exception as exc:
+                  print(name + ": connection or authentication failed (" + type(exc).__name__ + ")")
+          PY

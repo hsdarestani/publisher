@@ -1,0 +1,166 @@
+name: TaskService V2 isolated low-memory pilot on Publisher
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/taskservice-v2-protected-staging-20261121.yml']
+permissions:
+  contents: read
+concurrency:
+  group: taskservice-publisher-stage
+  cancel-in-progress: false
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hsdarestani/taskservice
+          ref: f6545b025c2a26ace4e56772a656b31981f081d7
+      - name: Build V2 image on runner and package isolated config
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t taskservice:pilot-f6545b0 -f v2/Dockerfile .
+          mkdir -p "$RUNNER_TEMP/stage/postgres"
+          cp v2/ops/compose.yaml v2/ops/compose-lowmem.experimental.yaml v2/ops/clamd.conf v2/ops/taskservice.slice "$RUNNER_TEMP/stage/"
+          cp v2/ops/postgres/initialize.sh "$RUNNER_TEMP/stage/postgres/initialize.sh"
+          cp v2/TaskService/Database/grants.sql "$RUNNER_TEMP/stage/postgres/grants.sql"
+          tar czf "$RUNNER_TEMP/ops.tar.gz" -C "$RUNNER_TEMP/stage" .
+          docker save taskservice:pilot-f6545b0 | gzip -1 > "$RUNNER_TEMP/taskservice-image.tar.gz"
+      - name: Stage only the isolated TaskService stack, no public routing
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$KEY"
+          port="$SSH_PORT"
+          if [ -z "$port" ]; then port=22; fi
+          addr="$(getent ahostsv4 "$HOST" | awk '{print $1}' | sort -u)"
+          expected="$(getent ahostsv4 reimflow.smarbiz.sbs | awk '{print $1}' | sort -u)"
+          test -n "$addr" && test "$addr" = "$expected"
+          curl --silent --show-error --fail --noproxy '*' --proto '=https' --connect-timeout 5 --max-time 12 --resolve "reimflow.smarbiz.sbs:443:$addr" -o /dev/null https://reimflow.smarbiz.sbs/
+          umask 077
+          tmp="$(mktemp -d "$RUNNER_TEMP/ts-stage.XXXXXXXX")"
+          trap 'if [ -n "$SSH_AGENT_PID" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
+          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
+          chmod 600 "$tmp/key"
+          unset KEY
+          if [ -n "$PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
+            chmod 700 "$tmp/askpass"
+            SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null
+          fi
+          unset PASSPHRASE
+          ssh-keyscan -T 8 -t ed25519 -p "$port" "$addr" > "$tmp/scanned" 2>/dev/null
+          while read -r _ keytype keydata; do
+            [ "$keytype" = ssh-ed25519 ] || continue
+            printf 'publisher-strato %s %s\n' "$keytype" "$keydata" > "$tmp/candidate"
+            actual="$(ssh-keygen -E sha256 -lf "$tmp/candidate" | awk '{print $2}')"
+            if [ "$actual" = 'SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg' ]; then
+              mv "$tmp/candidate" "$tmp/known_hosts"
+              break
+            fi
+          done < "$tmp/scanned"
+          test -s "$tmp/known_hosts"
+          ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -p "$port" root@"$addr" 'test ! -e /opt/taskservice; test "$(awk '\''/^MemAvailable:/ {print $2}'\'' /proc/meminfo)" -gt 1750000'
+          scp -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -P "$port" "$RUNNER_TEMP/ops.tar.gz" "$RUNNER_TEMP/taskservice-image.tar.gz" root@"$addr":/tmp/
+          ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o HostKeyAlias=publisher-strato -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -p "$port" root@"$addr" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cleanup() {
+            result=$?
+            if [ "$result" -ne 0 ] && [ -f /opt/taskservice/.env ]; then
+              cd /opt/taskservice
+              docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice stop api worker scanner db || true
+              echo 'Pilot did not pass; only TaskService containers were stopped.'
+            fi
+          }
+          trap cleanup EXIT
+          umask 077
+          test ! -e /opt/taskservice
+          test ! -e /etc/systemd/system/taskservice.slice
+          test "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" -gt 1700000
+          if ss -H -lnt | awk '{print $4}' | grep -Eq '(^|:)18081$'; then exit 1; fi
+          mkdir -p /opt/taskservice
+          tar xzf /tmp/ops.tar.gz -C /opt/taskservice
+          cd /opt/taskservice
+          chmod 644 compose.yaml compose-lowmem.experimental.yaml clamd.conf taskservice.slice postgres/grants.sql
+          chmod 755 postgres/initialize.sh
+          gzip -dc /tmp/taskservice-image.tar.gz | docker load
+          rm -f /tmp/taskservice-image.tar.gz /tmp/ops.tar.gz
+          docker pull postgres:18 >/dev/null
+          docker pull clamav/clamav:stable >/dev/null
+          docker create --name taskservice-clam-config-src clamav/clamav:stable >/dev/null
+          docker cp taskservice-clam-config-src:/etc/clamav/freshclam.conf freshclam-lowmem.conf
+          docker rm taskservice-clam-config-src >/dev/null
+          sed -i '/^TestDatabases[[:space:]]/d' freshclam-lowmem.conf
+          printf '\nTestDatabases no\n' >> freshclam-lowmem.conf
+          chmod 644 freshclam-lowmem.conf
+          install -m 0644 taskservice.slice /etc/systemd/system/taskservice.slice
+          systemctl daemon-reload
+          systemctl start taskservice.slice
+          mkdir -m 0700 secrets
+          for name in POSTGRES_PASSWORD TASKSERVICE_MIGRATOR_PASSWORD TASKSERVICE_API_PASSWORD TASKSERVICE_WORKER_PASSWORD TASKSERVICE_PLATFORM_PASSWORD; do
+            printf '%s=%s\n' "$name" "$(openssl rand -hex 32)" >> secrets/db.env
+          done
+          set -a
+          source secrets/db.env
+          set +a
+          cat > .env <<'EOF'
+          TASKSERVICE_IMAGE=taskservice:pilot-f6545b0
+          TASKSERVICE_POSTGRES_IMAGE=postgres:18
+          TASKSERVICE_CLAMAV_IMAGE=clamav/clamav:stable
+          TASKSERVICE_HTTP_PORT=18081
+          EOF
+          printf 'ConnectionStrings__Migration=Host=db;Database=taskservice;Username=taskservice_migrator;Password=%s\n' "$TASKSERVICE_MIGRATOR_PASSWORD" > secrets/migrate.env
+          {
+            printf 'ConnectionStrings__Runtime=Host=db;Database=taskservice;Username=taskservice_api;Password=%s\n' "$TASKSERVICE_API_PASSWORD"
+            printf 'ConnectionStrings__Platform=Host=db;Database=taskservice;Username=taskservice_platform;Password=%s\n' "$TASKSERVICE_PLATFORM_PASSWORD"
+            printf '%s\n' 'AllowedHosts=localhost' 'TASKSERVICE_HEALTH_HOST=localhost' 'Routing__DefaultTenantSlug=pilot'
+          } > secrets/api.env
+          {
+            printf 'ConnectionStrings__Worker=Host=db;Database=taskservice;Username=taskservice_worker;Password=%s\n' "$TASKSERVICE_WORKER_PASSWORD"
+            printf '%s\n' 'Mail__Host=localhost' 'Mail__From=pilot@example.invalid'
+          } > secrets/worker.env
+          chmod 600 .env secrets/*.env
+          compose() { docker compose -f compose.yaml -f compose-lowmem.experimental.yaml -p taskservice "$@"; }
+          compose config --quiet
+          compose up -d --wait --wait-timeout 120 db
+          compose run --rm migrate
+          compose exec -T db psql -X -v ON_ERROR_STOP=1 -U postgres -d taskservice < postgres/grants.sql
+          compose exec -T db psql -X -v ON_ERROR_STOP=1 -U postgres -d taskservice <<'SQL'
+          INSERT INTO ts.tenants(id,slug,name,accent,active)
+          VALUES ('4ca46aa9-4c46-4f25-b183-445db1b83f23','pilot','TaskService Pilot','#1064e8',true);
+          SQL
+          compose up -d api worker scanner
+          for attempt in $(seq 1 45); do
+            if curl -fsS -H 'Host: localhost' --connect-timeout 2 --max-time 4 http://127.0.0.1:18081/health/live >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS -H 'Host: localhost' --max-time 8 http://127.0.0.1:18081/health/live >/dev/null
+          for attempt in $(seq 1 60); do
+            if compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' 2>/dev/null | grep -q PONG; then break; fi
+            sleep 2
+          done
+          compose exec -T scanner sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310' | grep -q PONG
+          printf 'TASKSERVICE_LOOPBACK_PILOT=healthy\n'
+          compose ps
+          docker stats --no-stream --format 'CONTAINER {{.Name}} | {{.MemUsage}}'
+          printf 'MEM_AVAILABLE_KIB='
+          awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+          if [ "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" -lt 350000 ]; then
+            echo 'Insufficient host headroom. Stopping TaskService pilot only.'
+            exit 1
+          fi
+          cd /opt/aplus-publisher
+          docker compose exec -T web curl -fsS --max-time 10 http://127.0.0.1:8000/healthz/ >/dev/null
+          printf 'PUBLISHER_HEALTH=ok\n'
+          printf 'PUBLIC_CUTOVER=not_attempted\n'
+          printf 'PRODUCTION_IDENTITY_AND_MAIL=not_configured\n'
+          REMOTE

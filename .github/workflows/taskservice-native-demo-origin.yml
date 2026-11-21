@@ -6,7 +6,7 @@ on:
 permissions: { contents: read }
 concurrency:
   group: taskservice-demo-origin
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   origin:
     runs-on: ubuntu-latest
@@ -173,5 +173,16 @@ jobs:
             tar -C "$tmp/qa" -xf -
           export PLAYWRIGHT_BROWSERS_PATH="$RUNNER_TEMP/demo-chromium"
           export TASKSERVICE_DEMO_QA_CREDENTIALS="$tmp/qa" TASKSERVICE_DEMO_ORIGIN_IP="$addr"
-          HOME="$tmp/browser-home" python v2/tests/demo_live_browser.py
+          HOME="$tmp/browser-home" python - <<'PY'
+          import runpy
+          import sys
+          import traceback
+          try:
+              runpy.run_path('v2/tests/demo_live_browser.py', run_name='__main__')
+          except Exception as failure:
+              for frame in traceback.extract_tb(failure.__traceback__):
+                  if frame.filename.endswith("demo_live_browser.py"):
+                      print("QA failure location:", frame.name, frame.lineno, type(failure).__name__, file=sys.stderr)
+              sys.exit(1)
+          PY
           printf 'REAL_ORIGIN_BROWSER=passed\n'

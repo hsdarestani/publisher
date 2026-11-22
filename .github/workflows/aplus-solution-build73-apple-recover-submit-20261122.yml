@@ -1,0 +1,124 @@
+name: A+ Solution build 73 Apple detach attach and resubmit
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aplus-solution-build73-apple-recover-submit-20261122.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aplus-solution-current-store-submission
+  cancel-in-progress: false
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Replace stale build 72 only after verified build 73 is valid; queue Publisher Apple resubmit
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 7m
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import json,time
+            from apps.publisher.models import Release,Job
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            r=Release.objects.get(app__slug="a-plus-solution",source_commit="8d9dc615353e300833561d1010c56cfdd45f978b")
+            assert r.version_name=="1.0.34" and r.build_number==73 and r.android_track=="production"
+            build=r.builds.get(platform="ios")
+            assert build.status=="succeeded" and build.external_build_id
+            c=AppleStoreClient(r.app.apple_account)
+            aid=c.find_app(r.app.bundle_id)["id"]
+            ver=c.find_editable_version(aid,r.version_name)
+            assert ver and ver["attributes"]["versionString"]==r.version_name
+            version_id=ver["id"]
+            state=ver["attributes"].get("appStoreState") or ver["attributes"].get("appVersionState")
+            print("APPLE_STATE_BEFORE",state,flush=True)
+            assert state in ("DEVELOPER_REJECTED","PREPARE_FOR_SUBMISSION","READY_FOR_REVIEW"),"Unexpected Apple version state: "+str(state)
+            target=str(build.external_build_id)
+            attrs=c.request("GET",f"/builds/{target}")["data"]["attributes"]
+            assert attrs.get("processingState")=="VALID" and attrs.get("version")=="73",attrs
+            current=(c.request("GET",f"/appStoreVersions/{version_id}/relationships/build").get("data") or {}).get("id")
+            print("PREVIOUS_ATTACHED_BUILD",current,"NEW_BUILD",target,flush=True)
+            if current!=target:
+                # Apple cannot swap a build while the previous relationship exists
+                # after withdrawing an in-review version. Clear it before attaching.
+                if current:
+                    c.request("PATCH",f"/appStoreVersions/{version_id}/relationships/build",data=json.dumps({"data":None}))
+                    detached=c.request("GET",f"/appStoreVersions/{version_id}/relationships/build").get("data")
+                    assert detached is None,"Old build relation remains after detach"
+                    print("OLD_APPLE_BUILD_DETACHED",current,flush=True)
+                try:
+                    for attempt in range(8):
+                        try:
+                            c.attach_build(version_id,target)
+                            break
+                        except Exception as ex:
+                            if attempt==7: raise
+                            print("ATTACH_RETRY",attempt+1,str(ex)[:250],flush=True)
+                            time.sleep(4)
+                except Exception:
+                    if current:
+                        try: c.attach_build(version_id,current);print("OLD_RELATION_RESTORED",flush=True)
+                        except Exception as ex: print("RESTORE_FAILED",str(ex)[:500],flush=True)
+                    raise
+            attached=(c.request("GET",f"/appStoreVersions/{version_id}/relationships/build").get("data") or {}).get("id")
+            assert str(attached)==target,"Build 73 not attached"
+            print("NEW_APPLE_BUILD_ATTACHED",target,flush=True)
+            prior=Job.objects.filter(release=r,type="submit_apple",status__in=["queued","running","succeeded"]).order_by("-created_at").first()
+            if prior:
+                print("APPLE_SUBMIT_ALREADY_IN_FLIGHT",prior.id,prior.status,flush=True)
+            else:
+                j=enqueue_job("submit_apple",app=r.app,release=r,build=build)
+                print("APPLE_RESUBMIT_QUEUED",j.id,flush=True)
+            PY
+      - name: Confirm Publisher submission and exact App Store Connect attachment
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 10m
+          script: |
+            set -eu
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import time
+            from django.db import close_old_connections
+            from apps.publisher.models import Release,Job,Submission
+            from apps.integrations.apple_store import AppleStoreClient
+            r=Release.objects.get(app__slug="a-plus-solution",source_commit="8d9dc615353e300833561d1010c56cfdd45f978b")
+            deadline=time.monotonic()+480
+            while time.monotonic()<deadline:
+                close_old_connections()
+                j=Job.objects.filter(release=r,type="submit_apple").order_by("-created_at").first()
+                if j:
+                    print("APPLE_SUBMIT_PROGRESS",j.id,j.status,j.progress,flush=True)
+                    if j.status=="failed": raise RuntimeError(str(j.error)[:2000])
+                    if j.status=="succeeded": break
+                time.sleep(12)
+            else: raise RuntimeError("Apple submit did not complete within verification window")
+            c=AppleStoreClient(r.app.apple_account)
+            aid=c.find_app(r.app.bundle_id)["id"]
+            ver=c.find_editable_version(aid,r.version_name)
+            state=ver["attributes"].get("appStoreState") or ver["attributes"].get("appVersionState")
+            attached=(c.request("GET",f"/appStoreVersions/{ver['id']}/relationships/build").get("data") or {}).get("id")
+            assert str(attached)==str(r.builds.get(platform="ios").external_build_id)
+            assert state in {"WAITING_FOR_REVIEW","IN_REVIEW","PENDING_DEVELOPER_RELEASE","PENDING_APPLE_RELEASE","PROCESSING_FOR_APP_STORE","READY_FOR_SALE","READY_FOR_DISTRIBUTION"},state
+            assert Submission.objects.filter(release=r,platform="ios",state__in=["in_review","approved","live"]).exists()
+            assert Submission.objects.filter(release=r,platform="android",state__in=["in_review","approved","live"]).exists()
+            print("APPLUS_BUILD73_BOTH_STORES_SUBMITTED",r.version_name,r.build_number,"APPLE",state,"GOOGLE","in_review",flush=True)
+            PY

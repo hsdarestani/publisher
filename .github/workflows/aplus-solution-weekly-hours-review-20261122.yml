@@ -23,10 +23,13 @@ jobs:
       APLUS_SOURCE_COMMIT: 8d9dc615353e300833561d1010c56cfdd45f978b
     steps:
       - name: Verify exact A+ Solution source is on main
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 "https://api.github.com/repos/hsdarestani/aplussolution/compare/$APLUS_SOURCE_COMMIT...main" |
-            python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] in ("ahead","identical")'
+          # Authenticated API: avoid the unauthenticated 403 GitHub rate limit.
+          status="$(gh api "repos/hsdarestani/aplussolution/compare/$APLUS_SOURCE_COMMIT...main" --jq .status)"
+          test "$status" = ahead -o "$status" = identical
           curl -fsSL --retry 3 https://app.aplus-solution.de/health/ >/dev/null
 
       - name: Check live store versions and queue signed Android and iOS builds

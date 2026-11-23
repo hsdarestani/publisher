@@ -1,0 +1,106 @@
+name: A+ Esthetic iOS V3 build 50 — signed IPA upload and Apple review submission
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-ios-build50-apple-submit.yml]
+permissions: {contents: read}
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - name: Wait for exact signed IPA and Apple upload, then submit version 1.0.44 for review
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: PASS_VAR
+          command_timeout: 75m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            for i in $(seq 1 170); do
+              state=$(docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Build;print('STATE',Build.objects.get(pk=82).status)" | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+              if [[ "$state" == "succeeded" ]]; then echo "IOS_V3_SIGNED_IPA=SUCCEEDED";break;fi
+              if [[ "$state" == "failed" || "$state" == "cancelled" ]]; then echo "IOS_BUILD50=$state";exit 1;fi
+              if [[ "$state" != "queued" && "$state" != "claimed" && "$state" != "running" ]]; then echo "IOS_BUILD50_UNEXPECTED=$state";exit 1;fi
+              if (( i % 10 == 1 )); then echo "IOS_BUILD50=$state";fi
+              sleep 15
+            done
+            [[ "$state" == "succeeded" ]] || { echo "IOS_SIGNED_BUILD50_NOT_READY";exit 1; }
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp, Release, Build, Job
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            r=Release.objects.get(pk=46,app=app,version_name="1.0.44",build_number=50)
+            b=Build.objects.get(pk=82,release=r,platform="ios")
+            expected="058f57f06f7ca28f35f7d9ef29028f3985571bee"
+            assert r.source_commit==expected and r.source_branch=="feature/simplybook-v3-native-20261123", "Source mismatch"
+            build_job=Job.objects.filter(release=r,type="build_ios",status="succeeded").order_by("-created_at").first()
+            assert build_job and (build_job.result or {}).get("commit")==expected, "Signed IPA source mismatch"
+            assert b.status=="succeeded" and bool(b.artifact) and b.artifact_size>1000000
+            assert len(b.artifact_checksum)==64 and b.artifact.name.endswith(".ipa")
+            assert app.apple_account and app.apple_account.configured
+            print("IOS_V3_SIGNED_IPA_SOURCE_VERIFIED=YES")
+            print("IOS_V3_ARTIFACT_CHECKSUM_PRESENT=YES")
+            '
+            for i in $(seq 1 130); do
+              state=$(docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Build,Job
+            b=Build.objects.get(pk=82)
+            jobs=Job.objects.filter(build=b,type="upload_apple").order_by("-created_at")
+            j=jobs.first()
+            print("STATE",j.status if j else "not_started")
+            ' | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+              if [[ "$state" == "succeeded" ]]; then echo "IOS_V3_APPSTORE_UPLOAD=SUCCEEDED";break;fi
+              if [[ "$state" == "failed" ]]; then echo "IOS_V3_APPSTORE_UPLOAD=FAILED";exit 1;fi
+              if [[ "$state" != "queued" && "$state" != "claimed" && "$state" != "running" && "$state" != "not_started" ]]; then echo "UNEXPECTED_UPLOAD=$state";exit 1;fi
+              if (( i % 12 == 1 )); then echo "IOS_APPLE_UPLOAD=$state";fi
+              sleep 15
+            done
+            [[ "$state" == "succeeded" ]] || { echo "IOS_APPLE_UPLOAD_NOT_READY";exit 1; }
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            r=Release.objects.get(pk=46,app=app,build_number=50)
+            b=Build.objects.get(pk=82,release=r,platform="ios")
+            assert b.status=="succeeded" and bool(b.external_build_id), "App Store processed build ID missing"
+            existing=Submission.objects.filter(release=r,platform="ios").first()
+            if existing and existing.state in ("in_review","approved","live"):
+                print("IOS_V3_ALREADY_SUBMITTED",existing.state)
+            else:
+                jobs=Job.objects.filter(release=r,type="submit_apple").order_by("-created_at")
+                if jobs.exists():
+                    j=jobs.first()
+                    if j.status=="failed":raise SystemExit("Existing Apple submission failed; inspect failure before retry")
+                else:
+                    j=enqueue_job("submit_apple",app=app,release=r,build=b)
+                print("IOS_V3_APPLE_SUBMIT_JOB",j.pk,j.status)
+            '
+            for i in $(seq 1 95); do
+              state=$(docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Job,Submission
+            s=Submission.objects.filter(release_id=46,platform="ios").first()
+            j=Job.objects.filter(release_id=46,type="submit_apple").order_by("-created_at").first()
+            print("STATE","succeeded" if s and s.state in ("in_review","approved","live") else (j.status if j else "not_started"))
+            ' | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+              if [[ "$state" == "succeeded" ]]; then echo "IOS_V3_APPLE_REVIEW_SUBMIT=SUCCEEDED";break;fi
+              if [[ "$state" == "failed" ]]; then echo "IOS_V3_APPLE_REVIEW_SUBMIT=FAILED";exit 1;fi
+              if [[ "$state" != "queued" && "$state" != "running" && "$state" != "not_started" ]]; then echo "APPLE_SUBMIT_UNEXPECTED=$state";exit 1;fi
+              if (( i % 9 == 1 )); then echo "APPLE_SUBMIT=$state";fi
+              sleep 15
+            done
+            [[ "$state" == "succeeded" ]] || { echo "IOS_V3_APPLE_REVIEW_NOT_CONFIRMED";exit 1; }
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Release,Submission,Build
+            r=Release.objects.get(pk=46)
+            s=Submission.objects.filter(release=r,platform="ios").first()
+            b=Build.objects.get(pk=82)
+            assert s and s.state in ("in_review","approved","live") and s.external_id
+            print("IOS_V3_VERSION",r.version_name,r.build_number)
+            print("APPLE_SUBMISSION_STATE",s.state)
+            print("APP_STORE_BUILD_ID",b.external_build_id)
+            print("APPLE_SUBMISSION_CONFIRMED=YES")
+            '

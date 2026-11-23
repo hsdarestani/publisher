@@ -30,6 +30,9 @@ jobs:
             print("GOOGLE_ACCOUNT_CONFIGURED",bool(app.google_account and app.google_account.configured))
             print("UPLOAD_KEY_CONFIGURED",hasattr(app,"android_signing"))
             print("ANDROID_BUILD_CONFIG_KEYS",sorted(app.build_config.keys()) if isinstance(app.build_config,dict) else [])
+            print("ANDROID_COMMAND",app.build_config.get("android_command","") if isinstance(app.build_config,dict) else "")
+            print("ANDROID_ARTIFACT",app.build_config.get("android_artifact","") if isinstance(app.build_config,dict) else "")
+            print("HAS_REVIEW_LOGIN",bool(app.review_username and app.get_review_password()))
             for rel in Release.objects.filter(app=app).order_by("-build_number")[:7]:
                 print("RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.android_track,rel.source_branch)
                 for build in rel.builds.filter(platform="android"):

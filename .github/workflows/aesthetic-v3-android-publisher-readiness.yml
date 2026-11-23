@@ -33,7 +33,7 @@ jobs:
             for rel in Release.objects.filter(app=app).order_by("-build_number")[:7]:
                 print("RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.android_track,rel.source_branch)
                 for build in rel.builds.filter(platform="android"):
-                    print("ANDROID_BUILD",build.pk,build.status,bool(build.artifact_file))
+                    print("ANDROID_BUILD",build.pk,build.status,bool(build.artifact),build.commit_sha[:12])
                 for submission in Submission.objects.filter(release=rel,platform="android"):
                     print("GOOGLE_SUBMISSION",submission.pk,submission.state)
             for job in Job.objects.filter(app=app).order_by("-created_at")[:7]:

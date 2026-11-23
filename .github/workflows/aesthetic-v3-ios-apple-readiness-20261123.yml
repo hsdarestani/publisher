@@ -1,0 +1,47 @@
+name: A+ Esthetic iOS V3 Apple readiness (read-only)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-ios-apple-readiness-20261123.yml]
+permissions: {contents: read}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Read Publisher Apple signing, versions, and App Store Connect state
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp, Release, Job, Build, Submission
+            from apps.integrations.apple_store import AppleStoreClient
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            print("APPLE_APP",app.pk,app.name,app.bundle_id)
+            print("APPLE_CREDENTIALS_CONFIGURED",bool(app.apple_account and app.apple_account.configured))
+            print("APPLE_SIGNING_KEYS",sorted(k for k in (app.build_config or {}).get("env",{}).keys()))
+            print("IOS_COMMAND",str((app.build_config or {}).get("ios_command",""))[:300])
+            print("IOS_ARTIFACT",app.build_config.get("ios_artifact",""))
+            print("REVIEW_ACCOUNT_CONFIGURED",bool(app.review_username and app.get_review_password()))
+            for rel in Release.objects.filter(app=app).order_by("-build_number")[:10]:
+                print("PUBLISHER_RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.source_branch)
+                for b in rel.builds.filter(platform="ios"):
+                    print("IOS_BUILD",b.pk,b.status,bool(b.artifact),bool(b.external_build_id))
+                for s in Submission.objects.filter(release=rel,platform="ios"):
+                    print("IOS_SUBMISSION",s.state)
+            client=AppleStoreClient(app.apple_account)
+            record=client.find_app(app.bundle_id)
+            print("APP_STORE_APP_FOUND",record.get("id"))
+            for item in client.list_versions(record["id"],limit=15):
+                a=item.get("attributes",{})
+                print("APPLE_VERSION",a.get("versionString"),a.get("appStoreState"),a.get("appVersionState"),item.get("id"))
+            '
+            echo APPLE_READINESS_AUDIT_COMPLETE

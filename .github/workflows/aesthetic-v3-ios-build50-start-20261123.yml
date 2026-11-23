@@ -1,0 +1,75 @@
+name: A+ Esthetic iOS V3 1.0.44 (50) — guarded signed IPA build
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-ios-build50-start-20261123.yml]
+permissions: {contents: read}
+jobs:
+  enqueue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require successful exact V3 iOS Simulator QA
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,urllib.request
+          base="https://api.github.com/repos/hsdarestani/a_esthetic"
+          headers={"Accept":"application/vnd.github+json","User-Agent":"a-esthetic-publisher-check"}
+          def get(p):
+              with urllib.request.urlopen(urllib.request.Request(base+p,headers=headers),timeout=25) as r:return json.load(r)
+          run=get("/actions/runs/45125774572")
+          expected="058f57f06f7ca28f35f7d9ef29028f3985571bee"
+          assert run["status"]=="completed" and run["conclusion"]=="success" and run["head_sha"]==expected,"iOS V3 simulator build not green"
+          compare=get("/compare/"+expected+"...540f9ce1a69cfdde26cc637ae925b3eb8022aa60")
+          assert compare["ahead_by"]==1 and all(x["filename"].startswith(".github/workflows/") for x in compare["files"]),"Unexpected iOS V3 code changes since QA"
+          print("APPLE_IOS_V3_QA_VERIFIED=YES",expected)
+          PY
+      - name: Queue exactly one signed iOS build with existing Publisher/Apple key
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from decimal import Decimal
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            source="058f57f06f7ca28f35f7d9ef29028f3985571bee"
+            branch="feature/simplybook-v3-native-20261123"
+            assert app.bundle_id=="de.aplusesthetic.app", "Wrong Apple bundle"
+            assert app.apple_account and app.apple_account.configured, "Apple API credentials missing"
+            assert app.review_username and app.get_review_password(), "Apple review login missing"
+            assert app.repository_url.rstrip("/").endswith("hsdarestani/a_esthetic"), "Wrong repo"
+            assert "scripts/build-ios.sh" in app.build_config.get("ios_command",""), "iOS build command mismatch"
+            assert app.build_config.get("ios_artifact")=="artifacts/a-esthetic.ipa", "iOS IPA artifact mismatch"
+            assert not Release.objects.filter(app=app,build_number__gt=50).exists(), "Newer release already exists"
+            with transaction.atomic():
+                rel=Release.objects.filter(app=app,build_number=50).first()
+                if rel is None:
+                    rel=Release.objects.create(app=app,version_name="1.0.44",build_number=50,
+                        source_branch=branch,source_commit=source,
+                        status="building",auto_submit=False,ios_release_type="manual",
+                        release_notes="Verbesserte native Praxisverwaltung: SimplyBook-inspirierter Kalender, sanfte Wischanimationen, feste sichtbare Zeiten 10–20 Uhr, verbesserte Terminübersicht sowie GOÄ-Entwürfe und Patientenverwaltung.")
+                    b=Build.objects.create(release=rel,platform="ios",status="queued")
+                    job=enqueue_job("build_ios",app=app,release=rel,build=b,agent=True,platform="macos")
+                else:
+                    assert rel.version_name=="1.0.44" and rel.source_commit==source and rel.source_branch==branch, "Existing build50 conflicts"
+                    b=rel.builds.filter(platform="ios").first()
+                    assert b is not None
+                    job=Job.objects.filter(release=rel,type="build_ios").order_by("-created_at").first()
+                    assert job is not None
+                print("APPLE_V3_RELEASE_ID",rel.pk)
+                print("APPLE_V3_BUILD_ID",b.pk,b.status)
+                print("APPLE_V3_BUILD_JOB_ID",job.pk,job.status)
+                print("SOURCE_SHA",rel.source_commit)
+                print("ANDROID_BUILD_UNCHANGED=YES")
+            '

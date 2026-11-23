@@ -42,7 +42,11 @@ jobs:
             assert release.android_track=="production" and float(release.android_rollout)==1
             assert build.status=="succeeded" and bool(build.artifact) and build.artifact_size>1000000
             assert len(build.artifact_checksum)==64, "AAB checksum not recorded"
-            assert build.commit_sha==release.source_commit, "Signed AAB source mismatch"
+            recorded_source=build.commit_sha or str((build.metadata or {}).get("commit",""))
+            assert recorded_source==release.source_commit, "Signed AAB metadata source mismatch"
+            meta_hash=str((build.metadata or {}).get("sha256",""))
+            if meta_hash: assert meta_hash.lower()==build.artifact_checksum.lower(), "Stored signed AAB digest mismatch"
+            assert (build.metadata or {}).get("android_certificate_sha256"), "Publisher signing certificate missing"
             assert app.google_account and app.google_account.configured
             assert hasattr(app,"android_signing"), "Store upload signing not configured"
             existing=Job.objects.filter(release=release,type__in=["upload_google","submit_google"]).order_by("-created_at")

@@ -1,0 +1,90 @@
+name: A+ Esthetic Android V3 build 49 — start signed Publisher release
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-android-start-build49.yml]
+permissions: {contents: read}
+jobs:
+  guarded-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Require both verified Android native and Publisher entrypoint QA runs
+        env:
+          SOURCE_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          base='https://api.github.com/repos/hsdarestani/a_esthetic'
+          expected='c393c2ee698e593d0df8f0ce42d1201464062762'
+          headers={'Accept':'application/vnd.github+json'}
+          if os.getenv('SOURCE_TOKEN'):headers['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
+          def get(path):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=15) as r:return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in (401,403,404) and 'Authorization' in headers:
+                      x={k:v for k,v in headers.items() if k!='Authorization'}
+                      with urllib.request.urlopen(urllib.request.Request(base+path,headers=x),timeout=15) as r:return json.load(r)
+                  raise
+          branch=get('/branches/feature%2Fsimplybook-v3-android-20261123')
+          if branch['commit']['sha']!=expected:raise SystemExit('SAFE_ABORT: source branch has changed since testing')
+          for run_id in (45131293738,45131293682):
+              run=get('/actions/runs/'+str(run_id))
+              print('QA_RUN',run_id,run['status'],run['conclusion'],run['head_sha'][:12])
+              if run['head_sha']!=expected or run['status']!='completed' or run['conclusion']!='success':
+                  raise SystemExit('SAFE_ABORT: required QA not green for this source')
+          print('QA_GATES_PASSED=YES; source branch and commit frozen')
+          PY
+      - name: Create exactly one Android-only release and queue signed build
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from decimal import Decimal
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            exact="c393c2ee698e593d0df8f0ce42d1201464062762"
+            branch="feature/simplybook-v3-android-20261123"
+            assert app.google_account and app.google_account.configured, "Google account missing"
+            assert hasattr(app,"android_signing"), "Existing Google upload key missing"
+            assert app.repository_url.rstrip("/").endswith("hsdarestani/a_esthetic"), "Repository mismatch"
+            assert "scripts/build-android.sh" in app.build_config.get("android_command",""), "Publisher build command mismatch"
+            assert app.build_config.get("android_artifact")=="artifacts/a-esthetic-release.aab"
+            assert app.review_username and app.get_review_password(), "Google reviewer login missing"
+            if Release.objects.filter(app=app,build_number__gte=49).exclude(build_number=49).exists():
+                raise SystemExit("SAFE_ABORT: a higher build code already exists")
+            with transaction.atomic():
+                rel=Release.objects.filter(app=app,build_number=49).first()
+                if rel is None:
+                    rel=Release.objects.create(app=app,version_name="1.0.43",
+                        build_number=49,source_branch=branch,source_commit=exact,
+                        android_track="production",android_rollout=Decimal("1.0000"),
+                        auto_submit=False,status="building",
+                        release_notes="Verbesserte native Kalenderansicht für die Praxisverwaltung mit flüssiger Navigation, festen sichtbaren Zeiten von 10 bis 20 Uhr und übersichtlicher Darstellung paralleler Termine.")
+                    build=Build.objects.create(release=rel,platform="android",status="queued")
+                    job=enqueue_job("build_android",app=app,release=rel,build=build,agent=True,platform="linux")
+                else:
+                    assert rel.source_commit==exact and rel.version_name=="1.0.43", "Existing release mismatch"
+                    build=rel.builds.filter(platform="android").first()
+                    assert build is not None, "Existing release has no Android build"
+                    jobs=Job.objects.filter(release=rel,type="build_android").order_by("-created_at")
+                    assert jobs.exists(), "Existing release has no build job"
+                    job=jobs.first()
+                print("PUBLISHER_RELEASE_ID",rel.pk)
+                print("PUBLISHER_ANDROID_BUILD_ID",build.pk,build.status)
+                print("PUBLISHER_BUILD_JOB_ID",job.pk,job.status)
+                print("SOURCE_SHA",rel.source_commit[:12])
+                print("GOOGLE_TRACK",rel.android_track)
+            '
+            echo PUBLISHER_BUILD49_QUEUED_OR_PRESENT=YES

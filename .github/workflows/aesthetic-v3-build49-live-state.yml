@@ -1,0 +1,36 @@
+name: Read signed Android V3 build 49 and Google submission status
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-build49-live-state.yml]
+permissions: {contents: read}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Inspect only A+ Esthetic build 49 statuses
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 3m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Release,Build,Job,Submission
+            r=Release.objects.get(pk=45,build_number=49)
+            b=Build.objects.get(pk=81,release=r)
+            print("RELEASE49",r.status,r.android_track,r.source_commit[:12])
+            print("BUILD49",b.status,b.commit_sha[:12],b.artifact_size, bool(b.artifact),len(b.artifact_checksum))
+            for j in Job.objects.filter(release=r).order_by("-created_at")[:4]:
+                print("JOB49",j.pk,j.type,j.status,j.required_platform)
+                if j.status=="failed":
+                    print("JOB49_ERROR_TYPE",type(j.error).__name__,"ERROR_LENGTH",len(j.error))
+            for s in Submission.objects.filter(release=r,platform="android"):
+                print("GOOGLE49",s.state)
+            '

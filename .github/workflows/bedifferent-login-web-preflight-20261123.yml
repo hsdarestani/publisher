@@ -1,0 +1,63 @@
+name: BE DIFFERENT login web host preflight 2026-11-23
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bedifferent-login-web-preflight-20261123.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - name: Read only BE DIFFERENT shared-host deployment state
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          SSH_HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST" && test -n "$SSH_PRIVATE_KEY"
+          port="${SSH_PORT:-22}"
+          umask 077
+          key="$RUNNER_TEMP/bd-login-inspect-key"
+          known="$RUNNER_TEMP/bd-login-inspect-known-hosts"
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > "$key"
+          chmod 600 "$key"
+          ssh-keyscan -T 12 -p "$port" -H "$HOST" > "$known" 2>/dev/null
+          test -s "$known"
+          if [ -n "$SSH_HOST_FINGERPRINT" ]; then
+            ssh-keygen -lf "$known" | grep -F -- "$SSH_HOST_FINGERPRINT" >/dev/null
+          fi
+          if [ -n "$SSH_KEY_PASSPHRASE" ]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            askpass="$RUNNER_TEMP/bd-login-inspect-askpass"
+            printf '%s\n' '#!/bin/sh' 'printf "%s" "$SSH_KEY_PASSPHRASE"' > "$askpass"
+            chmod 700 "$askpass"
+            DISPLAY=:0 SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$key" </dev/null
+          fi
+          ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known" -p "$port" root@"$HOST" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          echo "BD_LOGIN_WEB_PREFLIGHT_BEGIN"
+          for path in /opt/bedifferent /opt/aplus-publisher /opt/aplussolution /opt/a-esthetic-mobile; do
+            if test -d "$path"; then echo "PRESENT:$path"; else echo "ABSENT:$path"; fi
+          done
+          if test -d /opt/bedifferent/.git; then
+            echo "BD_REPO_HEAD=$(git -C /opt/bedifferent rev-parse HEAD)"
+            echo "BD_REPO_BRANCH=$(git -C /opt/bedifferent branch --show-current)"
+            echo "BD_REPO_DIRTY_COUNT=$(git -C /opt/bedifferent status --porcelain | wc -l)"
+            echo "BD_COMPOSE_PRESENT=$(test -f /opt/bedifferent/docker-compose.yml && echo yes || echo no)"
+          fi
+          echo "BD_CONTAINERS"
+          docker ps --filter "name=bedifferent" --format '{{.Names}} {{.Status}} {{.Image}}' || true
+          echo "BD_LOCAL_READY"
+          curl -fsS --connect-timeout 5 --max-time 8 http://127.0.0.1:3100/api/ready || true
+          echo
+          echo "BD_LOGIN_WEB_PREFLIGHT_END"
+          REMOTE
+          echo "BD_HTTPS_CODE=$(curl -sS -L --connect-timeout 8 --max-time 15 -o /dev/null -w '%{http_code}' https://bedifferent.smarbiz.sbs/login || true)"

@@ -1,0 +1,44 @@
+name: Diagnose Android V3 build 49 artifact provenance (read-only)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-build49-source-diagnose.yml]
+permissions: {contents: read}
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify source SHA, artifact and cloud agent metadata
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 3m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Release,Build,Job
+            release=Release.objects.get(pk=45)
+            b=Build.objects.get(pk=81,release=release)
+            print("EXPECTED_SOURCE",release.source_commit)
+            print("BUILD_SOURCE",b.commit_sha or "EMPTY")
+            print("BUILD_SOURCE_MATCH",b.commit_sha==release.source_commit)
+            print("BUILD_STATUS",b.status)
+            print("ARTIFACT_PRESENT",bool(b.artifact))
+            print("ARTIFACT_SIZE",b.artifact_size)
+            print("CHECKSUM_LENGTH",len(b.artifact_checksum))
+            print("RELEASE_BRANCH",release.source_branch)
+            print("RELEASE_VERSION",release.version_name,release.build_number)
+            print("BUILD_METADATA_KEYS",sorted((b.metadata or {}).keys()))
+            for key in ("source_commit","commit","head_sha","branch","versionCode","version_code","signed"):
+                if key in (b.metadata or {}):print("BUILD_META",key,str(b.metadata[key])[:128])
+            for j in Job.objects.filter(release=release).order_by("-created_at")[:3]:
+                print("JOB",j.pk,j.type,j.status,"RESULT_KEYS",sorted((j.result or {}).keys()))
+                for key in ("commit","source_commit","branch","git_sha","source_sha"):
+                    if key in (j.result or {}):print("JOB_META",key,str(j.result[key])[:128])
+            '

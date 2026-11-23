@@ -1,0 +1,42 @@
+name: A+ Esthetic Android V3 Publisher readiness (read-only)
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-android-publisher-readiness.yml]
+permissions: {contents: read}
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read existing publisher app and release state only
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 5m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Job,Build,Submission
+            app=MobileApp.objects.filter(package_name="de.aplusesthetic.app").first()
+            if not app: print("APP_NOT_FOUND");raise SystemExit(1)
+            print("PUBLISHER_APP",app.pk,app.slug,app.status,app.platform)
+            print("REPOSITORY",app.repository_url,"DEFAULT_BRANCH",app.default_branch)
+            print("GOOGLE_ACCOUNT_CONFIGURED",bool(app.google_account and app.google_account.configured))
+            print("UPLOAD_KEY_CONFIGURED",hasattr(app,"android_signing"))
+            print("ANDROID_BUILD_CONFIG_KEYS",sorted(app.build_config.keys()) if isinstance(app.build_config,dict) else [])
+            for rel in Release.objects.filter(app=app).order_by("-build_number")[:7]:
+                print("RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.android_track,rel.source_branch)
+                for build in rel.builds.filter(platform="android"):
+                    print("ANDROID_BUILD",build.pk,build.status,bool(build.artifact_file))
+                for submission in Submission.objects.filter(release=rel,platform="android"):
+                    print("GOOGLE_SUBMISSION",submission.pk,submission.state)
+            for job in Job.objects.filter(app=app).order_by("-created_at")[:7]:
+                print("JOB",job.pk,job.type,job.status,job.required_platform)
+            '
+            echo 'PUBLISHER_READ_ONLY_COMPLETE'

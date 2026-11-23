@@ -31,6 +31,10 @@ jobs:
             print("IOS_COMMAND",str((app.build_config or {}).get("ios_command",""))[:300])
             print("IOS_ARTIFACT",app.build_config.get("ios_artifact",""))
             print("REVIEW_ACCOUNT_CONFIGURED",bool(app.review_username and app.get_review_password()))
+            current=Release.objects.filter(app=app,build_number=50).first()
+            if current:
+                for job in Job.objects.filter(release=current).order_by("-created_at")[:8]:
+                    print("IOS50_JOB",job.pk,job.type,job.status,job.required_platform,"ERROR_LENGTH",len(job.error or ""),"ERROR_BRIEF",(job.error or "").replace(chr(10)," ")[:180])
             for rel in Release.objects.filter(app=app).order_by("-build_number")[:10]:
                 print("PUBLISHER_RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.source_branch)
                 for b in rel.builds.filter(platform="ios"):

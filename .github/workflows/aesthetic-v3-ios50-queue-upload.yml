@@ -1,0 +1,46 @@
+name: A+ Esthetic iOS 1.0.44 (50) — queue missing Apple IPA upload
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-ios50-queue-upload.yml]
+permissions: {contents: read}
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Queue verified signed IPA upload once
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            a=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            r=Release.objects.get(pk=46,app=a,build_number=50,version_name="1.0.44")
+            b=Build.objects.get(pk=82,release=r,platform="ios")
+            expected="058f57f06f7ca28f35f7d9ef29028f3985571bee"
+            assert r.source_commit==expected and r.source_branch=="feature/simplybook-v3-native-20261123"
+            j=Job.objects.filter(release=r,type="build_ios",status="succeeded").order_by("-created_at").first()
+            assert j is not None and (j.result or {}).get("commit")==expected
+            assert b.status=="succeeded" and bool(b.artifact) and b.artifact_size>1000000
+            assert len(b.artifact_checksum)==64 and b.artifact.name.endswith(".ipa")
+            assert a.apple_account and a.apple_account.configured
+            jobs=Job.objects.filter(release=r,type="upload_apple").order_by("-created_at")
+            if jobs.exists():
+                job=jobs.first()
+                if job.status=="failed":raise SystemExit("Existing upload_apple failed; manual diagnosis required")
+            else:
+                job=enqueue_job("upload_apple",app=a,release=r,build=b,agent=True,platform="macos")
+            print("IOS50_APPLE_UPLOAD_JOB_ID",job.pk)
+            print("IOS50_APPLE_UPLOAD_STATUS",job.status)
+            print("IOS50_SIGNED_IPA_SOURCE_VERIFIED=YES")
+            '

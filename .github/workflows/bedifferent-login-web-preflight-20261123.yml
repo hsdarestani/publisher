@@ -61,3 +61,4 @@ jobs:
           echo "BD_LOGIN_WEB_PREFLIGHT_END"
           REMOTE
           echo "BD_HTTPS_CODE=$(curl -sS -L --connect-timeout 8 --max-time 15 -o /dev/null -w '%{http_code}' https://bedifferent.smarbiz.sbs/login || true)"
+# Trigger read-only preflight after workflow registration

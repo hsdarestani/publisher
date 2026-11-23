@@ -20,7 +20,7 @@ jobs:
     environment: production
     timeout-minutes: 105
     env:
-      APLUS_SOURCE_COMMIT: 8d9dc615353e300833561d1010c56cfdd45f978b
+      APLUS_SOURCE_COMMIT: b06c84f57b6ed9e66d3e9ad905d358f887d8a929
     steps:
       - name: Verify exact A+ Solution source is on main
         env:
@@ -58,7 +58,7 @@ jobs:
 
             source = os.environ["APLUS_SOURCE_COMMIT"]
             slug = "a-plus-solution"
-            notes = "Dienstplan: Gesamtstunden berücksichtigen alle Schichten und Mitarbeiterplätze der Woche, unabhängig von Filtern oder Bestätigungsstatus."
+            notes = "Dienstplan: Tages- und Wochensummen aus PLAN-Zeiten ohne Pausenabzug; klare Veranstaltungsnummer; vereinfachte Admin-Ansicht."
             app = MobileApp.objects.get(slug=slug)
             assert app.bundle_id == "de.aplussolution.workforce" and app.package_name == app.bundle_id
             assert app.google_account and app.google_account.configured
@@ -120,7 +120,7 @@ jobs:
                     )
                     app.localizations.filter(locale="de-DE").update(release_notes=notes)
                     app.localizations.filter(locale__in=["en-GB", "en-US"]).update(
-                        release_notes="Duty planner: Weekly total includes every scheduled shift slot regardless of filtering or confirmation."
+                        release_notes="Duty planner: Day and week PLAN totals without pause deductions, event number field and streamlined admin shift cards."
                     )
                 assert release.auto_submit and release.android_track == "production"
                 for platform, runner in (("android", "linux"), ("ios", "macos")):

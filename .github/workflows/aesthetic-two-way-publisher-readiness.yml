@@ -1,0 +1,43 @@
+name: A+ Esthetic two-way store readiness (Publisher read-only)
+on:
+  push:
+    branches: [audit/aesthetic-two-way-release-readiness-20261123]
+    paths: [.github/workflows/aesthetic-two-way-publisher-readiness.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Inspect Publisher A+ Esthetic credentials, active builds and release numbers (read-only)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            print("PUBLISHER_APP_FOUND",bool(app))
+            print("APPLE_ACCOUNT_CONFIGURED",bool(app.apple_account and app.apple_account.configured))
+            print("GOOGLE_ACCOUNT_CONFIGURED",bool(app.google_account and app.google_account.configured))
+            print("ANDROID_SIGNING_CONFIGURED",bool(hasattr(app,"android_signing")))
+            print("BUNDLE_ID_MATCH",app.bundle_id=="de.aplusesthetic.app")
+            print("REPOSITORY_MATCH",app.repository_url.rstrip("/").endswith("hsdarestani/a_esthetic"))
+            print("MAX_BUILD_NUMBER",Release.objects.filter(app=app).order_by("-build_number").values_list("build_number",flat=True).first())
+            for rel in Release.objects.filter(app=app).order_by("-build_number")[:6]:
+                print("PUBLISHER_RELEASE",rel.pk,rel.version_name,rel.build_number,rel.status,rel.source_branch,rel.source_commit[:12] if rel.source_commit else "")
+                for b in rel.builds.all():
+                    print("SIGNED_BUILD",b.pk,b.platform,b.status,bool(b.artifact),bool(b.external_build_id))
+                for sub in Submission.objects.filter(release=rel):
+                    print("STORE_SUBMISSION",sub.platform,sub.state)
+            print("READ_ONLY_INSPECTION_COMPLETE")
+            '

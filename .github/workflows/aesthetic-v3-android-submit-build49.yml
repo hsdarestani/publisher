@@ -1,0 +1,77 @@
+name: A+ Esthetic Android V3 build 49 — guarded Google Play production submission
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/aesthetic-v3-android-submit-build49.yml]
+permissions: {contents: read}
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Await Publisher signed AAB and submit only exact tested source to Google
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 62m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            echo 'WAITING_FOR_SIGNED_BUILD_49'
+            for i in $(seq 1 150); do
+              status=$(docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Build;print('STATUS',Build.objects.get(pk=81).status)" | grep '^STATUS ' | tail -1 | cut -d' ' -f2)
+              if [[ "$status" == "succeeded" ]]; then echo 'ANDROID_SIGNED_BUILD_49=SUCCEEDED';break;fi
+              if [[ "$status" == "failed" || "$status" == "cancelled" ]]; then echo "ANDROID_BUILD_49=$status";exit 1;fi
+              if [[ "$status" != "queued" && "$status" != "claimed" && "$status" != "running" ]]; then echo 'UNEXPECTED_BUILD_STATE';exit 1;fi
+              if (( i % 8 == 1 )); then echo "ANDROID_BUILD_49=$status";fi
+              sleep 12
+            done
+            [[ "$status" == "succeeded" ]] || { echo 'SIGNED_BUILD_NOT_READY_WITHIN_GUARDED_WINDOW'; exit 1; }
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Build,Job,Release
+            from apps.publisher.tasks import enqueue_job
+            app=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            release=Release.objects.get(pk=45,app=app,build_number=49)
+            build=Build.objects.get(pk=81,release=release,platform="android")
+            assert release.source_branch=="feature/simplybook-v3-android-20261123"
+            assert release.source_commit=="c393c2ee698e593d0df8f0ce42d1201464062762"
+            assert release.android_track=="production" and float(release.android_rollout)==1
+            assert build.status=="succeeded" and bool(build.artifact) and build.artifact_size>1000000
+            assert len(build.artifact_checksum)==64, "AAB checksum not recorded"
+            assert build.commit_sha==release.source_commit, "Signed AAB source mismatch"
+            assert app.google_account and app.google_account.configured
+            assert hasattr(app,"android_signing"), "Store upload signing not configured"
+            existing=Job.objects.filter(release=release,type__in=["upload_google","submit_google"]).order_by("-created_at")
+            if existing.exists():
+                job=existing.first()
+                if job.status=="failed":raise SystemExit("Previous Google submission failed; inspect it before retry")
+            else:
+                job=enqueue_job("submit_google",app=app,release=release,build=build)
+            print("GOOGLE_SUBMIT_JOB",job.pk,job.status)
+            '
+            for i in $(seq 1 130); do
+              state=$(docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Job
+            job=Job.objects.filter(release_id=45,type__in=["upload_google","submit_google"]).order_by("-created_at").first()
+            print("STATE",job.status if job else "missing")
+            ' | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+              if [[ "$state" == "succeeded" ]]; then echo 'GOOGLE_PLAY_SUBMISSION_JOB=SUCCEEDED';break;fi
+              if [[ "$state" == "failed" ]]; then echo 'GOOGLE_PLAY_SUBMISSION_JOB=FAILED';exit 1;fi
+              if [[ "$state" != "queued" && "$state" != "running" ]]; then echo "GOOGLE_SUBMISSION_UNEXPECTED=$state";exit 1;fi
+              if (( i % 8 == 1 )); then echo "GOOGLE_PLAY_SUBMISSION_JOB=$state";fi
+              sleep 12
+            done
+            [[ "$state" == "succeeded" ]] || { echo 'GOOGLE_PLAY_SUBMISSION_TIMEOUT';exit 1; }
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import Release,Submission
+            r=Release.objects.get(pk=45)
+            s=Submission.objects.filter(release=r,platform="android").first()
+            print("ANDROID_RELEASE",r.version_name,r.build_number,r.status,r.android_track)
+            print("GOOGLE_PLAY_STATE",s.state if s else "missing")
+            assert s and s.state in ("in_review","ready_for_review","approved","live")
+            print("GOOGLE_PLAY_SUBMISSION_CONFIRMED=YES")
+            '

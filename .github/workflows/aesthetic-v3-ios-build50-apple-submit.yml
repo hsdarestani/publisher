@@ -16,7 +16,7 @@ jobs:
           username: root
           port: ${{ secrets.SSH_PORT }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          passphrase: PASS_VAR
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
           command_timeout: 75m
           script: |
             set -euo pipefail

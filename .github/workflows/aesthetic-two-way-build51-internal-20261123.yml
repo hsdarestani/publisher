@@ -1,0 +1,149 @@
+name: A+ Esthetic build 51 signed internal delivery
+on:
+  push:
+    branches: [release/aesthetic-two-way-build51-internal-20261123]
+    paths: [.github/workflows/aesthetic-two-way-build51-internal-20261123.yml]
+permissions: {contents: read}
+jobs:
+  queue:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - name: Verify exact tested source for both native platforms
+        run: |
+          python3 - <<'PY'
+          import json,urllib.request
+          base="https://api.github.com/repos/hsdarestani/a_esthetic"
+          def get(path):
+              req=urllib.request.Request(base+path,headers={"User-Agent":"aesthetic-internal-delivery"})
+              with urllib.request.urlopen(req,timeout=25) as r: return json.load(r)
+          expected="97902e66e0a8ed33ef3edf8356083580551aef9a"
+          assert get("/branches/feature%2Fsimplybook-bidirectional-safe-writeback-20261123")["commit"]["sha"]==expected
+          q=get("/actions/runs/45239630564")
+          assert q["head_sha"]==expected and q["conclusion"]=="success" and q["status"]=="completed"
+          print("EXACT_NATIVE_QA=PASS",expected)
+          PY
+      - name: Create exactly one signed internal Publisher release for iOS and Android
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell -c '
+            from decimal import Decimal
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            a=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            sha="97902e66e0a8ed33ef3edf8356083580551aef9a"
+            branch="feature/simplybook-bidirectional-safe-writeback-20261123"
+            assert a.bundle_id=="de.aplusesthetic.app"
+            assert a.repository_url.rstrip("/").endswith("hsdarestani/a_esthetic")
+            assert a.apple_account and a.apple_account.configured
+            assert a.google_account and a.google_account.configured and hasattr(a,"android_signing")
+            assert a.review_username and a.get_review_password()
+            assert "scripts/build-ios.sh" in a.build_config.get("ios_command","")
+            assert "scripts/build-android.sh" in a.build_config.get("android_command","")
+            assert not Release.objects.filter(app=a,build_number__gt=51).exists()
+            with transaction.atomic():
+                r=Release.objects.filter(app=a,build_number=51).first()
+                if r is None:
+                    r=Release.objects.create(app=a,version_name="1.0.45",build_number=51,
+                       source_branch=branch,source_commit=sha,status="building",
+                       android_track="internal",android_rollout=Decimal("1.0000"),
+                       ios_release_type="manual",auto_submit=False,
+                       release_notes="Interne Testversion: native Praxisverwaltung und abgesicherte SimplyBook-Terminänderungen.")
+                assert r.version_name=="1.0.45" and r.source_branch==branch and r.source_commit==sha
+                assert r.android_track=="internal" and not r.auto_submit
+                for platform,agent in (("android","linux"),("ios","macos")):
+                    b=Build.objects.filter(release=r,platform=platform).first()
+                    if b is None:b=Build.objects.create(release=r,platform=platform,status="queued")
+                    j=Job.objects.filter(release=r,type="build_"+platform).order_by("-created_at").first()
+                    if j is None:j=enqueue_job("build_"+platform,app=a,release=r,build=b,agent=True,platform=agent)
+                    assert j.status!="failed"
+                    print("SIGNED_BUILD_QUEUED",platform,"release",r.pk,"build",b.pk,"job",j.pk,j.status)
+            print("SIGNED_INTERNAL_RELEASE_51_QUEUED=YES")
+            '
+  deliver:
+    needs: queue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - name: Await signed artifacts, upload IPA to TestFlight and submit AAB to Google internal
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          command_timeout: 92m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            for platform in android ios; do
+              state=waiting
+              for i in $(seq 1 175); do
+                state=$(docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Build;b=Build.objects.get(release__app__package_name='de.aplusesthetic.app',release__build_number=51,platform='$platform');print('STATE',b.status)" | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+                if [[ "$state" == "succeeded" ]];then break;fi
+                if [[ "$state" == "failed" || "$state" == "cancelled" ]];then echo "SIGNED_$platform=$state";exit 1;fi
+                sleep 15
+              done
+              [[ "$state" == "succeeded" ]] || { echo "SIGNED_$platform=TIMEOUT";exit 1; }
+              echo "SIGNED_$platform=SUCCEEDED"
+            done
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            a=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            r=Release.objects.get(app=a,version_name="1.0.45",build_number=51)
+            assert r.source_commit=="97902e66e0a8ed33ef3edf8356083580551aef9a"
+            assert r.android_track=="internal" and r.ios_release_type=="manual" and not r.auto_submit
+            for platform,jobtype,agent in (("android","submit_google","linux"),("ios","upload_apple","macos")):
+                b=Build.objects.get(release=r,platform=platform)
+                assert b.status=="succeeded" and b.artifact and b.artifact_size>1000000 and len(b.artifact_checksum)==64
+                build_job=Job.objects.filter(release=r,type="build_"+platform,status="succeeded").order_by("-created_at").first()
+                assert build_job is not None
+                if platform=="android":
+                    assert (b.commit_sha or str((b.metadata or {}).get("commit","")))==r.source_commit
+                else:
+                    assert (build_job.result or {}).get("commit")==r.source_commit
+                j=Job.objects.filter(release=r,type=jobtype).order_by("-created_at").first()
+                if j is None:
+                    j=enqueue_job(jobtype,app=a,release=r,build=b,**({"agent":True,"platform":"macos"} if platform=="ios" else {}))
+                assert j.status!="failed", "Previous store job failed, requires diagnosis"
+                print("STORE_INTERNAL_DELIVERY",platform,jobtype,j.pk,j.status)
+            '
+            for platform in android ios; do
+              type=submit_google
+              [[ "$platform" != "ios" ]] || type=upload_apple
+              state=waiting
+              for i in $(seq 1 150);do
+                state=$(docker compose exec -T web python manage.py shell -c "from apps.publisher.models import Job;j=Job.objects.filter(release__app__package_name='de.aplusesthetic.app',release__build_number=51,type='$type').order_by('-created_at').first();print('STATE',j.status if j else 'missing')" | grep '^STATE ' | tail -1 | cut -d' ' -f2)
+                if [[ "$state" == "succeeded" ]];then break;fi
+                if [[ "$state" == "failed" || "$state" == "cancelled" ]];then echo "$type=$state";exit 1;fi
+                sleep 15
+              done
+              [[ "$state" == "succeeded" ]] || { echo "$type=TIMEOUT";exit 1; }
+              echo "$type=SUCCEEDED"
+            done
+            docker compose exec -T web python manage.py shell -c '
+            from apps.publisher.models import MobileApp,Release,Build,Submission
+            a=MobileApp.objects.get(package_name="de.aplusesthetic.app")
+            r=Release.objects.get(app=a,build_number=51)
+            assert r.android_track=="internal"
+            s=Submission.objects.filter(release=r,platform="android").first()
+            assert s and s.state in ("in_review","ready_for_review","approved","live")
+            b=Build.objects.get(release=r,platform="ios")
+            assert b.external_build_id
+            print("GOOGLE_INTERNAL_SUBMISSION_STATE",s.state)
+            print("APPLE_TESTFLIGHT_BUILD_ID",b.external_build_id)
+            print("INTERNAL_STORE_DELIVERY_VERIFIED=YES")
+            print("NO_PRODUCTION_ROLLOUT_OR_APP_REVIEW_SUBMITTED")
+            '

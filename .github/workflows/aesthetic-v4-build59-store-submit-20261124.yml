@@ -1,0 +1,122 @@
+name: A+ Esthetic 1.0.53 (59) - signed builds and store submission
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-v4-build59-store-submit-20261124.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: a-esthetic-v4-build59-store-submit-20261124
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 12
+    steps:
+      - name: Verify exact B59 source, production baseline and QA
+        env:
+          SOURCE_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          base='https://api.github.com/repos/hsdarestani/a_esthetic'
+          headers={'Accept':'application/vnd.github+json','User-Agent':'aesthetic-integrated-release'}
+          if os.getenv('SOURCE_TOKEN'): headers['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
+          def get(path):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=25) as r:return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in (401,403,404) and 'Authorization' in headers:
+                      h={k:v for k,v in headers.items() if k!='Authorization'}
+                      with urllib.request.urlopen(urllib.request.Request(base+path,headers=h),timeout=25) as r:return json.load(r)
+                  raise
+          assert get('/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='3357566b7635639cfb932f6512ac108142a2b941'
+          for rid in (45435094339,45435630831,45438606874,45460814442):
+              run=get('/actions/runs/'+str(rid))
+              assert run['status']=='completed' and run['conclusion']=='success',(rid,run['status'],run['conclusion'])
+              if rid==45460814442: assert run['head_sha']=='3357566b7635639cfb932f6512ac108142a2b941'
+          print('EXACT_SOURCE_AND_PRODUCTION_QA_OK')
+          PY
+      - name: Queue signed production-source builds via established Publisher SSH key
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db import transaction
+            from django.db.models import Max
+            from apps.publisher.models import MobileApp, Release, Build, Job
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            source='3357566b7635639cfb932f6512ac108142a2b941'
+            branch='feature/admin-v4-native-20261124'
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert app.apple_account and app.apple_account.configured
+            assert app.google_account and app.google_account.configured
+            assert hasattr(app,'android_signing')
+            assert app.repository_url.rstrip('/').endswith('hsdarestani/a_esthetic')
+            assert app.review_username and app.get_review_password()
+            assert 'scripts/build-ios.sh' in app.build_config.get('ios_command','')
+            assert 'scripts/build-android.sh' in app.build_config.get('android_command','')
+            assert app.build_config.get('ios_artifact')=='artifacts/a-esthetic.ipa'
+            assert app.build_config.get('android_artifact')=='artifacts/a-esthetic-release.aab'
+            def number(x):return int(x) if str(x).isdigit() else 0
+            apple=AppleStoreClient(app.apple_account)
+            aid=apple.find_app(app.bundle_id)['id']
+            av=apple.list_versions(aid)
+            apple_max=max((number(x['attributes'].get('version')) for x in apple.list_builds(aid)),default=0)
+            google=GooglePlayClient(app.google_account)
+            edit=google._open_edit(app.package_name)
+            try:
+                prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                bundles=google._edit_request(edit,'GET',prefix+'/bundles').get('bundles',[])
+            finally:
+                google._safe_delete_edit(edit)
+            google_max=max([number(c) for t in tracks for r in t.get('releases',[]) for c in r.get('versionCodes',[])]+[number(b.get('versionCode')) for b in bundles],default=0)
+            notes='Überarbeitete native Praxisverwaltung, verbesserte Kalender- und Buchungsansichten, Patientenakten sowie optimierte Darstellung und Kontoverknüpfung.'
+            with transaction.atomic():
+                app=MobileApp.objects.select_for_update().get(pk=app.pk)
+                release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+                if release is None:
+                    patches=[int(v.split('.')[-1]) for v in Release.objects.filter(app=app).values_list('version_name',flat=True) if v and v.startswith('1.0.') and v.split('.')[-1].isdigit()]
+                    patches += [int(v['attributes']['versionString'].split('.')[-1]) for v in av if v['attributes'].get('versionString','').startswith('1.0.') and v['attributes']['versionString'].split('.')[-1].isdigit()]
+                    dbmax=Release.objects.filter(app=app).aggregate(n=Max('build_number'))['n'] or 0
+                    assert max(dbmax,apple_max,google_max)<59,'Build 59 is not available; do not reuse or silently change the requested build'
+                    assert max(patches or [0])<53,'Version 1.0.53 is not newer than the existing release'
+                    release=Release.objects.create(app=app,source_branch=branch,source_commit=source,version_name='1.0.53',build_number=59,android_track='production',android_rollout=1,ios_release_type='manual',auto_submit=True,status='building',release_notes=notes)
+                assert release.source_branch==branch and release.source_commit==source
+                assert release.version_name=='1.0.53' and release.build_number==59
+                assert not Release.objects.filter(app=app,build_number__gt=59).exists()
+                assert release.auto_submit is True and release.android_track=='production' and float(release.android_rollout)==1 and release.ios_release_type=='manual'
+                for platform,runner in [('android','linux'),('ios','macos')]:
+                    build,_=Build.objects.get_or_create(release=release,platform=platform,defaults={'status':'queued','commit_sha':source})
+                    assert not build.commit_sha or build.commit_sha==source
+                    assert not Job.objects.filter(build=build,type=f'build_{platform}',status__in=['failed','cancelled']).exists(),'Existing failed job: diagnose before retry'
+                    if build.status not in ('succeeded','running') and not Job.objects.filter(build=build,type=f'build_{platform}',status__in=['queued','running','succeeded']).exists():
+                        build.status='queued'; build.commit_sha=source; build.save(update_fields=['status','commit_sha','updated_at'])
+                        enqueue_job(f'build_{platform}',app=app,release=release,build=build,agent=True,platform=runner)
+                    print('SIGNED_BUILD',platform,build.pk,build.status)
+                print('RELEASE_QUEUED',release.pk,release.version_name,release.build_number,release.source_commit,'AUTO_SUBMIT',release.auto_submit)
+            PY
+      - name: Wake existing Android and iOS build agents
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id,ref:'main'});
+            }

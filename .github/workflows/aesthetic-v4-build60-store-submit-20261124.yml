@@ -34,18 +34,18 @@ jobs:
                       h={k:v for k,v in headers.items() if k!='Authorization'}
                       with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=h),timeout=25) as r:return json.load(r)
                   raise
-          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='378083062c165a9f0fbce113da127684c2b45577'
-          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45465134232)):
+          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='afd08abef39216bf4bc3f68e0149db2d7adfc2e5'
+          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45468612721)):
               run=get(repo,'/actions/runs/'+str(rid))
-              if rid==45465134232:
+              if rid==45468612721:
                   for attempt in range(100):
-                      assert run['head_sha']=='378083062c165a9f0fbce113da127684c2b45577'
+                      assert run['head_sha']=='afd08abef39216bf4bc3f68e0149db2d7adfc2e5'
                       if run['status']=='completed':break
                       if attempt%10==0: print('B60_QA_STATUS',run['status'],flush=True)
                       time.sleep(20)
                       run=get(repo,'/actions/runs/'+str(rid))
               assert run['status']=='completed' and run['conclusion']=='success',(rid,run['status'],run['conclusion'])
-              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45465134232:'378083062c165a9f0fbce113da127684c2b45577'}
+              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45468612721:'afd08abef39216bf4bc3f68e0149db2d7adfc2e5'}
               assert run['head_sha']==expected[rid],(repo,rid,'source mismatch')
               print('VERIFIED',repo,rid,run['head_sha'],flush=True)
           print('EXACT_SOURCE_AND_PRODUCTION_QA_OK')
@@ -70,7 +70,7 @@ jobs:
             from apps.publisher.tasks import enqueue_job
             from apps.integrations.apple_store import AppleStoreClient
             from apps.integrations.google_play import GooglePlayClient
-            source='378083062c165a9f0fbce113da127684c2b45577'
+            source='afd08abef39216bf4bc3f68e0149db2d7adfc2e5'
             branch='feature/admin-v4-native-20261124'
             app=MobileApp.objects.get(slug='a-esthetic')
             assert app.bundle_id==app.package_name=='de.aplusesthetic.app'

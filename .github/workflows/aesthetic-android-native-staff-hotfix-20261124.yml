@@ -1,0 +1,172 @@
+name: A+ Esthetic Android NativeStaff hotfix — signed build and Google Play submission
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-android-native-staff-hotfix-20261124.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: a-esthetic-android-native-staff-hotfix-20261124
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 40
+    steps:
+      - name: Wait for exact Android registration regression and release build QA
+        env:
+          SOURCE_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          base='https://api.github.com/repos/hsdarestani/a_esthetic'
+          h={'Accept':'application/vnd.github+json','User-Agent':'aesthetic-android-native-staff-hotfix'}
+          if os.getenv('SOURCE_TOKEN'): h['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
+          def get(path):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+path,headers=h),timeout=25) as r:return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in (401,403,404) and 'Authorization' in h:
+                      public={k:v for k,v in h.items() if k!='Authorization'}
+                      with urllib.request.urlopen(urllib.request.Request(base+path,headers=public),timeout=25) as r:return json.load(r)
+                  raise
+          source='f1a64beb8cf55adc983d8c5062b39d46a3ccf28a'
+          assert get('/branches/fix%2Fandroid-native-staff-registration-20261124')['commit']['sha']==source
+          for attempt in range(105):
+              r=get('/actions/runs/45407534392')
+              assert r['head_sha']==source,'QA source mismatch'
+              if r['status']=='completed':
+                  assert r['conclusion']=='success',r['conclusion']
+                  print('ANDROID_NATIVE_STAFF_RELEASE_QA_PASSED',source)
+                  break
+              if attempt%10==0:print('QA_STATUS',r['status'],flush=True)
+              time.sleep(20)
+          else:raise SystemExit('QA not confirmed within gate window')
+          PY
+      - name: Queue only the fixed Android source via established Publisher SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db import transaction
+            from django.db.models import Max
+            from apps.publisher.models import MobileApp,Release,Build,Job
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.google_play import GooglePlayClient
+            source='f1a64beb8cf55adc983d8c5062b39d46a3ccf28a'
+            branch='fix/android-native-staff-registration-20261124'
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.package_name==app.bundle_id=='de.aplusesthetic.app'
+            assert app.google_account and app.google_account.configured and hasattr(app,'android_signing')
+            assert app.repository_url.rstrip('/').endswith('hsdarestani/a_esthetic')
+            assert 'scripts/build-android.sh' in app.build_config.get('android_command','')
+            assert app.build_config.get('android_artifact')=='artifacts/a-esthetic-release.aab'
+            assert app.review_username and app.get_review_password()
+            assert Release.objects.filter(app=app,build_number=52,source_commit='daf287f613b62c87d385fe7356c8a040ebbdf204').exists()
+            google=GooglePlayClient(app.google_account)
+            edit=google._open_edit(app.package_name)
+            try:
+                prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                bundles=google._edit_request(edit,'GET',prefix+'/bundles').get('bundles',[])
+            finally:
+                google._safe_delete_edit(edit)
+            numbers=[int(c) for t in tracks for r in t.get('releases',[]) for c in r.get('versionCodes',[]) if str(c).isdigit()]+[int(b['versionCode']) for b in bundles if str(b.get('versionCode','')).isdigit()]
+            with transaction.atomic():
+                app=MobileApp.objects.select_for_update().get(pk=app.pk)
+                release=Release.objects.filter(app=app,source_commit=source).order_by('-pk').first()
+                if release is None:
+                    assert max(numbers or [0])<=52,'Unexpected newer Google version, stop before replacing'
+                    assert not Release.objects.filter(app=app,build_number__gte=53).exists(),'Unexpected newer Publisher release'
+                    release=Release.objects.create(app=app,source_branch=branch,source_commit=source,version_name='1.0.47',build_number=53,android_track='production',android_rollout=1,ios_release_type='manual',auto_submit=False,status='building',release_notes='Android: Fehler beim Öffnen der nativen Praxisverwaltung behoben. Die Registrierung der nativen Schnittstelle wurde korrigiert.')
+                assert release.source_commit==source and release.source_branch==branch and release.version_name=='1.0.47' and release.build_number==53
+                assert not release.builds.filter(platform='ios').exists(),'Android-only release'
+                assert not Release.objects.filter(app=app,build_number__gt=53).exists()
+                build,_=Build.objects.get_or_create(release=release,platform='android',defaults={'status':'queued','commit_sha':source})
+                assert not build.commit_sha or build.commit_sha==source
+                job=Job.objects.filter(release=release,build=build,type='build_android').order_by('-pk').first()
+                if job:
+                    assert job.status not in ('failed','cancelled'),'Failed build must be diagnosed first'
+                elif build.status!='succeeded':
+                    job=enqueue_job('build_android',app=app,release=release,build=build,agent=True,platform='linux')
+                print('ANDROID_HOTFIX_RELEASE',release.pk,release.version_name,release.build_number,source)
+                print('ANDROID_HOTFIX_BUILD',build.pk,build.status,'JOB',job.pk if job else None)
+                print('IOS_UNCHANGED')
+            PY
+      - name: Wake existing Android signing agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id:'cloud-linux.yml',ref:'main'});
+  submit-and-verify:
+    needs: queue
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 85
+    steps:
+      - name: Wait for exact signed AAB and submit Google production update
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 78m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            for i in $(seq 1 170); do
+              state=$(docker compose exec -T web python manage.py shell <<'PY'
+            from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            a=MobileApp.objects.get(slug='a-esthetic')
+            source='f1a64beb8cf55adc983d8c5062b39d46a3ccf28a'
+            r=Release.objects.get(app=a,source_commit=source,version_name='1.0.47',build_number=53)
+            assert r.source_branch=='fix/android-native-staff-registration-20261124' and r.android_track=='production'
+            assert not Release.objects.filter(app=a,build_number__gt=53).exists()
+            assert not r.builds.filter(platform='ios').exists()
+            b=Build.objects.get(release=r,platform='android')
+            build_job=Job.objects.filter(build=b,type='build_android').order_by('-pk').first()
+            s=Submission.objects.filter(release=r,platform='android').first()
+            j=Job.objects.filter(release=r,build=b,type__in=['submit_google','upload_google']).order_by('-pk').first()
+            if b.status=='succeeded' and not j and not (s and s.state in ('in_review','approved','live','ready_for_review')):
+                assert b.artifact and b.artifact_size>1000000 and b.artifact.name.endswith('.aab')
+                assert len(b.artifact_checksum)==64
+                assert build_job and build_job.status=='succeeded' and (build_job.result or {}).get('commit')==source
+                assert (b.metadata or {}).get('android_certificate_sha256')
+                assert (b.commit_sha or (b.metadata or {}).get('commit') or (build_job.result or {}).get('commit'))==source
+                print('SIGNED_ANDROID_HOTFIX_VERIFIED',b.pk)
+                j=enqueue_job('submit_google',app=a,release=r,build=b)
+                print('GOOGLE_SUBMIT_JOB',j.pk,j.status)
+            print('STATE','Build='+b.status,'Submit='+str(j.status if j else 'pending'),'Review='+str(s.state if s else 'pending'))
+            if b.status in ('failed','cancelled') or (build_job and build_job.status in ('failed','cancelled')) or (j and j.status in ('failed','cancelled')):
+                print('FAILED_JOB',str((j.error if j and j.status=='failed' else build_job.error if build_job else '') or '')[:700])
+            if s and s.state in ('in_review','approved','live'):
+                print('GOOGLE_PLAY_SUBMISSION_CONFIRMED',r.version_name,r.build_number,s.state)
+            elif s and s.state=='ready_for_review':
+                print('GOOGLE_MANUAL_REVIEW_REQUIRED')
+            PY
+              )
+              echo "$state"
+              if grep -q '^GOOGLE_PLAY_SUBMISSION_CONFIRMED ' <<< "$state"; then exit 0; fi
+              if grep -q '^FAILED_JOB' <<< "$state"; then exit 1; fi
+              if grep -q '^GOOGLE_MANUAL_REVIEW_REQUIRED$' <<< "$state"; then exit 2; fi
+              sleep 25
+            done
+            echo 'Google Play review was not confirmed in the workflow window'
+            exit 1

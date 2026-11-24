@@ -1,0 +1,123 @@
+name: A+ Esthetic 1.0.46 (52) — submit exact signed builds to both stores
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-integrated-build52-submit-20261124.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: a-esthetic-build52-store-submit
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Verify release identity and queue Apple upload and Google review
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from apps.publisher.models import MobileApp, Release, Build, Job, Submission
+            from apps.publisher.tasks import enqueue_job
+            a=MobileApp.objects.get(slug='a-esthetic')
+            r=Release.objects.get(pk=51,app=a,version_name='1.0.46',build_number=52)
+            source='daf287f613b62c87d385fe7356c8a040ebbdf204'
+            assert a.package_name==a.bundle_id=='de.aplusesthetic.app'
+            assert r.source_commit==source and r.source_branch=='release/integrated-20261124'
+            assert r.android_track=='production' and float(r.android_rollout)==1
+            assert a.google_account and a.google_account.configured and hasattr(a,'android_signing')
+            assert a.apple_account and a.apple_account.configured
+            assert not Release.objects.filter(app=a,build_number__gt=52).exists()
+            for platform,pk,extension in [('android',91,'.aab'),('ios',92,'.ipa')]:
+                b=Build.objects.get(pk=pk,release=r,platform=platform)
+                assert b.status=='succeeded' and b.artifact and b.artifact_size>1000000
+                assert b.artifact.name.endswith(extension) and len(b.artifact_checksum)==64
+                j=Job.objects.filter(build=b,type='build_'+platform,status='succeeded').order_by('-pk').first()
+                assert j and (j.result or {}).get('commit')==source
+                if platform=='android':
+                    assert (b.metadata or {}).get('android_certificate_sha256')
+                s=Submission.objects.filter(release=r,platform=platform,state__in=['in_review','approved','live']).first()
+                if s:
+                    print('ALREADY_SUBMITTED',platform,s.state)
+                    continue
+                kinds=['submit_google','upload_google'] if platform=='android' else ['upload_apple']
+                j=Job.objects.filter(release=r,build=b,type__in=kinds).order_by('-pk').first()
+                if j:
+                    assert j.status not in ['failed','cancelled'], 'Existing failed upload: inspect before retry'
+                elif platform=='android':
+                    j=enqueue_job('submit_google',app=a,release=r,build=b)
+                else:
+                    j=enqueue_job('upload_apple',app=a,release=r,build=b,agent=True,platform='macos')
+                print('STORE_JOB',platform,j.pk,j.type,j.status)
+            print('EXACT_SIGNED_BUILD52_VERIFIED')
+            PY
+      - name: Wake Apple upload agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id:'cloud-macos.yml',ref:'main'});
+  submit-and-verify:
+    needs: queue
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    environment: production
+    steps:
+      - name: Submit processed iOS binary and read back both review states
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 75m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            for i in $(seq 1 150); do
+              state=$(docker compose exec -T web python manage.py shell <<'PY'
+            from apps.publisher.models import Release,Build,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            r=Release.objects.get(pk=51,version_name='1.0.46',build_number=52)
+            assert r.source_commit=='daf287f613b62c87d385fe7356c8a040ebbdf204'
+            b=Build.objects.get(pk=92,release=r,platform='ios')
+            upload=Job.objects.filter(build=b,type='upload_apple').order_by('-pk').first()
+            apple=Submission.objects.filter(release=r,platform='ios').first()
+            google=Submission.objects.filter(release=r,platform='android').first()
+            submit=Job.objects.filter(release=r,type='submit_apple').order_by('-pk').first()
+            gj=Job.objects.filter(release=r,type__in=['submit_google','upload_google']).order_by('-pk').first()
+            done={'in_review','approved','live'}
+            if not (apple and apple.state in done) and upload and upload.status=='succeeded' and b.external_build_id and not submit:
+                submit=enqueue_job('submit_apple',app=r.app,release=r,build=b)
+            print('REVIEW_STATE', 'Apple='+str(apple.state if apple else 'pending'), 'Google='+str(google.state if google else 'pending'), 'AppleUpload='+str(upload.status if upload else 'none'), 'AppleSubmit='+str(submit.status if submit else 'none'), 'GoogleSubmit='+str(gj.status if gj else 'none'))
+            for j in [upload,submit,gj]:
+                if j and j.status in ['failed','cancelled']:
+                    print('FAILED_JOB',j.pk,j.type,str(j.error or '')[:600])
+            if apple and google and apple.state in done and google.state in done:
+                print('BOTH_STORES_CONFIRMED')
+            if google and google.state=='ready_for_review':
+                print('GOOGLE_MANUAL_REVIEW_REQUIRED')
+            PY
+              )
+              echo "$state"
+              if grep -q '^BOTH_STORES_CONFIRMED$' <<< "$state"; then exit 0; fi
+              if grep -q '^FAILED_JOB ' <<< "$state"; then exit 1; fi
+              if grep -q '^GOOGLE_MANUAL_REVIEW_REQUIRED$' <<< "$state" && grep -q 'Apple=in_review' <<< "$state"; then exit 2; fi
+              sleep 25
+            done
+            echo 'Review status not confirmed for both stores within workflow window'
+            exit 1

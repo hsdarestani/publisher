@@ -1,0 +1,102 @@
+name: Replace older Apple review with verified A+ Esthetic B61
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-b61-replace-previous-apple-review.yml']
+  workflow_dispatch:
+permissions: {contents: read}
+concurrency:
+  group: aesthetic-b61-final-review
+  cancel-in-progress: false
+jobs:
+  replace:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import time
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id=='de.aplusesthetic.app'
+            r=Release.objects.get(pk=55,app=app,version_name='1.0.55',build_number=61,source_commit='1c8c03a28bdf23b94c25a8c94f8ade5692f36726')
+            assert not Release.objects.filter(app=app,build_number__gt=61).exists()
+            b=r.builds.get(platform='ios',status='succeeded')
+            assert b.external_build_id and b.artifact
+            client=AppleStoreClient(app.apple_account)
+            aid=client.find_app(app.bundle_id)['id']
+            valid=[x for x in client.list_builds(aid,61) if x['id']==b.external_build_id and x['attributes'].get('processingState')=='VALID']
+            assert len(valid)==1,'Exact replacement binary is not valid'
+            def version_state(v):
+                return v['attributes'].get('appStoreState') or v['attributes'].get('appVersionState')
+            def versions():
+                vs=client.list_versions(aid)
+                print('APPLE_VERSIONS',[(v['attributes'].get('versionString'),version_state(v)) for v in vs],flush=True)
+                return vs
+            def number(v):return tuple(int(x) for x in v.split('.'))
+            review={'WAITING_FOR_REVIEW','IN_REVIEW'}
+            done=review|{'PENDING_DEVELOPER_RELEASE','READY_FOR_DISTRIBUTION','READY_FOR_SALE','PENDING_APPLE_RELEASE'}
+            editable={'DEVELOPER_REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','METADATA_REJECTED','REJECTED'}
+            vs=versions()
+            exact=[v for v in vs if v['attributes'].get('versionString')==r.version_name]
+            if exact and version_state(exact[0]) in done:
+                print('TARGET_ALREADY_SUBMITTED',version_state(exact[0]),flush=True)
+            else:
+                candidates=[v for v in vs if version_state(v) in review]
+                assert len(candidates)<=1,'Multiple active versions: stop without cancellation'
+                if candidates:
+                    old=candidates[0]
+                    old_name=old['attributes']['versionString']
+                    assert number(old_name)<number(r.version_name),'Refuse to withdraw equal/newer release'
+                    matches=[]
+                    for state in review:
+                        for sub in client.list_review_submissions(aid,state):
+                            item,items=client._review_submission_matches(sub,old['id'])
+                            if item:
+                                assert len(items)==1,'Old review contains unrelated items'
+                                matches.append(sub)
+                    assert len(matches)==1,'Cannot uniquely identify old review submission'
+                    print('WITHDRAWING_OLD',old_name,version_state(old),flush=True)
+                    client.cancel_review_submission(matches[0]['id'])
+                    for _ in range(60):
+                        current=next((v for v in client.list_versions(aid) if v['id']==old['id']),None)
+                        if current and version_state(current) in editable:
+                            print('OLD_WITHDRAWN',old_name,version_state(current),flush=True)
+                            break
+                        time.sleep(5)
+                    else:
+                        raise RuntimeError('Apple has not released old review slot')
+                    Submission.objects.filter(app=app,release__version_name=old_name,platform='ios',state='in_review').update(state='withdrawn')
+                # Only the confirmed older review may be withdrawn; no live version is changed.
+                with transaction.atomic():
+                    Release.objects.select_for_update().get(pk=r.pk)
+                    assert not r.jobs.filter(type='submit_apple',status='succeeded').exists(),'Unexpected prior successful submission: inspect'
+                    j=r.jobs.filter(type='submit_apple',status__in=['queued','running']).first()
+                    if not j:j=enqueue_job('submit_apple',app=app,release=r,build=b)
+                    print('REVIEW_JOB',j.pk,j.status,flush=True)
+                for _ in range(60):
+                    j.refresh_from_db()
+                    if j.status in {'succeeded','failed','cancelled'}:break
+                    time.sleep(5)
+                print('REVIEW_JOB_RESULT',j.pk,j.status,(' '.join(j.error.split())[:700] if j.status=='failed' else ''),flush=True)
+            final=[v for v in versions() if v['attributes'].get('versionString')==r.version_name]
+            assert len(final)==1 and version_state(final[0]) in done,'Replacement not confirmed by Apple'
+            attached=client.request('GET',f"/appStoreVersions/{final[0]['id']}/build").get('data')
+            assert attached and attached['id']==b.external_build_id,'Wrong build attached'
+            print('APPLE_B61_REVIEW_CONFIRMED',version_state(final[0]),flush=True)
+            PY

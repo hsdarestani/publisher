@@ -70,9 +70,17 @@ jobs:
                             if item:
                                 assert len(items)==1,'Old review contains unrelated items'
                                 matches.append(sub)
-                    assert len(matches)==1,'Cannot uniquely identify old review submission'
+                    assert len(matches)<=1,'Ambiguous modern review submission'
                     print('WITHDRAWING_OLD',old_name,version_state(old),flush=True)
-                    client.cancel_review_submission(matches[0]['id'])
+                    if matches:
+                        client.cancel_review_submission(matches[0]['id'])
+                    else:
+                        # Apple's documented legacy relationship identifies only this exact version.
+                        assert old_name=='1.0.46','Unexpected old version: stop'
+                        legacy=client.request('GET',f"/appStoreVersions/{old['id']}/relationships/appStoreVersionSubmission").get('data')
+                        assert isinstance(legacy,dict) and legacy.get('type')=='appStoreVersionSubmissions' and legacy.get('id'),'No exact legacy submission relationship'
+                        client.request('DELETE',f"/appStoreVersionSubmissions/{legacy['id']}")
+                        print('LEGACY_WITHDRAWAL_ACCEPTED',old_name,flush=True)
                     for _ in range(60):
                         current=next((v for v in client.list_versions(aid) if v['id']==old['id']),None)
                         if current and version_state(current) in editable:

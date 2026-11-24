@@ -23,22 +23,24 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os, urllib.request, urllib.error
-          base='https://api.github.com/repos/hsdarestani/a_esthetic'
+          base='https://api.github.com/repos/hsdarestani/'
           headers={'Accept':'application/vnd.github+json','User-Agent':'aesthetic-integrated-release'}
           if os.getenv('SOURCE_TOKEN'): headers['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
-          def get(path):
+          def get(repo,path):
               try:
-                  with urllib.request.urlopen(urllib.request.Request(base+path,headers=headers),timeout=25) as r:return json.load(r)
+                  with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=headers),timeout=25) as r:return json.load(r)
               except urllib.error.HTTPError as e:
                   if e.code in (401,403,404) and 'Authorization' in headers:
                       h={k:v for k,v in headers.items() if k!='Authorization'}
-                      with urllib.request.urlopen(urllib.request.Request(base+path,headers=h),timeout=25) as r:return json.load(r)
+                      with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=h),timeout=25) as r:return json.load(r)
                   raise
-          assert get('/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='3357566b7635639cfb932f6512ac108142a2b941'
-          for rid in (45435094339,45435630831,45438606874,45460814442):
-              run=get('/actions/runs/'+str(rid))
+          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='3357566b7635639cfb932f6512ac108142a2b941'
+          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45460814442)):
+              run=get(repo,'/actions/runs/'+str(rid))
               assert run['status']=='completed' and run['conclusion']=='success',(rid,run['status'],run['conclusion'])
-              if rid==45460814442: assert run['head_sha']=='3357566b7635639cfb932f6512ac108142a2b941'
+              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45460814442:'3357566b7635639cfb932f6512ac108142a2b941'}
+              assert run['head_sha']==expected[rid],(repo,rid,'source mismatch')
+              print('VERIFIED',repo,rid,run['head_sha'],flush=True)
           print('EXACT_SOURCE_AND_PRODUCTION_QA_OK')
           PY
       - name: Queue signed production-source builds via established Publisher SSH key

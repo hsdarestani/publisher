@@ -1,0 +1,120 @@
+name: A+ Esthetic B61 — finish and verify both store submissions
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-b61-final-store-confirmation.yml']
+  workflow_dispatch:
+permissions: {contents: read}
+concurrency:
+  group: aesthetic-b61-final-review
+  cancel-in-progress: false
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+    steps:
+      - uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Build,Job,Submission
+            from apps.publisher.tasks import enqueue_job,run_job,_publish_existing_google_version
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            import time
+            from django.utils import timezone
+            app=MobileApp.objects.get(slug='a-esthetic')
+            r=Release.objects.get(pk=55,app=app,version_name='1.0.55',build_number=61,source_commit='1c8c03a28bdf23b94c25a8c94f8ade5692f36726')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert r.android_track=='production' and r.auto_submit
+            assert not Release.objects.filter(app=app,build_number__gt=61).exists()
+            def report():
+                for b in r.builds.all():
+                    print('BUILD',b.platform,b.status,bool(b.artifact),bool(b.external_build_id),flush=True)
+                for j in r.jobs.order_by('pk'):
+                    print('JOB',j.pk,j.type,j.status,(' '.join(j.error.split())[:450] if j.status=='failed' else ''),flush=True)
+                for s in r.submissions.all():
+                    print('SUBMISSION',s.platform,s.state,bool(s.submitted_at),flush=True)
+            report()
+            apple=AppleStoreClient(app.apple_account)
+            aid=apple.find_app(app.bundle_id)['id']
+            google=GooglePlayClient(app.google_account)
+            def google_state():
+                edit=google._open_edit(app.package_name)
+                try:
+                    prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                    tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                    bundles=google._edit_request(edit,'GET',prefix+'/bundles').get('bundles',[])
+                    live=[x.get('status') for t in tracks if t.get('track')=='production' for x in t.get('releases',[]) if '61' in list(map(str,x.get('versionCodes',[])))]
+                    exists=any(str(x.get('versionCode'))=='61' for x in bundles)
+                    print('GOOGLE_PRODUCTION_B61',live,'BUNDLE_EXISTS',exists,flush=True)
+                    return live,exists
+                finally:
+                    google._safe_delete_edit(edit)
+            def apple_state():
+                versions=apple.list_versions(aid)
+                exact=[v for v in versions if v.get('attributes',{}).get('versionString')=='1.0.55']
+                states=[v['attributes'].get('appStoreState') or v['attributes'].get('appVersionState') for v in exact]
+                print('APPLE_VERSION_1.0.55',states,flush=True)
+                return states
+            # Let existing tasks finish; never submit twice or interrupt active jobs.
+            for _ in range(30):
+                if not r.jobs.filter(type__in=['upload_google','submit_google','upload_apple','submit_apple'],status__in=['queued','running']).exists(): break
+                time.sleep(10)
+            def schedule_one(kind,build):
+                with transaction.atomic():
+                    Release.objects.select_for_update().get(pk=r.pk)
+                    if r.jobs.filter(type__in=[kind,'upload_google'] if kind=='submit_google' else [kind],status__in=['queued','running']).exists():
+                        print('EXISTING_ACTIVE',kind,flush=True);return
+                    j=enqueue_job(kind,app=app,release=r,build=build)
+                    print('FINAL_JOB_QUEUED',kind,j.pk,flush=True)
+            android=r.builds.get(platform='android',status='succeeded')
+            ios=r.builds.get(platform='ios',status='succeeded')
+            assert android.artifact and ios.artifact
+            states=apple_state()
+            reviewed={'WAITING_FOR_REVIEW','IN_REVIEW','PENDING_DEVELOPER_RELEASE','READY_FOR_DISTRIBUTION','READY_FOR_SALE','PENDING_APPLE_RELEASE'}
+            if not set(states)&reviewed:
+                valid=[x for x in apple.list_builds(aid,61) if x.get('attributes',{}).get('processingState')=='VALID']
+                assert len(valid)==1,'Apple build 61 not uniquely valid'
+                if not ios.external_build_id:
+                    ios.external_build_id=valid[0]['id'];ios.save(update_fields=['external_build_id','updated_at'])
+                assert ios.external_build_id==valid[0]['id']
+                schedule_one('submit_apple',ios)
+            else:
+                print('APPLE_ALREADY_IN_REVIEW_OR_LATER',flush=True)
+            live,exists=google_state()
+            sub=Submission.objects.filter(release=r,platform='android').first()
+            if live:
+                print('GOOGLE_ALREADY_ON_PRODUCTION_TRACK',flush=True)
+                if sub and sub.state=='ready_for_review': print('GOOGLE_MANUAL_REVIEW_REQUIRED',flush=True)
+            elif not r.jobs.filter(type__in=['upload_google','submit_google'],status__in=['queued','running']).exists():
+                if exists:
+                    # Reuse the already uploaded exact version code instead of uploading it again.
+                    result=_publish_existing_google_version(google,app,r)
+                    manual=bool(result.get('edit',{}).get('_changes_not_sent_for_review'))
+                    Submission.objects.update_or_create(app=app,release=r,platform='android',defaults={'state':'ready_for_review' if manual else 'in_review','submitted_at':timezone.now(),'last_error':'','raw':result})
+                    print('GOOGLE_EXISTING_BUNDLE_COMMITTED', 'manual_review' if manual else 'submitted',flush=True)
+                else:
+                    schedule_one('submit_google',android)
+            for _ in range(45):
+                if not r.jobs.filter(type__in=['submit_apple','upload_google','submit_google'],status__in=['queued','running']).exists(): break
+                time.sleep(10)
+            report()
+            states=apple_state()
+            live,exists=google_state()
+            sub=Submission.objects.filter(release=r,platform='android').first()
+            print('FINAL_APPLE',bool(set(states)&reviewed),'FINAL_GOOGLE',sub.state if sub else 'unconfirmed','TRACK',live,flush=True)
+            assert set(states)&reviewed,'Apple review not yet confirmed'
+            assert live and sub and sub.state in ['in_review','approved','live'],'Google review not yet confirmed'
+            PY

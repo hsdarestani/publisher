@@ -361,7 +361,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for QUERY in "Pokerface"; do
+          # Exercise the reported slow phrase cold and warm; retain the existing smoke case.
+          for QUERY in "karim benzema" "karim benzema" "Pokerface"; do
+            STARTED=$SECONDS
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
@@ -381,7 +383,7 @@ jobs:
                 if [[ "$STATUS" != "202" ]]; then break; fi
               done
             fi
-            echo "Rhyme quality live HTTP for $QUERY: $STATUS"
+            echo "Rhyme quality live HTTP for $QUERY: $STATUS, elapsed_seconds=$((SECONDS-STARTED))"
             # A depleted upstream API balance is an external billing blocker,
             # not a source-code or deployment defect. Do not hammer the API.
             if [[ "$STATUS" == "503" ]]; then
@@ -400,7 +402,7 @@ jobs:
           with open(sys.argv[1],encoding="utf8") as f: data=json.load(f)
           query=sys.argv[2]
           items=data.get("rhymes") or []
-          print("Review:",query,"candidates approved:",len(items),
+          print("Review:",query,"cached:",data.get("cached"),"candidates approved:",len(items),
                 "accepted words:",", ".join(str(x.get("word")) for x in items))
           assert data.get("ok") is True and data.get("quality_reviewed") is True
           for private_field in ("knowledge","context_revision","model","review_model","timing_ms","quality_method","intent"):

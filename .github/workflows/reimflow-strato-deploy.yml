@@ -46,7 +46,10 @@ jobs:
           python3 -m unittest discover -s tests -p "test_lyrics_import_expanded.py"
           python3 -m unittest discover -s tests -p "test_corpus_routes.py"
           bash scripts/build-rhyme-lexicon.sh
-          python3 -m unittest discover -s tests -p "test_hybrid_rhymes.py"
+          bash scripts/setup-rhyme-g2p.sh
+          PYTHONPATH="$PWD/rhyme-g2p:$PWD" python3 -m unittest discover -s tests -p "test_hybrid_rhymes.py"
+          PYTHONPATH="$PWD/rhyme-g2p:$PWD" python3 -m unittest discover -s tests -p "test_phase2_holdout.py"
+          docker run --rm --network none --memory 256m --cpus .6 -v "$PWD:/app:ro" -e PYTHONPATH=/app/rhyme-g2p:/app -w /app python:3.12-slim python -c 'import rhyme_lexicon as r; assert r.g2p.available(); assert r.pronunciation("Bahnhofsvorplatz"); assert r.retrieve_variants("Jude Bellingham",*r.pronunciation_info("Jude Bellingham")); print("Production runtime G2P and index verified offline")'
           node --check app.js
           npm install --no-save playwright@1.58.2
           npx playwright install chromium
@@ -55,14 +58,14 @@ jobs:
           cp docs/RHYME_LEXICON.md rhyme-lexicon-notice.txt
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py rhyme_lexicon.py rhyme-lexicon.sqlite rhyme-lexicon-notice.txt platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py rhyme_lexicon.py rhyme_pronunciation.py rhyme-g2p rhyme-lexicon.sqlite rhyme-lexicon-notice.txt platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
       - name: Verify scoped real model speed and creative quality before rollout
         if: contains(github.event.head_commit.message, '[reimflow-creative-benchmark]')
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           cd reimflow-src
-          python3 scripts/benchmark-creative-predeploy.py
+          PYTHONPATH="$PWD/rhyme-g2p:$PWD" python3 scripts/benchmark-creative-predeploy.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -144,8 +147,8 @@ jobs:
             mkdir -p /opt/reimflow/source-backups
             BACKUP="/opt/reimflow/source-backups/before-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
             BACKUP_FILES=(site api.py rhyme_jobs.py style_intelligence.py docker-compose.yml)
-            for item in rhyme_lexicon.py rhyme-lexicon.sqlite; do
-              if [ -f "/opt/reimflow/$item" ]; then BACKUP_FILES+=("$item"); fi
+            for item in rhyme_lexicon.py rhyme_pronunciation.py rhyme-lexicon.sqlite rhyme-g2p; do
+              if [ -e "/opt/reimflow/$item" ]; then BACKUP_FILES+=("$item"); fi
             done
             tar -czf "$BACKUP" -C /opt/reimflow "${BACKUP_FILES[@]}"
           fi
@@ -154,6 +157,9 @@ jobs:
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
           mv /opt/reimflow/site/rhyme_jobs.py /opt/reimflow/rhyme_jobs.py
           mv /opt/reimflow/site/rhyme_lexicon.py /opt/reimflow/rhyme_lexicon.py
+          mv /opt/reimflow/site/rhyme_pronunciation.py /opt/reimflow/rhyme_pronunciation.py
+          if [ -d /opt/reimflow/rhyme-g2p ]; then mv /opt/reimflow/rhyme-g2p "/opt/reimflow/source-backups/g2p-$(date -u +%Y%m%dT%H%M%SZ)"; fi
+          mv /opt/reimflow/site/rhyme-g2p /opt/reimflow/rhyme-g2p
           mv /opt/reimflow/site/rhyme-lexicon.sqlite /opt/reimflow/rhyme-lexicon.sqlite
           chmod 644 /opt/reimflow/rhyme_lexicon.py /opt/reimflow/rhyme-lexicon.sqlite
           mv /opt/reimflow/site/platform_api.py /opt/reimflow/platform_api.py
@@ -236,7 +242,7 @@ jobs:
               security_opt:
                 - no-new-privileges:true
             api:
-              image: python:3.12-alpine
+              image: python:3.12-slim
               restart: unless-stopped
               user: "10001:10001"
               network_mode: service:web
@@ -247,10 +253,13 @@ jobs:
               env_file: .env
               environment:
                 REIMFLOW_DB: /var/lib/reimflow/reimflow.sqlite3
+                PYTHONPATH: /app/g2p:/app
               volumes:
                 - ./api.py:/app/api.py:ro
                 - ./rhyme_jobs.py:/app/rhyme_jobs.py:ro
                 - ./rhyme_lexicon.py:/app/rhyme_lexicon.py:ro
+                - ./rhyme_pronunciation.py:/app/rhyme_pronunciation.py:ro
+                - ./rhyme-g2p:/app/g2p:ro
                 - ./rhyme-lexicon.sqlite:/app/rhyme-lexicon.sqlite:ro
                 - ./platform_api.py:/app/platform_api.py:ro
                 - ./role_admin.py:/app/role_admin.py:ro
@@ -387,7 +396,7 @@ jobs:
         run: |
           set -euo pipefail
           # Exercise the reported slow phrase cold and warm; retain the existing smoke case.
-          for QUERY in "Nacht" "Nacht" "Karim Benzema" "Karim Benzema" "Pokerface" "Blue Ferrari"; do
+          for QUERY in "Nacht" "Nacht" "Karim Benzema" "Karim Benzema" "Pokerface" "Blue Ferrari" "Jude Bellingham" "Alexanderplatz"; do
             STARTED=$SECONDS
             START_MS=$(date +%s%3N)
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
@@ -450,6 +459,11 @@ jobs:
               assert len(items)>=15 and not {"space","case","race"}.intersection(x["word"].casefold() for x in items)
           if query=="Nacht":
               assert len(items)>=20
+          if query=="Jude Bellingham":
+              assert len(items)>=5 and all(x.get("strength")=="brauchbar" for x in items),"Unknown-name hypotheses must not claim exact rhymes"
+              assert data["analysis"].get("pronunciation_variants"),"Missing pronunciation provenance"
+          if query=="Alexanderplatz":
+              assert len(items)>=5
           # Foreign input is allowed, but German-only mode may have zero legitimate rhymes.
           # Never force English suggestions to satisfy a result-count assertion.
           if query=="Blue Ferrari":
@@ -497,7 +511,7 @@ jobs:
                 echo "::error::Real community client missing after deploy."
                 exit 1
               fi
-              if [[ "$SITE" != *"app.js?v=20261125-hybrid1"* ]] || [[ "$HEALTH" != *'"lexicon": true'* ]] || [[ "$HEALTH" != *'2026-11-25-hybrid-lexicon-v3'* ]]; then
+              if [[ "$SITE" != *"app.js?v=20261125-generalized4"* ]] || [[ "$HEALTH" != *'"lexicon": true'* ]] || [[ "$HEALTH" != *'"g2p": true'* ]] || [[ "$HEALTH" != *'2026-11-25-generalized-phonetics-v4'* ]]; then
                 echo "::error::German-only rhyme client is missing from the deployed site."
                 exit 1
               fi
@@ -547,8 +561,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261125-hybrid1')"
-              if [[ "$SITE" != *'app.js?v=20261125-hybrid1'* ]] || ! grep -Fq '$$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261125-generalized4')"
+              if [[ "$SITE" != *'app.js?v=20261125-generalized4'* ]] || ! grep -Fq '$$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi

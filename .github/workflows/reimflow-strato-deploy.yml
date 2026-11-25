@@ -31,6 +31,7 @@ jobs:
           set -euo pipefail
           python3 -m py_compile reimflow-src/rhyme_jobs.py reimflow-src/api.py reimflow-src/platform_api.py reimflow-src/role_admin.py reimflow-src/rap-flow-analysis.py reimflow-src/rhyme-quality.py reimflow-src/rhyme-intent.py reimflow-src/style_intelligence.py reimflow-src/lyrics_import_lrclib.py reimflow-src/lyrics_import_expanded.py
           cd reimflow-src
+          echo "Deploying Reimflow revision $(git rev-parse HEAD)"
           python3 -m unittest discover -s tests -p "test_platform_api.py"
           python3 -m unittest discover -s tests -p "test_rap_flow.py"
           python3 -m unittest discover -s tests -p "test_rhyme_api.py"
@@ -44,9 +45,17 @@ jobs:
           python3 -m unittest discover -s tests -p "test_lyrics_import_lrclib.py"
           python3 -m unittest discover -s tests -p "test_lyrics_import_expanded.py"
           python3 -m unittest discover -s tests -p "test_corpus_routes.py"
+          bash scripts/build-rhyme-lexicon.sh
+          python3 -m unittest discover -s tests -p "test_hybrid_rhymes.py"
+          node --check app.js
+          npm install --no-save playwright@1.58.2
+          npx playwright install chromium
+          node tests/rhyme-browser.test.mjs
+          node tests/rhyme-async-browser.test.mjs
+          cp docs/RHYME_LEXICON.md rhyme-lexicon-notice.txt
           cd ..
           cd reimflow-src
-          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
+          tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py rhyme_lexicon.py rhyme-lexicon.sqlite rhyme-lexicon-notice.txt platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -127,12 +136,19 @@ jobs:
           if [ -f /opt/reimflow/api.py ]; then
             mkdir -p /opt/reimflow/source-backups
             BACKUP="/opt/reimflow/source-backups/before-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
-            tar -czf "$BACKUP" -C /opt/reimflow site api.py 2>/dev/null || true
+            BACKUP_FILES=(site api.py rhyme_jobs.py style_intelligence.py docker-compose.yml)
+            for item in rhyme_lexicon.py rhyme-lexicon.sqlite; do
+              if [ -f "/opt/reimflow/$item" ]; then BACKUP_FILES+=("$item"); fi
+            done
+            tar -czf "$BACKUP" -C /opt/reimflow "${BACKUP_FILES[@]}"
           fi
           rm -f /opt/reimflow/site/*.js /opt/reimflow/site/*.css /opt/reimflow/site/*.html
           tar -xzf /tmp/reimflow-strato.tar.gz -C /opt/reimflow/site
           mv /opt/reimflow/site/api.py /opt/reimflow/api.py
           mv /opt/reimflow/site/rhyme_jobs.py /opt/reimflow/rhyme_jobs.py
+          mv /opt/reimflow/site/rhyme_lexicon.py /opt/reimflow/rhyme_lexicon.py
+          mv /opt/reimflow/site/rhyme-lexicon.sqlite /opt/reimflow/rhyme-lexicon.sqlite
+          chmod 644 /opt/reimflow/rhyme_lexicon.py /opt/reimflow/rhyme-lexicon.sqlite
           mv /opt/reimflow/site/platform_api.py /opt/reimflow/platform_api.py
           mv /opt/reimflow/site/role_admin.py /opt/reimflow/role_admin.py
           mv /opt/reimflow/site/rap-flow-analysis.py /opt/reimflow/rap-flow-analysis.py
@@ -227,6 +243,8 @@ jobs:
               volumes:
                 - ./api.py:/app/api.py:ro
                 - ./rhyme_jobs.py:/app/rhyme_jobs.py:ro
+                - ./rhyme_lexicon.py:/app/rhyme_lexicon.py:ro
+                - ./rhyme-lexicon.sqlite:/app/rhyme-lexicon.sqlite:ro
                 - ./platform_api.py:/app/platform_api.py:ro
                 - ./role_admin.py:/app/role_admin.py:ro
                 - ./rap-flow-analysis.py:/app/rap-flow-analysis.py:ro
@@ -362,12 +380,20 @@ jobs:
         run: |
           set -euo pipefail
           # Exercise the reported slow phrase cold and warm; retain the existing smoke case.
-          for QUERY in "karim benzema" "karim benzema" "Pokerface"; do
+          for QUERY in "Nacht" "Nacht" "Karim Benzema" "Karim Benzema" "Pokerface" "Blue Ferrari"; do
             STARTED=$SECONDS
+            START_MS=$(date +%s%3N)
             PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"category":"Alle","syllables":"Alle"}))' "$QUERY")"
             STATUS="$(curl -sS --max-time 145 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
               -d "$PAYLOAD" https://reimflow.smarbiz.sbs/api/rhymes || true)"
+            FIRST_MS=$(($(date +%s%3N)-START_MS))
+            if python3 - "$RUNNER_TEMP/quality-response" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1])); p=d.get("partial",d)
+          raise SystemExit(0 if p.get("quality_reviewed") and p.get("rhymes") else 1)
+          PY
+            then echo "First verified results for $QUERY: ${FIRST_MS}ms"; fi
             if [[ "$STATUS" == "202" ]]; then
               JOB_ID="$(python3 - "$RUNNER_TEMP/quality-response" <<'PY'
           import json,sys
@@ -383,7 +409,7 @@ jobs:
                 if [[ "$STATUS" != "202" ]]; then break; fi
               done
             fi
-            echo "Rhyme quality live HTTP for $QUERY: $STATUS, elapsed_seconds=$((SECONDS-STARTED))"
+            echo "Rhyme quality live HTTP for $QUERY: $STATUS, elapsed_seconds=$((SECONDS-STARTED)), elapsed_ms=$(($(date +%s%3N)-START_MS))"
             # A depleted upstream API balance is an external billing blocker,
             # not a source-code or deployment defect. Do not hammer the API.
             if [[ "$STATUS" == "503" ]]; then
@@ -411,6 +437,12 @@ jobs:
           assert all(x.get("score")==0 and x.get("confidence")==0 for x in items)
           assert all(x.get("german_valid") is True for x in items),"Non-German or unverified rhyme passed the language gate"
           assert all(x.get("register")!="Englisch/Code-Switch" for x in items),"English code-switch escaped into German-only suggestions"
+          assert len(items)==len({x["word"].casefold() for x in items}),"Duplicate candidates"
+          assert data["analysis"]["input"]==query and data["analysis"]["interpreted_as"]==query
+          if query=="Pokerface":
+              assert len(items)>=15 and not {"space","case","race"}.intersection(x["word"].casefold() for x in items)
+          if query=="Nacht":
+              assert len(items)>=20
           # Foreign input is allowed, but German-only mode may have zero legitimate rhymes.
           # Never force English suggestions to satisfy a result-count assertion.
           if query=="Blue Ferrari":
@@ -458,7 +490,7 @@ jobs:
                 echo "::error::Real community client missing after deploy."
                 exit 1
               fi
-              if [[ "$SITE" != *"app.js?v=20261112-fast2"* ]]; then
+              if [[ "$SITE" != *"app.js?v=20261125-hybrid1"* ]] || [[ "$HEALTH" != *'"lexicon": true'* ]] || [[ "$HEALTH" != *'2026-11-25-hybrid-lexicon-v1'* ]]; then
                 echo "::error::German-only rhyme client is missing from the deployed site."
                 exit 1
               fi
@@ -508,8 +540,8 @@ jobs:
               fi
               echo "Flow Challenge: game, scoring and responsive CSS verified"
               # Regression guard: navigation must iterate across all page sections.
-              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261112-fast2')"
-              if [[ "$SITE" != *'app.js?v=20261112-fast2'* ]] || ! grep -Fq '$$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
+              APP_JS="$(curl -fsSL --max-time 12 'https://reimflow.smarbiz.sbs/app.js?v=20261125-hybrid1')"
+              if [[ "$SITE" != *'app.js?v=20261125-hybrid1'* ]] || ! grep -Fq '$$(".page").forEach' <<< "$APP_JS" || [[ "$APP_JS" != *"/api/rhymes/jobs/"* ]]; then
                 echo "::error::Navigation repair is not deployed (incorrect querySelector/forEach)."
                 exit 1
               fi

@@ -27,25 +27,34 @@ jobs:
           headers={'Accept':'application/vnd.github+json','User-Agent':'aesthetic-integrated-release'}
           if os.getenv('SOURCE_TOKEN'): headers['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
           def get(repo,path):
-              try:
-                  with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=headers),timeout=25) as r:return json.load(r)
-              except urllib.error.HTTPError as e:
-                  if e.code in (401,403,404) and 'Authorization' in headers:
-                      h={k:v for k,v in headers.items() if k!='Authorization'}
-                      with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=h),timeout=25) as r:return json.load(r)
-                  raise
-          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='06e71f0dba4eeb448998756cbabef10dc3614ba2'
-          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45573628998),('a_esthetic',45580503489)):
+              import http.client,socket
+              for attempt in range(6):
+                  try:
+                      try:
+                          with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=headers),timeout=25) as r:return json.load(r)
+                      except urllib.error.HTTPError as e:
+                          if e.code in (401,403,404) and 'Authorization' in headers:
+                              h={k:v for k,v in headers.items() if k!='Authorization'}
+                              with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=h),timeout=25) as r:return json.load(r)
+                          raise
+                  except urllib.error.HTTPError as e:
+                      if e.code not in (429,500,502,503,504) or attempt==5:raise
+                  except (urllib.error.URLError,http.client.RemoteDisconnected,TimeoutError,ConnectionError,socket.timeout):
+                      if attempt==5:raise
+                  print('GITHUB_READ_RETRY',attempt+1,flush=True)
+                  time.sleep(min(30,2**(attempt+1)))
+          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='a96860e92e3ccd229fc2ba2453467f5c559c0643'
+          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45573628998),('a_esthetic',45581881044)):
               run=get(repo,'/actions/runs/'+str(rid))
-              if rid==45580503489:
+              if rid==45581881044:
                   for attempt in range(130):
-                      assert run['head_sha']=={45580503489:'06e71f0dba4eeb448998756cbabef10dc3614ba2',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}[rid]
+                      assert run['head_sha']=={45581881044:'a96860e92e3ccd229fc2ba2453467f5c559c0643',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}[rid]
                       if run['status']=='completed':break
                       if attempt%10==0: print('B63_QA_STATUS',run['status'],flush=True)
                       time.sleep(20)
                       run=get(repo,'/actions/runs/'+str(rid))
               assert run['status']=='completed' and run['conclusion']=='success',(rid,run['status'],run['conclusion'])
-              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45580503489:'06e71f0dba4eeb448998756cbabef10dc3614ba2',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}
+              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45581881044:'a96860e92e3ccd229fc2ba2453467f5c559c0643',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}
               assert run['head_sha']==expected[rid],(repo,rid,'source mismatch')
               print('VERIFIED',repo,rid,run['head_sha'],flush=True)
           print('EXACT_SOURCE_AND_PRODUCTION_QA_OK')
@@ -70,7 +79,7 @@ jobs:
             from apps.publisher.tasks import enqueue_job
             from apps.integrations.apple_store import AppleStoreClient
             from apps.integrations.google_play import GooglePlayClient
-            source='06e71f0dba4eeb448998756cbabef10dc3614ba2'
+            source='a96860e92e3ccd229fc2ba2453467f5c559c0643'
             branch='feature/admin-v4-native-20261124'
             app=MobileApp.objects.get(slug='a-esthetic')
             assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
@@ -150,7 +159,7 @@ jobs:
             from apps.integrations.apple_store import AppleStoreClient
             from apps.integrations.google_play import GooglePlayClient
             app=MobileApp.objects.get(slug='a-esthetic')
-            r=Release.objects.get(app=app,version_name='1.0.57',build_number=63,source_commit='06e71f0dba4eeb448998756cbabef10dc3614ba2')
+            r=Release.objects.get(app=app,version_name='1.0.57',build_number=63,source_commit='a96860e92e3ccd229fc2ba2453467f5c559c0643')
             assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
             assert not Release.objects.filter(app=app,build_number__gt=63).exists()
             def state():

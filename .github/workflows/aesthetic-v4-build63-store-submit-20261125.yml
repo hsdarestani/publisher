@@ -1,0 +1,232 @@
+name: A+ Esthetic 1.0.57 (63) - signed builds and store submission
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-v4-build63-store-submit-20261125.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: a-esthetic-v4-build61-store-submit-20261124
+  cancel-in-progress: false
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 120
+    steps:
+      - name: Verify exact B63 source, production baseline and QA
+        env:
+          SOURCE_TOKEN: ${{ secrets.PUBLISHER_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          base='https://api.github.com/repos/hsdarestani/'
+          headers={'Accept':'application/vnd.github+json','User-Agent':'aesthetic-integrated-release'}
+          if os.getenv('SOURCE_TOKEN'): headers['Authorization']='Bearer '+os.environ['SOURCE_TOKEN']
+          def get(repo,path):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=headers),timeout=25) as r:return json.load(r)
+              except urllib.error.HTTPError as e:
+                  if e.code in (401,403,404) and 'Authorization' in headers:
+                      h={k:v for k,v in headers.items() if k!='Authorization'}
+                      with urllib.request.urlopen(urllib.request.Request(base+repo+path,headers=h),timeout=25) as r:return json.load(r)
+                  raise
+          assert get('a_esthetic','/branches/feature%2Fadmin-v4-native-20261124')['commit']['sha']=='06e71f0dba4eeb448998756cbabef10dc3614ba2'
+          for repo,rid in (('book',45435094339),('a_esthetic',45435630831),('book',45438606874),('a_esthetic',45573628998),('a_esthetic',45580503489)):
+              run=get(repo,'/actions/runs/'+str(rid))
+              if rid==45580503489:
+                  for attempt in range(130):
+                      assert run['head_sha']=={45580503489:'06e71f0dba4eeb448998756cbabef10dc3614ba2',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}[rid]
+                      if run['status']=='completed':break
+                      if attempt%10==0: print('B63_QA_STATUS',run['status'],flush=True)
+                      time.sleep(20)
+                      run=get(repo,'/actions/runs/'+str(rid))
+              assert run['status']=='completed' and run['conclusion']=='success',(rid,run['status'],run['conclusion'])
+              expected={45435094339:'d45780ee1aa64d19fd4412469c3939b72b363d83',45435630831:'3e57b560f90f6b1767c9c515feba0ea79f127485',45438606874:'4bc6824bd688a4268bfce57cb93eed82e39c79e7',45580503489:'06e71f0dba4eeb448998756cbabef10dc3614ba2',45573628998:'761012d4178c3df29c8dee8490cd8acae9a25be9'}
+              assert run['head_sha']==expected[rid],(repo,rid,'source mismatch')
+              print('VERIFIED',repo,rid,run['head_sha'],flush=True)
+          print('EXACT_SOURCE_AND_PRODUCTION_QA_OK')
+          PY
+      - name: Queue signed production-source builds via established Publisher SSH key
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 6m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db import transaction
+            from django.db.models import Max
+            from apps.publisher.models import MobileApp, Release, Build, Job
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            source='06e71f0dba4eeb448998756cbabef10dc3614ba2'
+            branch='feature/admin-v4-native-20261124'
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert app.apple_account and app.apple_account.configured
+            assert app.google_account and app.google_account.configured
+            assert hasattr(app,'android_signing')
+            assert app.repository_url.rstrip('/').endswith('hsdarestani/a_esthetic')
+            assert app.review_username and app.get_review_password()
+            assert 'scripts/build-ios.sh' in app.build_config.get('ios_command','')
+            assert 'scripts/build-android.sh' in app.build_config.get('android_command','')
+            assert app.build_config.get('ios_artifact')=='artifacts/a-esthetic.ipa'
+            assert app.build_config.get('android_artifact')=='artifacts/a-esthetic-release.aab'
+            def number(x):return int(x) if str(x).isdigit() else 0
+            apple=AppleStoreClient(app.apple_account)
+            aid=apple.find_app(app.bundle_id)['id']
+            av=apple.list_versions(aid)
+            apple_max=max((number(x['attributes'].get('version')) for x in apple.list_builds(aid)),default=0)
+            google=GooglePlayClient(app.google_account)
+            edit=google._open_edit(app.package_name)
+            try:
+                prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                bundles=google._edit_request(edit,'GET',prefix+'/bundles').get('bundles',[])
+            finally:
+                google._safe_delete_edit(edit)
+            google_max=max([number(c) for t in tracks for r in t.get('releases',[]) for c in r.get('versionCodes',[])]+[number(b.get('versionCode')) for b in bundles],default=0)
+            notes='Verbesserte Kalenderübersicht: Patiententermine in Blau mit weißer Schrift, Notizen und Sperrzeiten weiterhin in Goldtönen.'
+            with transaction.atomic():
+                app=MobileApp.objects.select_for_update().get(pk=app.pk)
+                release=Release.objects.filter(app=app,source_commit=source).order_by('-created_at').first()
+                if release is None:
+                    patches=[int(v.split('.')[-1]) for v in Release.objects.filter(app=app).values_list('version_name',flat=True) if v and v.startswith('1.0.') and v.split('.')[-1].isdigit()]
+                    patches += [int(v['attributes']['versionString'].split('.')[-1]) for v in av if v['attributes'].get('versionString','').startswith('1.0.') and v['attributes']['versionString'].split('.')[-1].isdigit()]
+                    dbmax=Release.objects.filter(app=app).aggregate(n=Max('build_number'))['n'] or 0
+                    assert max(dbmax,apple_max,google_max)<63,'Build 63 is not available; do not reuse or silently change the requested build'
+                    assert max(patches or [0])<57,'Version 1.0.57 is not newer than the existing release'
+                    release=Release.objects.create(app=app,source_branch=branch,source_commit=source,version_name='1.0.57',build_number=63,android_track='production',android_rollout=1,ios_release_type='manual',auto_submit=True,status='building',release_notes=notes)
+                assert release.source_branch==branch and release.source_commit==source
+                assert release.version_name=='1.0.57' and release.build_number==63
+                assert not Release.objects.filter(app=app,build_number__gt=63).exists()
+                assert release.auto_submit is True and release.android_track=='production' and float(release.android_rollout)==1 and release.ios_release_type=='manual'
+                for platform,runner in [('android','linux'),('ios','macos')]:
+                    build,_=Build.objects.get_or_create(release=release,platform=platform,defaults={'status':'queued','commit_sha':source})
+                    assert not build.commit_sha or build.commit_sha==source
+                    assert not Job.objects.filter(build=build,type=f'build_{platform}',status__in=['failed','cancelled']).exists(),'Existing failed job: diagnose before retry'
+                    if build.status not in ('succeeded','running') and not Job.objects.filter(build=build,type=f'build_{platform}',status__in=['queued','running','succeeded']).exists():
+                        build.status='queued'; build.commit_sha=source; build.save(update_fields=['status','commit_sha','updated_at'])
+                        enqueue_job(f'build_{platform}',app=app,release=release,build=build,agent=True,platform=runner)
+                    print('SIGNED_BUILD',platform,build.pk,build.status)
+                print('RELEASE_QUEUED',release.pk,release.version_name,release.build_number,release.source_commit,'AUTO_SUBMIT',release.auto_submit)
+            PY
+      - name: Wake existing Android and iOS build agents
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const workflow_id of ['cloud-linux.yml','cloud-macos.yml']) {
+              await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id,ref:'main'});
+            }
+      - name: Wait for signed builds and finish exact store review if needed
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 65m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import time
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            app=MobileApp.objects.get(slug='a-esthetic')
+            r=Release.objects.get(app=app,version_name='1.0.57',build_number=63,source_commit='06e71f0dba4eeb448998756cbabef10dc3614ba2')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert not Release.objects.filter(app=app,build_number__gt=63).exists()
+            def state():
+                print('BUILDS',list(r.builds.values_list('platform','status')), 'JOBS',list(r.jobs.values_list('type','status')), 'SUBMISSIONS',list(r.submissions.values_list('platform','state')),flush=True)
+            for i in range(150):
+                if i%6==0:state()
+                if r.builds.filter(status='failed').exists():raise RuntimeError('Signed build failed')
+                if r.builds.filter(status='succeeded').count()==2 and not r.jobs.filter(type__in=['build_ios','build_android','upload_apple','submit_apple','submit_google','upload_google'],status__in=['queued','running']).exists():break
+                time.sleep(20)
+            else:raise RuntimeError('Store delivery still in progress')
+            state()
+            b=r.builds.get(platform='ios',status='succeeded')
+            assert b.external_build_id and b.artifact,'Apple binary not processed; do not withdraw prior review'
+            client=AppleStoreClient(app.apple_account)
+            aid=client.find_app(app.bundle_id)['id']
+            valid=[x for x in client.list_builds(aid,63) if x['id']==b.external_build_id and x['attributes'].get('processingState')=='VALID']
+            assert len(valid)==1,'Exact new binary not valid'
+            def vs(v):return v['attributes'].get('appStoreState') or v['attributes'].get('appVersionState')
+            review={'WAITING_FOR_REVIEW','IN_REVIEW'}
+            done=review|{'PENDING_DEVELOPER_RELEASE','READY_FOR_DISTRIBUTION','READY_FOR_SALE','PENDING_APPLE_RELEASE'}
+            editable={'DEVELOPER_REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','METADATA_REJECTED','REJECTED'}
+            def exact():
+                versions=client.list_versions(aid)
+                return [v for v in versions if v['attributes'].get('versionString')==r.version_name],versions
+            def attached(v):
+                return client.request('GET',f"/appStoreVersions/{v['id']}/build").get('data')
+            target,versions=exact()
+            if not (len(target)==1 and vs(target[0]) in done):
+                candidates=[v for v in versions if vs(v) in review and v['attributes'].get('versionString')!='1.0.57']
+                assert len(candidates)<=1,'Ambiguous Apple review slot'
+                if candidates:
+                    old=candidates[0]
+                    assert old['attributes'].get('versionString')=='1.0.56','Unexpected prior version: no withdrawal'
+                    matches=[]
+                    for s in review:
+                        for sub in client.list_review_submissions(aid,s):
+                            item,items=client._review_submission_matches(sub,old['id'])
+                            if item:
+                                assert len(items)==1,'Review includes other items'
+                                matches.append(sub)
+                    assert len(matches)<=1
+                    if matches:client.cancel_review_submission(matches[0]['id'])
+                    else:
+                        legacy=client.request('GET',f"/appStoreVersions/{old['id']}/relationships/appStoreVersionSubmission").get('data')
+                        assert isinstance(legacy,dict) and legacy.get('type')=='appStoreVersionSubmissions' and legacy.get('id')
+                        client.request('DELETE',f"/appStoreVersionSubmissions/{legacy['id']}")
+                    for i in range(60):
+                        refreshed=next((v for v in client.list_versions(aid) if v['id']==old['id']),None)
+                        if refreshed and vs(refreshed) in editable:break
+                        time.sleep(5)
+                    else:raise RuntimeError('Previous review slot not released')
+                    Submission.objects.filter(app=app,release__version_name='1.0.56',platform='ios',state='in_review').update(state='withdrawn')
+                    print('B62_REVIEW_WITHDRAWN_ONLY_AFTER_B63_VALID',flush=True)
+                with transaction.atomic():
+                    Release.objects.select_for_update().get(pk=r.pk)
+                    j=r.jobs.filter(type='submit_apple',status__in=['queued','running']).first()
+                    if j is None:j=enqueue_job('submit_apple',app=app,release=r,build=b)
+                for i in range(90):
+                    j.refresh_from_db()
+                    if j.status in {'succeeded','failed','cancelled'}:break
+                    time.sleep(5)
+                print('APPLE_REVIEW_JOB',j.status,(' '.join(j.error.split())[:450] if j.status=='failed' else ''),flush=True)
+            target,_=exact()
+            assert len(target)==1 and vs(target[0]) in done,'Apple B63 review not confirmed'
+            a=attached(target[0])
+            assert a and a['id']==b.external_build_id,'Wrong Apple build attached'
+            print('APPLE_B63_CONFIRMED',vs(target[0]),flush=True)
+            google=GooglePlayClient(app.google_account)
+            edit=google._open_edit(app.package_name)
+            try:
+                prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                live=[v.get('status') for t in tracks if t.get('track')=='production' for v in t.get('releases',[]) if '63' in list(map(str,v.get('versionCodes',[])))]
+            finally:google._safe_delete_edit(edit)
+            sub=Submission.objects.filter(release=r,platform='android').first()
+            print('GOOGLE_B63_STATE',sub.state if sub else 'unconfirmed','PRODUCTION_TRACK',live,flush=True)
+            assert live and sub and sub.state in ['in_review','approved','live'],'Google B63 review not confirmed'
+            print('B63_BOTH_STORES_CONFIRMED',flush=True)
+            PY

@@ -376,8 +376,8 @@ jobs:
           print(data["job_id"])
           PY
               )"
-              for POLL in $(seq 1 100); do
-                sleep 2
+              for POLL in $(seq 1 200); do
+                sleep 1
                 STATUS="$(curl -sS --max-time 12 -o "$RUNNER_TEMP/quality-response" -w '%{http_code}' \
                   -H 'Accept: application/json' "https://reimflow.smarbiz.sbs/api/rhymes/jobs/$JOB_ID" || true)"
                 if [[ "$STATUS" != "202" ]]; then break; fi
@@ -418,8 +418,9 @@ jobs:
               assert not rejected.intersection(str(x.get("word","")).casefold() for x in items),"Phonetically weak Ferrari matches passed"
           PY
           done
-      - name: Diagnose isolated Reimflow API after failed live quality check
-        if: failure()
+      - name: Report isolated Reimflow API latency and token usage
+        if: always()
+        continue-on-error: true
         shell: bash
         env:
           DEPLOY_HOST: ${{ secrets.HOST }}
@@ -437,7 +438,7 @@ jobs:
             eval "$(ssh-agent -s)" >/dev/null
             DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/reimflow-askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$KEY" </dev/null
           fi
-          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$DEPLOY_HOST"             'cd /opt/reimflow && docker compose logs --since=12m --tail=140 api 2>&1 | grep -E "rhyme upstream:|rhyme request failed:|rhyme quality gate:|Reimflow API listening" || true'
+          ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$PORT" root@"$DEPLOY_HOST"             'cd /opt/reimflow && docker compose logs --since=12m --tail=140 api 2>&1 | grep -E "openai_usage|rhyme upstream:|rhyme request failed:|rhyme quality gate:|Reimflow API listening" || true'
       - name: Verify public domain and AI health
         shell: bash
         run: |

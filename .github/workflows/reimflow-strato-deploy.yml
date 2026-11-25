@@ -56,6 +56,13 @@ jobs:
           cd ..
           cd reimflow-src
           tar -czf "$RUNNER_TEMP/reimflow-strato.tar.gz" index.html app.js platform.js rhyme-fallback.js rhyme-previews.js api.py rhyme_jobs.py rhyme_lexicon.py rhyme-lexicon.sqlite rhyme-lexicon-notice.txt platform_api.py role_admin.py rhyme-quality.py rhyme-intent.py styles.css themes.css platform.css ux-simple.css ai-engine.css sonic-atelier.css comic-flow.css comic-variants.css theme-engine.js sonic-atelier.js flow-scoring.js flow-challenge.js flow-challenge.css rap-audio.js rap-flow.js rap-flow.css rap-flow-analysis.py style_intelligence.py lyrics_import_lrclib.py lyrics_import_expanded.py
+      - name: Verify scoped real model speed and creative quality before rollout
+        if: contains(github.event.head_commit.message, '[reimflow-creative-benchmark]')
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cd reimflow-src
+          python3 scripts/benchmark-creative-predeploy.py
       - name: Provision isolated containers and Caddy route
         shell: bash
         env:
@@ -490,7 +497,7 @@ jobs:
                 echo "::error::Real community client missing after deploy."
                 exit 1
               fi
-              if [[ "$SITE" != *"app.js?v=20261125-hybrid1"* ]] || [[ "$HEALTH" != *'"lexicon": true'* ]] || [[ "$HEALTH" != *'2026-11-25-hybrid-lexicon-v2'* ]]; then
+              if [[ "$SITE" != *"app.js?v=20261125-hybrid1"* ]] || [[ "$HEALTH" != *'"lexicon": true'* ]] || [[ "$HEALTH" != *'2026-11-25-hybrid-lexicon-v3'* ]]; then
                 echo "::error::German-only rhyme client is missing from the deployed site."
                 exit 1
               fi

@@ -1,0 +1,60 @@
+name: Verify A+ Esthetic store build availability
+
+on:
+  push:
+    branches: [qa/aesthetic-build70-store-availability]
+    paths: ['.github/workflows/aesthetic-build70-store-availability.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  availability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check store build numbering through the existing Publisher integrations
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          port: ${{ secrets.SERVER_PORT }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 4m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db.models import Max
+            from apps.publisher.models import MobileApp, Release
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            app = MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id == app.package_name == 'de.aplusesthetic.app'
+            def build_number(value):
+                return int(value) if str(value).isdigit() else 0
+            try:
+                apple = AppleStoreClient(app.apple_account)
+                apple_id = apple.find_app(app.bundle_id)['id']
+                apple_max = max((build_number(row['attributes'].get('version'))
+                                 for row in apple.list_builds(apple_id)), default=0)
+                google = GooglePlayClient(app.google_account)
+                edit = google._open_edit(app.package_name)
+                try:
+                    path = f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                    tracks = google._edit_request(edit,'GET',path+'/tracks').get('tracks',[])
+                    bundles = google._edit_request(edit,'GET',path+'/bundles').get('bundles',[])
+                finally:
+                    google._safe_delete_edit(edit)
+                google_codes = [n for t in tracks for r in t.get('releases',[]) for n in r.get('versionCodes',[])]
+                google_codes += [bundle.get('versionCode') for bundle in bundles]
+                google_max = max(map(build_number, google_codes), default=0)
+                publisher_max = Release.objects.filter(app=app).aggregate(n=Max('build_number'))['n'] or 0
+            except Exception as exc:
+                raise SystemExit('STORE_AVAILABILITY_CHECK_FAILED=' + type(exc).__name__) from None
+            print(f'APPLE_HIGHEST_BUILD={apple_max}')
+            print(f'GOOGLE_HIGHEST_BUILD={google_max}')
+            print(f'NEXT_SAFE_BUILD={max(69, apple_max, google_max, publisher_max) + 1}')
+            PY

@@ -1,0 +1,121 @@
+name: Sign A+ Esthetic 1.0.64 Build 70
+
+on:
+  push:
+    branches: [release/a-esthetic-unified-build70]
+    paths: ['.github/workflows/aesthetic-unified-build70-sign.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - name: Require the exact source and completed production and artifact gates
+        run: |
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+
+          def read(repo, path):
+              with urlopen('https://api.github.com/repos/hsdarestani/'+repo+'/'+path, timeout=8) as data:
+                  return json.load(data)
+
+          assert read('a_esthetic','branches/release%2Funified-native-b70')['commit']['sha']=='d9472cd185cce9c3df8a57e68fba1702653ccab2'
+          for repo, run_id in [('book',45971416697),('book',45971764008),('book',45972258046),
+                               ('book',45972439056),('a_esthetic',45971264186),
+                               ('book',45972692613),('a_esthetic',45972127169)]:
+              for attempt in range(28):
+                  run=read(repo,f'actions/runs/{run_id}')
+                  if run['status']=='completed':
+                      assert run['conclusion']=='success', f'Acceptance gate {run_id} failed'
+                      break
+                  time.sleep(15)
+              else:
+                  raise SystemExit(f'Acceptance gate {run_id} did not finish')
+          assert read('a_esthetic','actions/runs/45971264186')['head_sha']=='d9472cd185cce9c3df8a57e68fba1702653ccab2'
+          PY
+      - name: Queue signed builds with store upload disabled
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 16m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import time
+            from django.db import transaction
+            from django.db.models import Max
+            from apps.publisher.models import MobileApp, Release, Build, Job
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+
+            source='d9472cd185cce9c3df8a57e68fba1702653ccab2'
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id == app.package_name == 'de.aplusesthetic.app'
+            assert app.repository_url.rstrip('/').endswith('hsdarestani/a_esthetic')
+            assert 'scripts/build-ios.sh' in app.build_config.get('ios_command','')
+            assert 'scripts/build-android.sh' in app.build_config.get('android_command','')
+            assert app.build_config.get('ios_artifact')=='artifacts/a-esthetic.ipa'
+            assert app.build_config.get('android_artifact')=='artifacts/a-esthetic-release.aab'
+            def number(value):
+                return int(value) if str(value).isdigit() else 0
+            def highest_store_build():
+                apple=AppleStoreClient(app.apple_account)
+                app_id=apple.find_app(app.bundle_id)['id']
+                apple_max=max((number(row['attributes'].get('version')) for row in apple.list_builds(app_id)),default=0)
+                google=GooglePlayClient(app.google_account)
+                edit=google._open_edit(app.package_name)
+                try:
+                    prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                    tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                    bundles=google._edit_request(edit,'GET',prefix+'/bundles').get('bundles',[])
+                finally:
+                    google._safe_delete_edit(edit)
+                numbers=[number(c) for t in tracks for r in t.get('releases',[]) for c in r.get('versionCodes',[])]
+                numbers += [number(b.get('versionCode')) for b in bundles]
+                return max(apple_max, max(numbers,default=0))
+
+            store_max=highest_store_build()
+            with transaction.atomic():
+                app=MobileApp.objects.select_for_update().get(pk=app.pk)
+                release=Release.objects.filter(app=app,source_commit=source,version_name='1.0.64').first()
+                if release is None:
+                    last=Release.objects.filter(app=app).aggregate(n=Max('build_number'))['n'] or 0
+                    build_number=max(69,last,store_max)+1
+                    release=Release.objects.create(app=app,source_branch='release/unified-native-b70',
+                        source_commit=source,version_name='1.0.64',build_number=build_number,
+                        android_track='production',android_rollout=1,ios_release_type='manual',
+                        auto_submit=False,status='building',
+                        release_notes='Verbesserte Terminverwaltung und direkte Kontaktfunktionen in der Patientenakte.')
+                assert release.auto_submit is False and release.build_number>store_max
+                for platform, runner in [('android','linux'),('ios','macos')]:
+                    build,_=Build.objects.get_or_create(release=release,platform=platform,
+                        defaults={'status':'queued','commit_sha':source})
+                    assert build.commit_sha == source
+                    if not Job.objects.filter(build=build,type=f'build_{platform}').exists():
+                        enqueue_job(f'build_{platform}',app=app,release=release,build=build,agent=True,platform=runner)
+
+            print('SIGNED_CANDIDATE_RELEASE_ID='+str(release.pk),flush=True)
+            print('SIGNED_CANDIDATE_BUILD_NUMBER='+str(release.build_number),flush=True)
+            for attempt in range(50):
+                builds=list(release.builds.order_by('platform').values_list('platform','status'))
+                if len(builds)==2 and all(status=='succeeded' for _,status in builds):
+                    assert not release.submissions.exists()
+                    print('SIGNED_IOS_AND_ANDROID_READY=true',flush=True)
+                    break
+                if any(status in {'failed','cancelled'} for _,status in builds):
+                    raise SystemExit('SIGNED_CANDIDATE_BUILD_FAILED')
+                time.sleep(15)
+            else:
+                raise SystemExit('SIGNED_CANDIDATE_STILL_BUILDING')
+            PY

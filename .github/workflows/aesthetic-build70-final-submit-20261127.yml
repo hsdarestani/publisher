@@ -1,0 +1,175 @@
+name: Submit signed A+ Esthetic 1.0.64 Build 70 to both stores
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/aesthetic-build70-final-submit-20261127.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: a-esthetic-v4-build61-store-submit-20261124
+  cancel-in-progress: false
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 130
+    steps:
+      - name: Verify exact release and successful production routing correction
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request
+          def read(repo, run):
+              with urllib.request.urlopen(f'https://api.github.com/repos/hsdarestani/{repo}/actions/runs/{run}',timeout=20) as response:
+                  return json.load(response)
+          for repo,run in [('a_esthetic',45971264186),('a_esthetic',45972127169),('book',45971764008),('book',45973579291),('publisher',45973543055),('a_esthetic',46005234697)]:
+              result=read(repo,run)
+              assert result['status']=='completed' and result['conclusion']=='success', f'Gate {run} failed'
+          assert read('a_esthetic',45971264186)['head_sha']=='d9472cd185cce9c3df8a57e68fba1702653ccab2'
+          print('B70_RELEASE_GATES_VERIFIED')
+          PY
+      - name: Queue existing signed artifacts, no rebuild
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 8m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Submission
+            from apps.publisher.tasks import enqueue_job
+            app=MobileApp.objects.get(slug='a-esthetic')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert app.apple_account and app.apple_account.configured and app.google_account and app.google_account.configured
+            with transaction.atomic():
+                r=Release.objects.select_for_update().get(pk=64,app=app,version_name='1.0.64',build_number=70,source_commit='d9472cd185cce9c3df8a57e68fba1702653ccab2')
+                assert not Release.objects.filter(app=app,build_number__gt=70).exists()
+                assert r.android_track=='production' and float(r.android_rollout)==1 and r.ios_release_type=='manual'
+                for platform,kind,kw in [('android','upload_google',{}),('ios','upload_apple',{'agent':True,'platform':'macos'})]:
+                    b=r.builds.get(platform=platform,status='succeeded')
+                    assert b.commit_sha==r.source_commit and b.artifact and b.artifact_size>0
+                    if r.submissions.filter(platform=platform,state__in=['in_review','approved','live']).exists() or (platform=='ios' and b.external_build_id):
+                        print('ALREADY_UPLOADED',platform,flush=True)
+                        continue
+                    jobs=r.jobs.filter(type__in=[kind,'submit_google'] if platform=='android' else [kind])
+                    if jobs.filter(status__in=['queued','running','succeeded']).exists():
+                        print('UPLOAD_ALREADY_PRESENT',platform,flush=True)
+                        continue
+                    assert not jobs.filter(status='failed').exists(),'Inspect failed upload before retry'
+                    j=enqueue_job(kind,app=app,release=r,build=b,**kw)
+                    print('B70_UPLOAD_QUEUED',platform,j.pk,flush=True)
+            PY
+      - name: Wake existing macOS upload agent
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({owner:context.repo.owner,repo:context.repo.repo,workflow_id:'cloud-macos.yml',ref:'main'});
+      - name: Wait for signed builds and finish exact store review if needed
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          fingerprint: ${{ secrets.SSH_HOST_FINGERPRINT }}
+          command_timeout: 65m
+          script: |
+            set -euo pipefail
+            cd /opt/aplus-publisher
+            docker compose exec -T web python manage.py shell <<'PY'
+            import time
+            from django.db import transaction
+            from apps.publisher.models import MobileApp,Release,Job,Submission
+            from apps.publisher.tasks import enqueue_job
+            from apps.integrations.apple_store import AppleStoreClient
+            from apps.integrations.google_play import GooglePlayClient
+            app=MobileApp.objects.get(slug='a-esthetic')
+            r=Release.objects.get(app=app,version_name='1.0.64',build_number=70,source_commit='d9472cd185cce9c3df8a57e68fba1702653ccab2')
+            assert app.bundle_id==app.package_name=='de.aplusesthetic.app'
+            assert not Release.objects.filter(app=app,build_number__gt=70).exists()
+            def state():
+                print('BUILDS',list(r.builds.values_list('platform','status')), 'JOBS',list(r.jobs.values_list('type','status')), 'SUBMISSIONS',list(r.submissions.values_list('platform','state')),flush=True)
+            for i in range(150):
+                if i%6==0:state()
+                if r.builds.filter(status='failed').exists():raise RuntimeError('Signed build failed')
+                if r.builds.filter(status='succeeded').count()==2 and not r.jobs.filter(type__in=['build_ios','build_android','upload_apple','submit_apple','submit_google','upload_google'],status__in=['queued','running']).exists():break
+                time.sleep(20)
+            else:raise RuntimeError('Store delivery still in progress')
+            state()
+            b=r.builds.get(platform='ios',status='succeeded')
+            assert b.external_build_id and b.artifact,'Apple binary not processed; do not withdraw prior review'
+            client=AppleStoreClient(app.apple_account)
+            aid=client.find_app(app.bundle_id)['id']
+            valid=[x for x in client.list_builds(aid,70) if x['id']==b.external_build_id and x['attributes'].get('processingState')=='VALID']
+            assert len(valid)==1,'Exact new binary not valid'
+            def vs(v):return v['attributes'].get('appStoreState') or v['attributes'].get('appVersionState')
+            review={'WAITING_FOR_REVIEW','IN_REVIEW'}
+            done=review|{'PENDING_DEVELOPER_RELEASE','READY_FOR_DISTRIBUTION','READY_FOR_SALE','PENDING_APPLE_RELEASE'}
+            editable={'DEVELOPER_REJECTED','PREPARE_FOR_SUBMISSION','READY_FOR_REVIEW','METADATA_REJECTED','REJECTED'}
+            def exact():
+                versions=client.list_versions(aid)
+                return [v for v in versions if v['attributes'].get('versionString')==r.version_name],versions
+            def attached(v):
+                return client.request('GET',f"/appStoreVersions/{v['id']}/build").get('data')
+            target,versions=exact()
+            if not (len(target)==1 and vs(target[0]) in done):
+                candidates=[v for v in versions if vs(v) in review and v['attributes'].get('versionString')!='1.0.64']
+                assert len(candidates)<=1,'Ambiguous Apple review slot'
+                if candidates:
+                    old=candidates[0]
+                    assert old['attributes'].get('versionString') in {'1.0.57','1.0.58','1.0.59','1.0.60','1.0.61','1.0.62','1.0.63'},'Unexpected prior version: no withdrawal'
+                    matches=[]
+                    for s in review:
+                        for sub in client.list_review_submissions(aid,s):
+                            item,items=client._review_submission_matches(sub,old['id'])
+                            if item:
+                                assert len(items)==1,'Review includes other items'
+                                matches.append(sub)
+                    assert len(matches)<=1
+                    if matches:client.cancel_review_submission(matches[0]['id'])
+                    else:
+                        legacy=client.request('GET',f"/appStoreVersions/{old['id']}/relationships/appStoreVersionSubmission").get('data')
+                        assert isinstance(legacy,dict) and legacy.get('type')=='appStoreVersionSubmissions' and legacy.get('id')
+                        client.request('DELETE',f"/appStoreVersionSubmissions/{legacy['id']}")
+                    for i in range(60):
+                        refreshed=next((v for v in client.list_versions(aid) if v['id']==old['id']),None)
+                        if refreshed and vs(refreshed) in editable:break
+                        time.sleep(5)
+                    else:raise RuntimeError('Previous review slot not released')
+                    Submission.objects.filter(app=app,release__version_name=old['attributes']['versionString'],platform='ios',state='in_review').update(state='withdrawn')
+                    print('PRIOR_REVIEW_WITHDRAWN_ONLY_AFTER_B70_VALID',flush=True)
+                with transaction.atomic():
+                    Release.objects.select_for_update().get(pk=r.pk)
+                    j=r.jobs.filter(type='submit_apple',status__in=['queued','running']).first()
+                    if j is None:j=enqueue_job('submit_apple',app=app,release=r,build=b)
+                for i in range(90):
+                    j.refresh_from_db()
+                    if j.status in {'succeeded','failed','cancelled'}:break
+                    time.sleep(5)
+                print('APPLE_REVIEW_JOB',j.status,(' '.join(j.error.split())[:450] if j.status=='failed' else ''),flush=True)
+            target,_=exact()
+            assert len(target)==1 and vs(target[0]) in done,'Apple B70 review not confirmed'
+            a=attached(target[0])
+            assert a and a['id']==b.external_build_id,'Wrong Apple build attached'
+            print('APPLE_B70_CONFIRMED',vs(target[0]),flush=True)
+            google=GooglePlayClient(app.google_account)
+            edit=google._open_edit(app.package_name)
+            try:
+                prefix=f'/applications/{google._q(app.package_name)}/edits/{edit.edit_id}'
+                tracks=google._edit_request(edit,'GET',prefix+'/tracks').get('tracks',[])
+                live=[v.get('status') for t in tracks if t.get('track')=='production' for v in t.get('releases',[]) if '70' in list(map(str,v.get('versionCodes',[])))]
+            finally:google._safe_delete_edit(edit)
+            sub=Submission.objects.filter(release=r,platform='android').first()
+            print('GOOGLE_B70_STATE',sub.state if sub else 'unconfirmed','PRODUCTION_TRACK',live,flush=True)
+            assert live and sub and sub.state in ['in_review','approved','live'],'Google B70 review not confirmed'
+            print('B70_BOTH_STORES_CONFIRMED',flush=True)
+            PY

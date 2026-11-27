@@ -26,7 +26,7 @@ jobs:
           assert read('a_esthetic','branches/release%2Funified-native-b70')['commit']['sha']=='d9472cd185cce9c3df8a57e68fba1702653ccab2'
           for repo, run_id in [('book',45971416697),('book',45971764008),('book',45972258046),
                                ('book',45972439056),('a_esthetic',45971264186),
-                               ('book',45972692613),('a_esthetic',45972127169)]:
+                               ('book',45973182017),('a_esthetic',45972127169)]:
               for attempt in range(28):
                   run=read(repo,f'actions/runs/{run_id}')
                   if run['status']=='completed':

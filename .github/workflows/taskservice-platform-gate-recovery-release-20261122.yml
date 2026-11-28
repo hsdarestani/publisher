@@ -1,52 +1,54 @@
-name: TaskService platform gate recovery safe release
+name: TaskService verified release
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/taskservice-platform-gate-recovery-release-20261122.yml']
+    paths:
+      - '.github/workflows/taskservice-platform-gate-recovery-release-20261122.yml'
+      - 'ops/taskservice/**'
+  pull_request:
+    paths: ['ops/taskservice/**', '.github/workflows/taskservice-platform-gate-recovery-release-20261122.yml']
   workflow_dispatch:
+    inputs:
+      phase:
+        description: Operation
+        type: choice
+        options: [preflight, rehearse, release]
+        default: preflight
+        required: true
+      pull_request:
+        description: Merged TaskService PR for release
+        type: number
+        default: 5
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: taskservice-platform-gate-recovery
   cancel-in-progress: false
 jobs:
-  release:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          bash -n ops/taskservice/publisher-ssh.sh
+          bash -n ops/taskservice/host-release.sh
+          python3 -m unittest discover -s ops/taskservice -p 'test_*.py'
+  verify:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 45
+    env:
+      PHASE: ${{ inputs.phase || 'preflight' }}
     steps:
-      - name: Require full green CI for exact visual redesign commit
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          sha=69e2242f2aff1a7379041f85ce7465aa07ba1fdf
-          for attempt in {1..60}; do
-            status="$(curl -fsSL --retry 2 -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/hsdarestani/taskservice/actions/runs?head_sha=$sha&per_page=20" \
-              | python3 -c 'import json,sys; x=json.load(sys.stdin).get("workflow_runs",[]); x=[a for a in x if a.get("name")=="TaskService V2 validation" and a.get("head_sha")=="69e2242f2aff1a7379041f85ce7465aa07ba1fdf"]; print("pass" if any(a.get("conclusion")=="success" for a in x) else "fail" if x and all(a.get("status")=="completed" for a in x) else "pending")')"
-            if [ "$status" = pass ]; then echo 'SOURCE_CI=passed'; exit 0; fi
-            if [ "$status" = fail ]; then echo 'SOURCE_CI=failed; production unchanged'; exit 1; fi
-            sleep 10
-          done
-          echo 'SOURCE_CI=timed_out; production unchanged'
-          exit 1
       - uses: actions/checkout@v4
         with:
-          repository: hsdarestani/taskservice
-          ref: 69e2242f2aff1a7379041f85ce7465aa07ba1fdf
-          path: taskservice-src
-      - name: Build complete TaskService One public and staff UI off-server
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git -C taskservice-src rev-parse HEAD)" = 69e2242f2aff1a7379041f85ce7465aa07ba1fdf
-          grep -Fq 'DemoPasswordOnlyAssurance' taskservice-src/v2/TaskService/NativeIdentity.cs
-          docker build -f taskservice-src/v2/Dockerfile -t taskservice:platform-69e2242 taskservice-src
-      - name: Deploy full TaskService One UI to existing API with rollback and co-host verification
-        shell: bash
+          persist-credentials: false
+      - name: Verify Publisher and TaskService availability, capacity and backup configuration
         env:
           HOST: ${{ secrets.HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
@@ -55,82 +57,67 @@ jobs:
           HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
         run: |
           set -euo pipefail
-          test "$HOST" = 82.165.187.14
-          test -n "$KEY"
-          expected_fingerprint="${HOST_FINGERPRINT:-SHA256:G5zZTiYxEm6Hm2v/CYFe/4e7K3YwRCbOkABFBBy93vg}"
-          port="${SSH_PORT:-22}"
-          tmp="$(mktemp -d)"
-          trap 'if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
-          umask 077
-          printf '%s\n' "$KEY" | tr -d '\r' > "$tmp/key"
-          chmod 600 "$tmp/key"
-          if [ -n "$PASSPHRASE" ]; then
-            eval "$(ssh-agent -s)" >/dev/null
-            printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$PASSPHRASE"' > "$tmp/askpass"
-            chmod 700 "$tmp/askpass"
-            DISPLAY=:0 SSH_ASKPASS="$tmp/askpass" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$tmp/key" </dev/null >/dev/null
+          source ops/taskservice/publisher-ssh.sh
+          host_release preflight
+      - name: Rehearse encrypted backup and isolated restore
+        if: env.PHASE == 'rehearse'
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          source ops/taskservice/publisher-ssh.sh
+          host_release rehearse
+      - name: Resolve merged release tree and successful validation
+        if: env.PHASE == 'release'
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_PR: ${{ inputs.pull_request }}
+        run: python3 ops/taskservice/resolve-release.py
+      - uses: actions/checkout@v4
+        if: env.PHASE == 'release'
+        with:
+          repository: hsdarestani/taskservice
+          ref: ${{ steps.source.outputs.sha }}
+          path: taskservice-src
+          persist-credentials: false
+      - name: Build the validated image off-server
+        if: env.PHASE == 'release'
+        env:
+          REVISION: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C taskservice-src rev-parse HEAD)" = "$REVISION"
+          docker build --label "org.opencontainers.image.revision=$REVISION" -f taskservice-src/v2/Dockerfile -t "taskservice:v3-$REVISION" taskservice-src
+      - name: Prepare public browser checks
+        if: env.PHASE == 'release'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install 'playwright==1.62.0'
+          "$RUNNER_TEMP/smoke/bin/playwright" install --with-deps chromium
+      - name: Back up, restore, migrate and verify both services
+        if: env.PHASE == 'release'
+        env:
+          REVISION: ${{ steps.source.outputs.sha }}
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          source ops/taskservice/publisher-ssh.sh
+          bytes=$(docker image inspect -f '{{.Size}}' "taskservice:v3-$REVISION")
+          [[ $bytes =~ ^[1-9][0-9]*$ ]]
+          available=$("${SSH[@]}" root@"$HOST" 'df -PB1 "$(docker info --format "{{.DockerRootDir}}")" | tail -1' | awk '{print $4}')
+          (( available > bytes * 2 ))
+          docker save "taskservice:v3-$REVISION" | gzip -1 | "${SSH[@]}" root@"$HOST" 'gzip -dc | docker load >/dev/null'
+          host_release release "$REVISION"
+          if ! "$RUNNER_TEMP/smoke/bin/python" ops/taskservice/live-smoke.py; then
+            host_release rollback "$REVISION"
+            exit 1
           fi
-          unset PASSPHRASE
-          ssh-keyscan -T 10 -t ed25519 -p "$port" "$HOST" > "$tmp/known_hosts" 2>/dev/null
-          test -s "$tmp/known_hosts"
-          actual_fp="$(ssh-keygen -E sha256 -lf "$tmp/known_hosts" | awk 'NR==1{print $2}')"
-          test "$actual_fp" = "$expected_fingerprint"
-          SSH=(ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$tmp/known_hosts" -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 -p "$port")
-          "${SSH[@]}" root@"$HOST" 'bash -se' <<'PREFLIGHT'
-          set -euo pipefail
-          cd /opt/taskservice
-          grep -qx 'TASKSERVICE_IMAGE=taskservice:one-v3-3833ae7' .env
-          grep -qx 'Demo__Enabled=true' secrets/api.env
-          grep -qx 'Identity__DemoPasswordOnly=true' secrets/api.env
-          grep -Fq 'taskservice-demo-api' compose.yaml
-          test -f compose-lowmem.experimental.yaml
-          test -f secrets/api.env
-          docker network inspect aplus-publisher_default >/dev/null
-          docker compose -p taskservice -f compose.yaml -f compose-lowmem.experimental.yaml config -q
-          curl -fsS --max-time 8 https://taskservice.smarbiz.sbs/api/v1/session >/dev/null
-          (cd /opt/aplus-publisher && docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null)
-          PREFLIGHT
-          docker save taskservice:platform-69e2242 | gzip -1 | "${SSH[@]}" root@"$HOST" 'gzip -dc | docker load >/dev/null'
-          "${SSH[@]}" root@"$HOST" 'bash -se' <<'REMOTE'
-          set -euo pipefail
-          cd /opt/taskservice
-          umask 077
-          backup="$(mktemp -d /opt/taskservice/.taskservice-platform-gate-release.XXXXXXXX)"
-          cp -p .env "$backup/dotenv"
-          cp -p secrets/api.env "$backup/api.env"
-          good=no
-          rollback() {
-            echo 'Restoring previous TaskService API configuration'
-            cp -p "$backup/dotenv" .env
-            cp -p "$backup/api.env" secrets/api.env
-            docker compose -p taskservice -f compose.yaml -f compose-lowmem.experimental.yaml up -d --no-deps --force-recreate api
-          }
-          trap 'rc=$?; if [ "$good" != yes ]; then rollback || true; fi; exit "$rc"' EXIT
-          python3 - <<'PY'
-          from pathlib import Path
-          env=Path(".env")
-          source=env.read_text()
-          old="TASKSERVICE_IMAGE=taskservice:one-v3-3833ae7"
-          assert source.count(old)==1, "Unexpected TaskService base image"
-          env.write_text(source.replace(old,"TASKSERVICE_IMAGE=taskservice:platform-69e2242"))
-          PY
-          docker compose -p taskservice -f compose.yaml -f compose-lowmem.experimental.yaml config -q
-          docker compose -p taskservice -f compose.yaml -f compose-lowmem.experimental.yaml up -d --no-deps --force-recreate api
-          for attempt in {1..35}; do
-            local_http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 -H 'Host: taskservice.smarbiz.sbs' http://127.0.0.1:18081/health/ready || true)"
-            session_http="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 12 https://taskservice.smarbiz.sbs/api/v1/session || true)"
-            if [ "$local_http" = 200 ] && [ "$session_http" = 200 ]; then
-              break
-            fi
-            sleep 3
-          done
-          echo "TASKSERVICE_POSTDEPLOY_LOCAL=$local_http SESSION=$session_http"
-          test "$local_http" = 200
-          test "$session_http" = 200
-          (cd /opt/aplus-publisher && docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ </dev/null >/dev/null)
-          good=yes
-          trap - EXIT
-          echo 'TASKSERVICE_PLATFORM_GATE_RECOVERY=deployed'
-          echo 'SESSION_HTTP=200'
-          echo 'HEALTH_HTTP=200'
-          REMOTE

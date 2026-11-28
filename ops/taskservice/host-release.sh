@@ -46,6 +46,21 @@ check_capacity() {
   local bytes headroom group limit current mem free_db free_image dbpath
   if ((unhealthy)); then
     printf 'MEM_AVAILABLE_KIB=%s DISK_AVAILABLE_KIB=%s\n' "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" "$(df -Pk . | awk 'NR==2 {print $4}')"
+    local cg=/sys/fs/cgroup/taskservice.slice
+    for metric in memory.current memory.max memory.high memory.swap.current pids.current pids.max cgroup.freeze; do
+      if [[ -r $cg/$metric ]]; then printf 'CGROUP_%s=%s\n' "$metric" "$(cat "$cg/$metric")"; fi
+    done
+    if [[ -r $cg/memory.events ]]; then awk '{print "MEMORY_EVENT_" $1 "=" $2}' "$cg/memory.events"; fi
+    for metric in cpu memory io; do
+      if [[ -r $cg/$metric.pressure ]]; then awk -v m="$metric" '{print "PRESSURE_" m "_" $1 "=" $2}' "$cg/$metric.pressure"; fi
+    done
+    for svc in db scanner api worker; do
+      cid=$(compose ps -q "$svc")
+      if [[ -n $cid ]]; then
+        docker inspect -f 'PROCESS={{.Name}} PAUSED={{.State.Paused}} OOM_KILLED={{.State.OOMKilled}} RESTARTS={{.RestartCount}}' "$cid"
+      fi
+    done
+    if (load_backup_config) >/dev/null 2>&1; then echo RECOVERY_DESTINATION=verified_mount; else echo RECOVERY_DESTINATION=unverified; fi
     # Use read-only probes bounded independently, including when Docker exec hangs.
     if timeout 8 docker exec "$(compose ps -q db)" pg_isready -t 3 -U postgres -d taskservice >/dev/null; then echo DB_ACCEPTING=yes; else echo DB_ACCEPTING=no; fi
     if timeout 8 docker exec "$(compose ps -q scanner)" sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310 | grep -qx PONG'; then echo SCANNER_PONG=yes; else echo SCANNER_PONG=no; fi

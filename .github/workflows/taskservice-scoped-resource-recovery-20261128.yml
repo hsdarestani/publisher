@@ -42,8 +42,9 @@ jobs:
           }
           api_health() {
             curl -fsS --max-time 10 https://taskservice.smarbiz.sbs/api/v1/session |
-              python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(0 if x.get("signedIn") is False else 1)'
-            timeout 10 docker exec "$(compose ps -q api)" sh -c 'curl -fsS --max-time 6 -H "Host: $TASKSERVICE_HEALTH_HOST" http://127.0.0.1:8080/health/ready' >/dev/null
+              python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(0 if x.get("signedIn") is False else 1)' &&
+            timeout 10 docker exec "$(compose ps -q api)" sh -c 'curl -fsS --max-time 6 -H "Host: $TASKSERVICE_HEALTH_HOST" http://127.0.0.1:8080/health/ready' >/dev/null &&
+            [[ $(docker inspect -f '{{.State.Running}} {{.State.Paused}}' "$(compose ps -q worker)") == 'true false' ]]
           }
           snapshot() {
             for metric in memory.current memory.high memory.max pids.current pids.max memory.swap.current; do
@@ -91,7 +92,7 @@ jobs:
           [[ $(cat "$cg/memory.max") == 1610612736 && $(cat "$cg/memory.swap.max") == 0 ]]
           [[ $(cat "$cg/pids.max") == 512 && $(cat "$cg/memory.high") == 1572864000 ]]
           consecutive=0
-          for attempt in {1..12}; do
+          for attempt in {1..7}; do
             (( $(mem_available) >= 262144 && $(oom_events) == old_oom )) || { echo 'Capacity protection tripped'; exit 1; }
             if probe && api_health && cohost_health; then
               consecutive=$((consecutive+1))

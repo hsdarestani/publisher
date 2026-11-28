@@ -28,20 +28,30 @@ load_backup_config() {
 }
 ready() {
   compose exec -T api sh -c 'curl -fsS --max-time 8 -H "Host: $TASKSERVICE_HEALTH_HOST" http://127.0.0.1:8080/health/ready' >/dev/null &&
-  curl -fsS --max-time 10 https://taskservice.smarbiz.sbs/api/v1/session >/dev/null &&
+  curl -fsS --max-time 10 https://taskservice.smarbiz.sbs/api/v1/session |
+    python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("demo") is False and s.get("signedIn") is False else 1)' &&
   (cd /opt/aplus-publisher && docker compose exec -T web curl -fsS --max-time 8 http://127.0.0.1:8000/healthz/ >/dev/null)
 }
 check_capacity() {
   compose config -q
-  for svc in db scanner api; do
+  local unhealthy=0
+  for svc in db scanner api worker; do
     local cid health
     cid=$(compose ps -q "$svc")
-    [[ -n $cid ]] || die "READINESS_GATE: $svc is absent"
+    if [[ -z $cid ]]; then echo "SERVICE=$svc HEALTH=absent"; unhealthy=1; continue; fi
     health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")
     printf 'SERVICE=%s HEALTH=%s\n' "$svc" "$health"
-    [[ $health == healthy ]] || die "READINESS_GATE: $svc requires recovery"
+    if [[ $health != healthy && !( $svc == worker && $health == running ) ]]; then unhealthy=1; fi
   done
   local bytes headroom group limit current mem free_db free_image dbpath
+  if ((unhealthy)); then
+    printf 'MEM_AVAILABLE_KIB=%s DISK_AVAILABLE_KIB=%s\n' "$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)" "$(df -Pk . | awk 'NR==2 {print $4}')"
+    # Use read-only probes bounded independently, including when Docker exec hangs.
+    if timeout 8 docker exec "$(compose ps -q db)" pg_isready -t 3 -U postgres -d taskservice >/dev/null; then echo DB_ACCEPTING=yes; else echo DB_ACCEPTING=no; fi
+    if timeout 8 docker exec "$(compose ps -q scanner)" sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310 | grep -qx PONG'; then echo SCANNER_PONG=yes; else echo SCANNER_PONG=no; fi
+    curl -sS --max-time 8 -o /dev/null -w 'PUBLIC_SESSION_HTTP=%{http_code}\n' https://taskservice.smarbiz.sbs/api/v1/session || true
+    die 'READINESS_GATE: unhealthy baseline'
+  fi
   bytes=$(sql taskservice -c "SELECT pg_database_size(current_database())")
   mem=$(( $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) * 1024 ))
   group=$(systemctl show taskservice.slice -p ControlGroup --value)

@@ -126,4 +126,4 @@ jobs:
         run: |
           set -euo pipefail
           source ops/taskservice/publisher-ssh.sh
-          "${{SSH[@]}" root@"$HOST" 'script=$(cat); exec bash -euc "$script"' < "$RUNNER_TEMP/taskservice-recovery.sh"
+          "${SSH[@]}" root@"$HOST" 'script=$(cat); exec bash -euc "$script"' < "$RUNNER_TEMP/taskservice-recovery.sh"

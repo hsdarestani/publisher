@@ -1,0 +1,129 @@
+name: TaskService scoped resource recovery
+on:
+  pull_request:
+    paths: ['.github/workflows/taskservice-scoped-resource-recovery-20261128.yml']
+  push:
+    branches: [main]
+    paths: ['.github/workflows/taskservice-scoped-resource-recovery-20261128.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: taskservice-platform-gate-recovery
+  cancel-in-progress: false
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare bounded recovery script
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/taskservice-recovery.sh" <<'REMOTE'
+          set -euo pipefail
+          cd /opt/taskservice
+          exec 9>/run/lock/taskservice-release.lock
+          flock -n 9 || { echo 'Another TaskService operation is active'; exit 1; }
+          cg=/sys/fs/cgroup/taskservice.slice
+          compose() { docker compose -p taskservice -f compose.yaml -f compose-lowmem.experimental.yaml "$@"; }
+          mem_available() { awk '/^MemAvailable:/ {print $2}' /proc/meminfo; }
+          oom_events() { awk '$1=="oom" || $1=="oom_kill" {n+=$2} END{print n+0}' "$cg/memory.events"; }
+          cohost_health() {
+            curl -fsS --max-time 10 -o /dev/null https://publisher.smarbiz.sbs/healthz/ &&
+            curl -fsS --max-time 10 -o /dev/null https://reimflow.smarbiz.sbs/
+          }
+          probe() {
+            timeout 8 docker exec "$(compose ps -q db)" pg_isready -t 3 -U postgres -d taskservice >/dev/null &&
+            timeout 8 docker exec "$(compose ps -q scanner)" sh -c 'printf "PING\n" | nc -w 3 127.0.0.1 3310 | grep -qx PONG'
+          }
+          api_health() {
+            curl -fsS --max-time 10 https://taskservice.smarbiz.sbs/api/v1/session |
+              python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(0 if x.get("signedIn") is False else 1)' &&
+            timeout 10 docker exec "$(compose ps -q api)" sh -c 'curl -fsS --max-time 6 -H "Host: $TASKSERVICE_HEALTH_HOST" http://127.0.0.1:8080/health/ready' >/dev/null &&
+            [[ $(docker inspect -f '{{.State.Running}} {{.State.Paused}}' "$(compose ps -q worker)") == 'true false' ]]
+          }
+          snapshot() {
+            for metric in memory.current memory.high memory.max pids.current pids.max memory.swap.current; do
+              printf '%s=%s\n' "$metric" "$(cat "$cg/$metric")"
+            done
+            printf 'HOST_AVAILABLE_KIB=%s OOM_EVENTS=%s\n' "$(mem_available)" "$(oom_events)"
+            for svc in db scanner api worker; do
+              local cid pid path
+              cid=$(compose ps -q "$svc")
+              test -n "$cid" || return 1
+              pid=$(docker inspect -f '{{.State.Pid}}' "$cid")
+              path=$(awk -F: '$1=="0" {print $3}' "/proc/$pid/cgroup")
+              [[ $path == /taskservice.slice/* ]] || return 1
+              printf 'SERVICE=%s MEMORY_BYTES=%s TASKS=%s\n' "$svc" "$(cat "/sys/fs/cgroup$path/memory.current")" "$(cat "/sys/fs/cgroup$path/pids.current")"
+            done
+          }
+          [[ $(systemctl show taskservice.slice -p ControlGroup --value) == /taskservice.slice ]]
+          [[ $(cat "$cg/memory.max") == 1610612736 ]]
+          [[ $(cat "$cg/memory.swap.max") == 0 ]]
+          old_high=$(cat "$cg/memory.high")
+          old_tasks=$(cat "$cg/pids.max")
+          [[ $old_high == 1363148800 && $old_tasks == 300 ]] || { echo 'Existing settings differ; no changes made'; exit 1; }
+          (( $(cat "$cg/pids.current") >= old_tasks ))
+          (( $(cat "$cg/memory.current") > old_high ))
+          (( $(mem_available) >= 327680 ))
+          snapshot
+          cohost_health || { echo 'Co-host baseline not healthy; no changes made'; exit 1; }
+          old_oom=$(oom_events)
+          changed=0
+          keep=0
+          restore() {
+            local rc=$?
+            if ((changed && !keep)); then
+              if systemctl set-property --runtime taskservice.slice "TasksMax=$old_tasks" "MemoryHigh=$old_high"; then
+                echo 'RECOVERY_ROLLBACK=original_limits_restored'
+              else
+                echo 'RECOVERY_ROLLBACK=failed_manual_attention_required'
+              fi
+            fi
+            exit "$rc"
+          }
+          trap restore EXIT
+          changed=1
+          systemctl set-property --runtime taskservice.slice TasksMax=512 MemoryHigh=1500M
+          [[ $(cat "$cg/memory.max") == 1610612736 && $(cat "$cg/memory.swap.max") == 0 ]]
+          [[ $(cat "$cg/pids.max") == 512 && $(cat "$cg/memory.high") == 1572864000 ]]
+          consecutive=0
+          for attempt in {1..7}; do
+            (( $(mem_available) >= 262144 && $(oom_events) == old_oom )) || { echo 'Capacity protection tripped'; exit 1; }
+            if probe && api_health && cohost_health; then
+              consecutive=$((consecutive+1))
+              if ((consecutive >= 2)); then
+                snapshot
+                (( $(mem_available) >= 262144 && $(oom_events) == old_oom ))
+                keep=1
+                echo 'RECOVERY=verified_runtime_only'
+                echo 'No containers restarted, no migrations, no backup gate bypass.'
+                exit 0
+              fi
+            else
+              consecutive=0
+            fi
+            sleep 5
+          done
+          snapshot
+          echo 'RECOVERY=not_verified'
+          exit 1
+          REMOTE
+          bash -n "$RUNNER_TEMP/taskservice-recovery.sh"
+      - name: Recover only the TaskService slice
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          HOST: ${{ secrets.HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          HOST_FINGERPRINT: ${{ secrets.SSH_HOST_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          source ops/taskservice/publisher-ssh.sh
+          "${{SSH[@]}" root@"$HOST" 'script=$(cat); exec bash -euc "$script"' < "$RUNNER_TEMP/taskservice-recovery.sh"
